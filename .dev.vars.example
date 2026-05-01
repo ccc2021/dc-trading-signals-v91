@@ -1,0 +1,22 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# 本地開發機敏設定範例
+#
+# 1. 複製本檔為 `.dev.vars` (已加入 .gitignore，不會推上 GitHub)
+# 2. 填入真實值
+# 3. 用 `wrangler dev` 跑本地開發伺服器即可自動載入
+#
+# 正式部署時請改用：
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put WEBHOOK_SECRET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Telegram Bot Token (從 @BotFather 取得)
+BOT_TOKEN=1234567890:ABCDEF_your_bot_token_here
+
+# 可選：Webhook 安全驗證密鑰
+# 設定後 setWebhook 時務必帶上 secret_token=<同樣值>
+WEBHOOK_SECRET=
+
+# 以下若已寫在 wrangler.toml [vars] 可不必重複放
+ADMIN_IDS=810479094
+BOT_USERNAME=Dan_mix_bot

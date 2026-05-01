@@ -4,19 +4,27 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  VERSION: '9.1.0',
+  VERSION: '9.1.1',
   BUILD: 'UserSubscribe',
-  BOT_TOKEN: '8514506641:AAEx72ChhsQKD0OFz4XykgXGgj4E3va_54w',
-  ADMIN_IDS: ['810479094'],
-  BOT_USERNAME: 'Dan_mix_bot',
-  
+
+  // ⚠️ 機敏資訊請以 wrangler secret/vars 注入，請勿寫死於原始碼。
+  // 必填 vars/secrets (見 wrangler.toml 與 DEPLOY_GUIDE.md):
+  //   BOT_TOKEN       Telegram Bot Token        (secret)
+  //   ADMIN_IDS       逗號分隔的管理員 user_id   (var)
+  //   BOT_USERNAME    Bot 用戶名 (不含 @)       (var)
+  //   WEBHOOK_SECRET  (可選) webhook 驗證密鑰    (secret)
+  BOT_TOKEN: '',
+  ADMIN_IDS: [],
+  BOT_USERNAME: '',
+  WEBHOOK_SECRET: '',
+
   // 會員等級
   TIERS: {
     free: { name: '免費會員', emoji: '👤', canReceive: false, tpCount: 0 },
     pro:  { name: 'Pro會員', emoji: '⭐', canReceive: true, tpCount: 2 },
     vip:  { name: 'VIP會員', emoji: '👑', canReceive: true, tpCount: 3 }
   },
-  
+
   // 品種分類
   SYMBOL_CATEGORIES: {
     index: { name: '指數期貨', emoji: '📈' },
@@ -24,25 +32,43 @@ const CONFIG = {
     energy: { name: '能源', emoji: '🛢️' },
     forex: { name: '外匯', emoji: '💱' }
   },
-  
+
   // 訊號類型
   SIGNAL_TYPES: {
     scalp: { name: '短線訊號', emoji: '⚡', desc: '持倉數分鐘~數小時' },
     swing: { name: '波段訊號', emoji: '📈', desc: '持倉數小時~數天' },
     daytrade: { name: '日內訊號', emoji: '🎯', desc: '當日開平倉' }
   },
-  
+
   // 訊號動作
   ACTIONS: {
     LONG:  { emoji: '🟢', name: '做多' },
     SHORT: { emoji: '🔴', name: '做空' }
+  },
+
+  // 內建 fallback tick value（品種表查不到時用）
+  DEFAULT_TICK_VALUE: {
+    NQ: 5, ES: 12.5, YM: 5, RTY: 5,
+    GC: 10, SI: 25,
+    CL: 10, NG: 10,
+    '6E': 6.25, '6J': 6.25
   }
 };
+
+function initConfig(env) {
+  CONFIG.BOT_TOKEN = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
+  CONFIG.BOT_USERNAME = env.BOT_USERNAME || CONFIG.BOT_USERNAME;
+  CONFIG.WEBHOOK_SECRET = env.WEBHOOK_SECRET || CONFIG.WEBHOOK_SECRET;
+  if (env.ADMIN_IDS) {
+    CONFIG.ADMIN_IDS = String(env.ADMIN_IDS)
+      .split(',').map(s => s.trim()).filter(Boolean);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函數
 // ═══════════════════════════════════════════════════════════════════════════════
-const TG = `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
+const TG = () => `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
 const json = (d, s = 200) => new Response(JSON.stringify(d), { 
   status: s, 
   headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } 
@@ -69,7 +95,7 @@ async function sendTg(chatId, text, kb = null) {
   const body = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true };
   if (kb) body.reply_markup = kb;
   try {
-    const res = await fetch(`${TG}/sendMessage`, {
+    const res = await fetch(`${TG()}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -82,7 +108,7 @@ async function editTg(chatId, msgId, text, kb = null) {
   const body = { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', disable_web_page_preview: true };
   if (kb) body.reply_markup = kb;
   try {
-    await fetch(`${TG}/editMessageText`, {
+    await fetch(`${TG()}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -92,7 +118,7 @@ async function editTg(chatId, msgId, text, kb = null) {
 
 async function answerCb(cbId, text = '', showAlert = false) {
   try {
-    await fetch(`${TG}/answerCallbackQuery`, {
+    await fetch(`${TG()}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callback_query_id: cbId, text, show_alert: showAlert })
@@ -229,14 +255,19 @@ async function addPoints(db, userId, points, reason) {
 // 訊號格式化
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function formatSignalCard(signal, userSettings = null, isVip = false) {
+function formatSignalCard(signal, userSettings = null, isVip = false, symbolMeta = null) {
   const { ticker, action, entry_price, stop_loss, tp1, tp2, tp3, signal_type } = signal;
   const actionInfo = CONFIG.ACTIONS[action] || { emoji: '📊', name: action };
   const typeInfo = CONFIG.SIGNAL_TYPES[signal_type] || { emoji: '📊', name: '' };
-  
+
   const risk = Math.abs(entry_price - stop_loss);
   const reward1 = tp1 ? Math.abs(tp1 - entry_price) : 0;
   const rr = risk > 0 ? (reward1 / risk).toFixed(1) : '0';
+
+  // tick value 優先順序: symbols 表 -> 內建表 -> 5 (NQ 預設)
+  const tickValue = symbolMeta?.tick_value
+    ?? CONFIG.DEFAULT_TICK_VALUE[ticker]
+    ?? 5;
   
   let msg = '';
   
@@ -267,7 +298,6 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   // 個人化交易建議
   if (userSettings && userSettings.capital > 0) {
     const riskAmount = userSettings.capital * (userSettings.risk_percent / 100);
-    const tickValue = 5; // 預設 NQ tick value
     const contracts = risk > 0 ? (riskAmount / (risk * tickValue)).toFixed(2) : 0;
     
     msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
@@ -425,6 +455,10 @@ async function isInQuietHours(settings) {
 }
 
 async function broadcastSignal(db, signal) {
+  // 取得品種 metadata（tick_value 等）
+  const symbolMeta = await db.prepare('SELECT * FROM symbols WHERE symbol = ?')
+    .bind(signal.ticker).first();
+
   // 取得所有付費會員
   const users = await db.prepare(`
     SELECT u.user_id, u.tier, us.*
@@ -433,9 +467,9 @@ async function broadcastSignal(db, signal) {
     WHERE u.is_active = 1 AND u.is_banned = 0 AND u.tier != 'free'
       AND (u.tier_expires_at IS NULL OR u.tier_expires_at > datetime('now'))
   `).all();
-  
+
   let sent = 0, queued = 0, skipped = 0;
-  
+
   for (const user of users.results || []) {
     // 檢查是否應該收到
     const shouldReceive = await shouldReceiveSignal(db, user.user_id, signal);
@@ -443,16 +477,16 @@ async function broadcastSignal(db, signal) {
       skipped++;
       continue;
     }
-    
+
     // 檢查通知設定
     if (!user.notify_entry) {
       skipped++;
       continue;
     }
-    
+
     // 格式化訊號（個人化）
     const isVip = user.tier === 'vip';
-    const msg = formatSignalCard(signal, user, isVip);
+    const msg = formatSignalCard(signal, user, isVip, symbolMeta);
     
     // 檢查安靜時段
     if (await isInQuietHours(user)) {
@@ -475,12 +509,19 @@ async function broadcastSignal(db, signal) {
     };
     
     const r = await sendTg(user.user_id, msg, kb);
-    if (r?.ok) sent++; else skipped++;
-    
+    if (r?.ok) {
+      sent++;
+      // 累計接收數，作為試用判斷的旁證
+      try {
+        await db.prepare('UPDATE users SET total_signals = total_signals + 1 WHERE user_id = ?')
+          .bind(user.user_id).run();
+      } catch (e) {}
+    } else skipped++;
+
     // 避免頻率限制
     if (sent % 20 === 0) await new Promise(r => setTimeout(r, 100));
   }
-  
+
   return { sent, queued, skipped, total: (users.results || []).length };
 }
 
@@ -923,15 +964,20 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     if (user.tier !== 'free') {
       return sendTg(cid, `您已是 ${tierName(user.tier)}！`);
     }
-    
-    if (user.total_signals > 0) {
+
+    // 透過 admin_logs 紀錄判斷是否用過試用（避免 total_signals 計數副作用）
+    const used = await db.prepare(
+      `SELECT id FROM admin_logs WHERE action = 'trial_granted' AND target = ? LIMIT 1`
+    ).bind(uid).first();
+    if (used) {
       return sendTg(cid, `您已使用過試用\n\n使用 /plans 查看正式方案`);
     }
-    
+
     const trialDays = parseInt(await getConfig(db, 'trial_days') || '7');
     const expires = new Date(Date.now() + trialDays * 86400000).toISOString();
-    
+
     await updateUser(db, uid, { tier: 'pro', tier_expires_at: expires });
+    await logAction(db, 'SYSTEM', 'trial_granted', uid, `${trialDays} days`);
     
     let m = `🎉 <b>試用已開通！</b>\n\n`;
     m += `等級：⭐ Pro會員\n`;
@@ -1208,12 +1254,119 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     await updateUserSettings(db, uid, { paused: 1 });
     return sendTg(cid, `⏸️ 已暫停接收訊號\n\n使用 /resumesub 恢復`);
   }
-  
+
   if (cmd === '/resumesub') {
     await updateUserSettings(db, uid, { paused: 0 });
     return sendTg(cid, `▶️ 已恢復接收訊號`);
   }
-  
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 歷史訊號 /history
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/history') {
+    if (user.tier === 'free') {
+      return sendTg(cid, `❌ 此功能需要訂閱會員`);
+    }
+
+    const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
+    let symbolFilter = '';
+    if (subscribedSymbols.length > 0) {
+      const safeList = subscribedSymbols
+        .filter(s => /^[A-Z0-9]{1,10}$/.test(s))
+        .map(s => `'${s}'`).join(',');
+      if (safeList) symbolFilter = `AND ticker IN (${safeList})`;
+    }
+
+    const rows = await db.prepare(`
+      SELECT * FROM signals
+      WHERE status = 'closed' ${symbolFilter}
+      ORDER BY closed_at DESC LIMIT 15
+    `).all();
+
+    if (!rows.results || rows.results.length === 0) {
+      return sendTg(cid, `📜 尚無歷史訊號`);
+    }
+
+    let m = `📜 <b>歷史訊號 (近15筆)</b>\n\n`;
+    for (const s of rows.results) {
+      const arrow = s.action === 'LONG' ? '🟢' : '🔴';
+      const tag = s.result === 'win' ? '✅' : s.result === 'loss' ? '❌' : '⚪';
+      const pnl = s.pnl_points != null
+        ? ` ${s.pnl_points >= 0 ? '+' : ''}${fmtPrice(s.pnl_points)}` : '';
+      m += `${tag}${arrow} ${s.ticker} ${fmtPrice(s.entry_price)} →${pnl}\n`;
+    }
+    return sendTg(cid, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 兌換會員 /redeem
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/redeem') {
+    const pointsPerDay = parseInt(await getConfig(db, 'points_per_day') || '100');
+    const days = Math.floor((user.points || 0) / pointsPerDay);
+
+    if (args[0]) {
+      const want = parseInt(args[0]);
+      if (!want || want <= 0) return sendTg(cid, `用法：/redeem [天數]`);
+      if (want > days) return sendTg(cid, `❌ 積分不足\n目前可兌換 ${days} 天`);
+
+      const cost = want * pointsPerDay;
+      const baseExpiry = user.tier_expires_at && new Date(user.tier_expires_at) > new Date()
+        ? new Date(user.tier_expires_at).getTime()
+        : Date.now();
+      const newExpiry = new Date(baseExpiry + want * 86400000).toISOString();
+      const tier = user.tier === 'free' ? 'pro' : user.tier;
+
+      await updateUser(db, uid, { tier, tier_expires_at: newExpiry, points: (user.points || 0) - cost });
+      await db.prepare(`INSERT INTO point_history (user_id, points, reason, created_at)
+        VALUES (?, ?, ?, datetime('now'))`).bind(uid, -cost, `兌換 ${want} 天會員`).run();
+
+      return sendTg(cid, `✅ 兌換成功\n+${want} 天 ${tierName(tier)}\n到期：${fmtDate(newExpiry)}`);
+    }
+
+    let m = `🎁 <b>積分兌換會員</b>\n\n`;
+    m += `目前積分：<b>${user.points || 0}</b>\n`;
+    m += `匯率：${pointsPerDay} 點 = 1 天\n`;
+    m += `可兌換：<b>${days}</b> 天\n\n`;
+    m += `用法：/redeem [天數]\n例如：/redeem 7`;
+    return sendTg(cid, m);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 時區設定 /timezone
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/timezone') {
+    if (args[0]) {
+      const tz = args[0];
+      try {
+        new Date().toLocaleString('en-US', { timeZone: tz });
+      } catch {
+        return sendTg(cid, `❌ 無效的時區\n範例：Asia/Taipei、America/New_York`);
+      }
+      await updateUserSettings(db, uid, { timezone: tz });
+      return sendTg(cid, `✅ 時區已設為 ${tz}`);
+    }
+
+    let m = `🌍 <b>時區設定</b>\n\n目前：${settings.timezone || 'Asia/Taipei'}\n\n常用時區：`;
+    const kb = {
+      inline_keyboard: [
+        [{ text: '🇹🇼 台北 (UTC+8)', callback_data: 'tz_Asia/Taipei' }],
+        [{ text: '🇯🇵 東京 (UTC+9)', callback_data: 'tz_Asia/Tokyo' }],
+        [{ text: '🇺🇸 紐約 (UTC-5/4)', callback_data: 'tz_America/New_York' }],
+        [{ text: '🇬🇧 倫敦 (UTC+0/1)', callback_data: 'tz_Europe/London' }],
+        [{ text: '« 返回', callback_data: 'u_settings' }]
+      ]
+    };
+    return sendTg(cid, m, kb);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 續費 /renew (alias to /plans)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/renew') {
+    return handleUserCommand(cid, uid, '/plans', [], env);
+  }
+
   return null;
 }
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1715,6 +1868,38 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data === 'u_trial') return handleUserCommand(cid, uid, '/trial', [], env);
   if (data === 'u_points') return handleUserCommand(cid, uid, '/points', [], env);
   if (data === 'u_history') return handleUserCommand(cid, uid, '/history', [], env);
+  if (data === 'u_status' || data === 'u_renew' || data === 'u_upgrade')
+    return handleUserCommand(cid, uid, '/status', [], env);
+  if (data === 'u_redeem') return handleUserCommand(cid, uid, '/redeem', [], env);
+  if (data === 'u_timezone') return handleUserCommand(cid, uid, '/timezone', [], env);
+
+  // 安靜時段時間設定提示
+  if (data === 'set_quiet_start' || data === 'set_quiet_end') {
+    await answerCb(null, '請選擇下方按鈕的預設時段');
+    return;
+  }
+
+  // 績效篩選佔位 (避免按鈕無回應)
+  if (data === 'mystats_symbol' || data === 'mystats_month') {
+    await answerCb(null, '此功能即將推出');
+    return;
+  }
+
+  // 複製邀請連結
+  if (data === 'copy_ref') {
+    await answerCb(null, '請長按上方連結複製', true);
+    return;
+  }
+
+  // 時區快選
+  if (data.startsWith('tz_')) {
+    const tz = data.slice(3);
+    try { new Date().toLocaleString('en-US', { timeZone: tz }); }
+    catch { await answerCb(null, '無效時區', true); return; }
+    await updateUserSettings(db, uid, { timezone: tz });
+    await answerCb(null, `已設為 ${tz}`);
+    return;
+  }
   
   // 訂閱方案
   if (data === 'order_pro' || data === 'order_vip') {
@@ -2488,11 +2673,55 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await logAction(db, uid, 'pause', '', '');
     return sendTg(cid, `⏸️ 訊號已暫停`);
   }
-  
+
   if (cmd === '/resume') {
     await setConfig(db, 'signals_paused', '0');
     await logAction(db, uid, 'resume', '', '');
     return sendTg(cid, `▶️ 訊號已恢復`);
+  }
+
+  // /setprice [pro|vip] [1|3|12] [金額]
+  if (cmd === '/setprice') {
+    if (args.length < 3) {
+      return sendTg(cid, `用法：/setprice [pro|vip] [1|3|12] [金額]\n例：/setprice pro 1 299`);
+    }
+    const tier = args[0].toLowerCase();
+    const months = args[1];
+    const price = String(parseInt(args[2]) || 0);
+    if (!['pro', 'vip'].includes(tier) || !['1', '3', '12'].includes(months)) {
+      return sendTg(cid, `❌ 參數錯誤`);
+    }
+    const key = `${tier}_price_${months}m`;
+    await setConfig(db, key, price);
+    await logAction(db, uid, 'setprice', key, price);
+    return sendTg(cid, `✅ ${key} = NT$ ${price}`);
+  }
+
+  // /setcontact [tg|line] [值]
+  if (cmd === '/setcontact') {
+    if (args.length < 2) return sendTg(cid, `用法：/setcontact [tg|line] [@帳號]`);
+    const k = args[0] === 'tg' ? 'contact_telegram' : args[0] === 'line' ? 'contact_line' : null;
+    if (!k) return sendTg(cid, `❌ 參數錯誤`);
+    await setConfig(db, k, args.slice(1).join(' '));
+    return sendTg(cid, `✅ 已更新 ${k}`);
+  }
+
+  // /settrial [天數]
+  if (cmd === '/settrial') {
+    const days = parseInt(args[0]);
+    if (!days || days < 0) return sendTg(cid, `用法：/settrial [天數]`);
+    await setConfig(db, 'trial_days', String(days));
+    return sendTg(cid, `✅ 試用天數已設為 ${days} 天`);
+  }
+
+  // /sendtest 把最近一筆訊號重發給自己（debug）
+  if (cmd === '/sendtest') {
+    const sig = await db.prepare(`SELECT * FROM signals ORDER BY created_at DESC LIMIT 1`).first();
+    if (!sig) return sendTg(cid, `❌ 沒有訊號可測試`);
+    const meta = await db.prepare('SELECT * FROM symbols WHERE symbol = ?').bind(sig.ticker).first();
+    const settings = await getUserSettings(db, uid);
+    const msg = formatSignalCard(sig, settings, true, meta);
+    return sendTg(cid, msg);
   }
   
   // /help 管理員幫助
@@ -2693,7 +2922,15 @@ async function handleQueuedSignals(env) {
 
 async function handleWebhook(request, env) {
   const db = env.DB;
-  
+
+  // Webhook secret 驗證 (若設定 WEBHOOK_SECRET)
+  if (CONFIG.WEBHOOK_SECRET) {
+    const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+    if (got !== CONFIG.WEBHOOK_SECRET) {
+      return json({ error: 'unauthorized' }, 401);
+    }
+  }
+
   try {
     const update = await request.json();
     
@@ -2707,8 +2944,8 @@ async function handleWebhook(request, env) {
       
       await answerCb(cb.id);
       
-      // 管理員 Callback
-      if (isAdmin(uid) && data.startsWith('a_') || data.startsWith('adm_')) {
+      // 管理員 Callback (限管理員觸發，避免一般用戶呼叫到 adm_ 操作)
+      if (isAdmin(uid) && (data.startsWith('a_') || data.startsWith('adm_'))) {
         return await handleAdminCallback(cid, uid, msgId, data, env);
       }
       
@@ -2759,15 +2996,17 @@ async function handleWebhook(request, env) {
 
 export default {
   async fetch(request, env, ctx) {
+    initConfig(env);
     const url = new URL(request.url);
-    
+
     // 健康檢查
     if (url.pathname === '/' || url.pathname === '/health') {
-      return json({ 
-        status: 'ok', 
-        version: CONFIG.VERSION, 
+      return json({
+        status: 'ok',
+        version: CONFIG.VERSION,
         build: CONFIG.BUILD,
-        time: fmtTime()
+        time: fmtTime(),
+        ready: Boolean(CONFIG.BOT_TOKEN && CONFIG.ADMIN_IDS.length)
       });
     }
     
@@ -2798,20 +3037,17 @@ export default {
   },
   
   async scheduled(event, env, ctx) {
-    // 每日 00:00 - 過期檢查
-    // 每日 08:00 - 到期提醒
-    // 每小時 - 待發訊號
-    
+    initConfig(env);
+    // 對應 wrangler.toml 的 cron triggers (UTC):
+    //   "0 16 * * *"  → 台北 00:00 過期檢查
+    //   "0 0 * * *"   → 台北 08:00 到期提醒
+    //   "0 * * * *"   → 每小時跑一次待發訊號
+
     const hour = new Date().getUTCHours();
-    
-    if (hour === 16) { // UTC 16 = 台北 00:00
-      await handleExpireCheck(env);
-    }
-    
-    if (hour === 0) { // UTC 0 = 台北 08:00
-      await handleExpireReminder(env);
-    }
-    
+
+    if (hour === 16) await handleExpireCheck(env);
+    if (hour === 0)  await handleExpireReminder(env);
+
     await handleQueuedSignals(env);
   }
 };

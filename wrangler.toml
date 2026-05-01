@@ -2,14 +2,40 @@ name = "dc-signals-v91"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "trading-signals-db"
-database_id = "YOUR_DATABASE_ID"
+# ═══════════════════════════════════════════════════════════════════════════════
+# 公開設定 (vars)：可以放在這裡，會被 git 追蹤
+# 機敏資訊 (secrets)：請用 `wrangler secret put` 注入，不要寫在這裡
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put WEBHOOK_SECRET   # 可選
+# ═══════════════════════════════════════════════════════════════════════════════
+[vars]
+ADMIN_IDS    = "YOUR_TELEGRAM_USER_ID"   # 例 "810479094"，多管理員逗號分隔 "111,222"
+BOT_USERNAME = "YOUR_BOT_USERNAME"       # 不含 @，例 "Dan_mix_bot"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# D1 資料庫
+# 第一次部署前先：
+#   wrangler d1 create trading-signals-db
+# 然後把回傳的 database_id 填到下方
+# ═══════════════════════════════════════════════════════════════════════════════
+[[d1_databases]]
+binding       = "DB"
+database_name = "trading-signals-db"
+database_id   = "YOUR_DATABASE_ID"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 排程 (cron) - UTC 時間
+#   "0 16 * * *" → 台北 00:00  會員過期檢查 (handleExpireCheck)
+#   "0 0  * * *" → 台北 08:00  到期前提醒 (handleExpireReminder)
+#   "0 *  * * *" → 每小時      安靜時段待發訊號補送 (handleQueuedSignals)
+# ═══════════════════════════════════════════════════════════════════════════════
 [triggers]
 crons = [
   "0 16 * * *",
   "0 0 * * *",
   "0 * * * *"
 ]
+
+# 觀測 (建議啟用)
+[observability]
+enabled = true

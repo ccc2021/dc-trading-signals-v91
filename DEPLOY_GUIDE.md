@@ -1,351 +1,406 @@
-# DC Trading Signals Pro v9.1 完整部署教學
+# 部署完整教學 — DC Trading Signals Pro v9.1
+
+> 從零開始，把這套系統部署到 Cloudflare 上。預計 **15–30 分鐘**。
 
 ## 📋 目錄
 
 1. [前置準備](#1-前置準備)
 2. [安裝工具](#2-安裝工具)
-3. [建立 Cloudflare 帳號](#3-建立-cloudflare-帳號)
-4. [建立 D1 資料庫](#4-建立-d1-資料庫)
-5. [部署 Worker](#5-部署-worker)
-6. [設定 Telegram Bot](#6-設定-telegram-bot)
-7. [測試系統](#7-測試系統)
-8. [常見問題](#8-常見問題)
+3. [建立 Telegram Bot](#3-建立-telegram-bot)
+4. [取得你的 Telegram ID](#4-取得你的-telegram-id)
+5. [建立 Cloudflare 帳號 / 登入 wrangler](#5-cloudflare--wrangler)
+6. [下載專案](#6-下載專案)
+7. [建立 D1 資料庫](#7-建立-d1-資料庫)
+8. [設定機敏資訊（secrets）](#8-設定機敏資訊secrets)
+9. [部署 Worker](#9-部署-worker)
+10. [設定 Telegram Webhook](#10-設定-telegram-webhook)
+11. [驗證部署](#11-驗證部署)
+12. [常見問題](#12-常見問題)
+13. [更新與重新部署](#13-更新與重新部署)
 
 ---
 
 ## 1. 前置準備
 
-### 你需要：
-- ✅ Windows 10/11 或 Mac
-- ✅ 網路連線
-- ✅ Cloudflare 帳號（免費）
-- ✅ Telegram 帳號
+你需要：
 
-### 預計時間：15-30 分鐘
+- 一台可上網的電腦（Windows 10/11、macOS、或 Linux）
+- 一個 **Telegram** 帳號
+- 一個 **Cloudflare** 帳號（免費方案夠用）
+- 約 30 分鐘
+
+**整個系統的免費額度可承載：**
+
+- 每天 100,000 次 Worker 執行（綽綽有餘）
+- D1 每天 5,000,000 次讀取 + 100,000 次寫入
 
 ---
 
 ## 2. 安裝工具
 
-### 步驟 2.1：安裝 Node.js
+### 2.1 安裝 Node.js
 
-1. 打開 https://nodejs.org/
-2. 下載 **LTS 版本**（綠色按鈕）
-3. 執行安裝程式，一直點「下一步」
-4. 安裝完成後重啟電腦
+下載 LTS 版：<https://nodejs.org/>，一路按下一步即可。
 
-**驗證安裝：**
-```
-打開「命令提示字元」或「終端機」輸入：
+驗證：
+
+```bash
 node --version
+# 應顯示 v18.x.x 或更新
 ```
-應該顯示類似 `v20.x.x`
 
----
-
-### 步驟 2.2：安裝 Wrangler（Cloudflare CLI）
-
-打開「命令提示字元」（Windows）或「終端機」（Mac）：
+### 2.2 安裝 Wrangler（Cloudflare CLI）
 
 ```bash
 npm install -g wrangler
-```
-
-**驗證安裝：**
-```bash
 wrangler --version
+# 應顯示 3.x.x 或更新
 ```
-應該顯示類似 `3.x.x`
+
+### 2.3 安裝 Git
+
+- **Windows**：<https://git-scm.com/download/win>
+- **macOS**：`xcode-select --install`
+- **Linux**：`sudo apt install git`
 
 ---
 
-### 步驟 2.3：安裝 Git
+## 3. 建立 Telegram Bot
 
-**Windows：**
-1. 打開 https://git-scm.com/download/win
-2. 下載並安裝，全部預設選項
+1. 打開 Telegram，搜尋 **@BotFather**
+2. 發送 `/newbot`
+3. 輸入 Bot 名稱（例：`DC Trading Signals`）
+4. 輸入 Bot 用戶名（例：`my_dc_signals_bot`，必須以 `bot` 結尾）
+5. BotFather 會回覆你一段 **Token**，格式像：
+   ```
+   1234567890:ABCDefGHIjklMNOpqrsTUVwxyz
+   ```
+6. **把 Token 抄下來**，下方會用到 → 對應 `BOT_TOKEN`
+7. **記下你的 Bot 用戶名**（不含 @）→ 對應 `BOT_USERNAME`
 
-**Mac：**
-```bash
-xcode-select --install
-```
+> ⚠️ Token 等同於 Bot 的密碼，**絕對不要**貼到截圖、聊天室、或公開 repo。
+
+可選：在 BotFather 裡設定：
+
+- `/setdescription` 設定簡介
+- `/setcommands` 設定指令選單（內容可從 [USER_GUIDE.md](./USER_GUIDE.md) 複製）
 
 ---
 
-## 3. 建立 Cloudflare 帳號
+## 4. 取得你的 Telegram ID
 
-### 步驟 3.1：註冊帳號
+管理員 ID 是純數字。
 
-1. 打開 https://dash.cloudflare.com/sign-up
-2. 輸入 Email 和密碼
-3. 驗證 Email
+1. 在 Telegram 搜尋 **@userinfobot**
+2. 發送 `/start`
+3. 它會回覆你的 ID（例如 `810479094`） → 對應 `ADMIN_IDS`
 
-### 步驟 3.2：登入 Wrangler
+要多管理員？用逗號分隔：`111111,222222`
 
-打開命令提示字元：
+---
+
+## 5. Cloudflare + wrangler
+
+### 5.1 註冊 Cloudflare 帳號
+
+<https://dash.cloudflare.com/sign-up>，免信用卡。
+
+### 5.2 登入 wrangler
 
 ```bash
 wrangler login
 ```
 
-會自動打開瀏覽器，點擊「Allow」授權。
-
-看到 `Successfully logged in` 就成功了！
+會自動開瀏覽器，點 **Allow**。看到 `Successfully logged in.` 就完成。
 
 ---
 
-## 4. 建立 D1 資料庫
-
-### 步驟 4.1：下載專案
+## 6. 下載專案
 
 ```bash
-# 進入你想存放的目錄（例如桌面）
-cd Desktop
-
-# 下載專案
 git clone https://github.com/ccc2021/dc-trading-signals-v91.git
-
-# 進入專案目錄
 cd dc-trading-signals-v91
 ```
 
 ---
 
-### 步驟 4.2：建立資料庫
+## 7. 建立 D1 資料庫
+
+### 7.1 建立 D1 instance
 
 ```bash
 wrangler d1 create trading-signals-db
 ```
 
-**重要！** 執行後會顯示類似：
+輸出會像：
 
 ```
 ✅ Successfully created DB 'trading-signals-db'
 
 [[d1_databases]]
-binding = "DB"
+binding       = "DB"
 database_name = "trading-signals-db"
-database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  ← 複製這個！
+database_id   = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"  ← 複製這個
 ```
 
-**複製 `database_id` 的值！**
+### 7.2 把 database_id 填到 wrangler.toml
 
----
+打開 `wrangler.toml`，找到：
 
-### 步驟 4.3：更新設定檔
-
-1. 用記事本打開 `wrangler.toml`
-2. 找到這行：
-   ```
-   database_id = "YOUR_DATABASE_ID"
-   ```
-3. 把 `YOUR_DATABASE_ID` 改成你剛才複製的 ID
-4. 儲存檔案
-
-**修改後應該像這樣：**
 ```toml
-name = "dc-signals-v91"
-main = "worker.js"
-compatibility_date = "2024-01-01"
-
 [[d1_databases]]
-binding = "DB"
+binding       = "DB"
 database_name = "trading-signals-db"
-database_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+database_id   = "YOUR_DATABASE_ID"
 ```
 
----
+把 `YOUR_DATABASE_ID` 換成剛才複製的值。
 
-### 步驟 4.4：建立資料表
+### 7.3 順手調整 [vars]
+
+```toml
+[vars]
+ADMIN_IDS    = "你的 Telegram user_id"   # 例如 "810479094"
+BOT_USERNAME = "你的 bot 用戶名"          # 不含 @，例如 "my_dc_signals_bot"
+```
+
+### 7.4 寫入資料表
 
 ```bash
 wrangler d1 execute trading-signals-db --remote --file=schema.sql
 ```
 
-看到一堆 `CREATE TABLE` 的輸出就成功了！
+第一次會建立全部 14 個資料表 + 預設資料。
+> 本檔案是「冪等」(idempotent)：重複執行不會洗掉用戶資料，只會跳過已存在的表。
 
 ---
 
-## 5. 部署 Worker
+## 8. 設定機敏資訊（secrets）
 
-### 步驟 5.1：修改 Bot Token（重要！）
+⚠️ **不要把 `BOT_TOKEN` 寫進 `wrangler.toml` 或 `worker.js`**，請用 secret 注入。
 
-1. 用記事本打開 `worker.js`
-2. 找到這行（大約在第 10 行）：
-   ```javascript
-   BOT_TOKEN: '8514506641:AAEx72ChhsQKD0OFz4XykgXGgj4E3va_54w',
-   ```
-3. 把 Token 改成你自己的（見下一章節如何取得）
-4. 找到這行：
-   ```javascript
-   ADMIN_IDS: ['810479094'],
-   ```
-5. 把數字改成你自己的 Telegram ID
-6. 儲存檔案
+### 8.1 BOT_TOKEN（必填）
 
-**如何取得你的 Telegram ID：**
-1. 在 Telegram 搜尋 `@userinfobot`
-2. 發送 `/start`
-3. 它會回覆你的 ID（純數字）
+```bash
+wrangler secret put BOT_TOKEN
+# 貼上 BotFather 給你的 Token，按 Enter
+```
+
+### 8.2 WEBHOOK_SECRET（強烈建議）
+
+可避免別人猜到你的 Worker URL 後送假 webhook。
+
+```bash
+# 任意亂碼，建議 32+ 字元
+wrangler secret put WEBHOOK_SECRET
+# 例：sk_r2dY7fP_9xK3Lq8nAH6vBwG4Tj1MzCsXuQpEvNyZ
+```
+
+設定後務必記得在第 10 步 setWebhook 帶上同樣的值。
+
+### 8.3 確認 secrets 已設定
+
+```bash
+wrangler secret list
+```
 
 ---
 
-### 步驟 5.2：部署
+## 9. 部署 Worker
 
 ```bash
 wrangler deploy
 ```
 
-**成功會顯示：**
+成功後會看到：
+
 ```
 Uploaded dc-signals-v91 (1.23 sec)
-Published dc-signals-v91 (0.45 sec)
-  https://dc-signals-v91.你的帳號.workers.dev
+Deployed dc-signals-v91 triggers (0.45 sec)
+  https://dc-signals-v91.<your-account>.workers.dev
 ```
 
-**複製這個網址！**
+**把這個網址抄下來** → 後面叫做 `<WORKER_URL>`。
+
+### 9.1 健康檢查
+
+打開瀏覽器訪問 `<WORKER_URL>/health`，應該看到：
+
+```json
+{
+  "status": "ok",
+  "version": "9.1.1",
+  "build": "UserSubscribe",
+  "time": "...",
+  "ready": true
+}
+```
+
+`ready: true` 表示 BOT_TOKEN 與 ADMIN_IDS 都讀到了。如果 `ready: false`，回頭檢查第 7.3、8 步。
 
 ---
 
-## 6. 設定 Telegram Bot
+## 10. 設定 Telegram Webhook
 
-### 步驟 6.1：建立 Bot
+把 Telegram 的訊息「轉接」到你的 Worker。
 
-1. 在 Telegram 搜尋 `@BotFather`
-2. 發送 `/newbot`
-3. 輸入 Bot 名稱（例如：`DC Trading Signals`）
-4. 輸入 Bot 用戶名（例如：`dc_signals_bot`，必須以 `bot` 結尾）
-5. BotFather 會給你一個 **Token**，格式像這樣：
-   ```
-   1234567890:ABCDefGHIjklMNOpqrsTUVwxyz
-   ```
-6. **複製這個 Token**
+### 10.1 沒設定 WEBHOOK_SECRET 時
 
----
-
-### 步驟 6.2：更新 Token 並重新部署
-
-1. 用記事本打開 `worker.js`
-2. 把 `BOT_TOKEN` 改成你的新 Token
-3. 儲存
-4. 重新部署：
-   ```bash
-   wrangler deploy
-   ```
-
----
-
-### 步驟 6.3：設定 Webhook
-
-把以下網址貼到瀏覽器（記得替換）：
-
-```
-https://api.telegram.org/bot你的TOKEN/setWebhook?url=你的Worker網址/webhook
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=<WORKER_URL>/webhook"
 ```
 
-**範例：**
-```
-https://api.telegram.org/bot1234567890:ABCDefGHI/setWebhook?url=https://dc-signals-v91.abc123.workers.dev/webhook
+### 10.2 有設定 WEBHOOK_SECRET 時（建議）
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  --data-urlencode "url=<WORKER_URL>/webhook" \
+  --data-urlencode "secret_token=<WEBHOOK_SECRET>"
 ```
 
-**成功會顯示：**
+成功會回：
+
 ```json
 {"ok":true,"result":true,"description":"Webhook was set"}
 ```
 
+### 10.3 確認 webhook
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
+```
+
+`url` 應該是你的 `<WORKER_URL>/webhook`，`pending_update_count` 通常為 0。
+
 ---
 
-## 7. 測試系統
+## 11. 驗證部署
 
-### 步驟 7.1：測試 Bot
+### 11.1 一般用戶測試
 
-1. 在 Telegram 搜尋你剛建立的 Bot
-2. 點擊「開始」或發送 `/start`
-3. 應該會看到主選單！
+1. 打開 Telegram，搜尋你的 Bot 用戶名
+2. 點 **Start** 或發送 `/start`
+3. 應該收到主選單
 
-### 步驟 7.2：測試管理員功能
+### 11.2 管理員測試
 
 發送：
+
 ```
 /admin
 ```
-應該會看到管理儀表板。
 
-### 步驟 7.3：測試發訊號
+應該看到管理儀表板。看不到 → `ADMIN_IDS` 沒設對，回到第 7.3 修改後 `wrangler deploy` 重新部署。
 
-發送：
+### 11.3 發訊測試
+
 ```
 /long NQ 21500 21480 21520
 ```
 
+應該看到「✅ 訊號已發送」並同時把訊號廣播給所有付費會員（如果你目前一個都沒有，就會顯示 0 人）。
+
+### 11.4 看 Logs
+
+即時查看 Worker 執行 log：
+
+```bash
+wrangler tail
+```
+
 ---
 
-## 8. 常見問題
+## 12. 常見問題
 
-### Q: `wrangler: command not found`
-**A:** Node.js 沒安裝好。重新安裝 Node.js 後重開命令提示字元。
+### Q1. `wrangler: command not found`
+A. Node.js 沒裝好，或 `npm` 全域路徑不在 PATH 上。重灌 Node.js 再試一次。
 
-### Q: `Error: Authentication required`
-**A:** 執行 `wrangler login` 重新登入。
+### Q2. `Authentication required` / 401
+A. `wrangler login` 重新登入。
 
-### Q: Bot 沒有回應
-**A:** 檢查：
-1. Webhook 設定正確嗎？
-2. Token 有更新嗎？
-3. Worker 部署成功嗎？
-
-### Q: `D1_ERROR: no such table: users`
-**A:** Schema 沒執行成功。重新執行：
+### Q3. `D1_ERROR: no such table: users`
+A. 第 7.4 步沒做或失敗。重新跑：
 ```bash
 wrangler d1 execute trading-signals-db --remote --file=schema.sql
 ```
 
-### Q: 如何查看錯誤日誌？
-**A:** 
+### Q4. Bot 沒反應
+A. 依序檢查：
+1. `<WORKER_URL>/health` 是否回 `ready: true`
+2. `getWebhookInfo` 的 `url` 是否正確
+3. `getWebhookInfo` 的 `last_error_message` 有沒有錯
+4. `wrangler tail` 看有沒有錯誤
+5. 有設 `WEBHOOK_SECRET` 但 setWebhook 沒帶 → webhook 會被 401 擋下，重設
+
+### Q5. 健康檢查 `ready: false`
+A. 表示 `BOT_TOKEN` 或 `ADMIN_IDS` 沒讀到：
+- `wrangler secret list` 確認 `BOT_TOKEN` 有
+- 看 `wrangler.toml` 的 `[vars]` 是否寫了 `ADMIN_IDS` 和 `BOT_USERNAME`
+- 重新 `wrangler deploy`
+
+### Q6. Cron 沒跑
+A. Workers Free 方案 cron 最低粒度 1 分鐘，不過至少要部署過一次才會啟用。
 ```bash
-wrangler tail
+wrangler tail --format=pretty
 ```
-會即時顯示 Worker 的執行日誌。
+觀察 scheduled 事件。
+
+### Q7. 想改價格 / 試用天數 / 客服聯繫
+A. 不需重新部署，直接從 Bot 用管理員指令：
+```
+/setprice pro 1 299
+/setprice vip 12 5748
+/settrial 14
+/setcontact tg @YourSupport
+```
+
+### Q8. 想新增管理員
+A. 改 `wrangler.toml` 的 `[vars] ADMIN_IDS = "111,222,333"`，然後 `wrangler deploy`。
+
+### Q9. 想在本地除錯（不部署）
+A. 複製 `.dev.vars.example` → `.dev.vars`，填入真實值，然後：
+```bash
+wrangler dev
+```
 
 ---
 
-## 📞 需要幫助？
+## 13. 更新與重新部署
 
-如果遇到問題，請提供：
-1. 錯誤訊息截圖
-2. 你執行的指令
-3. 目前卡在哪一步
+修改程式或 schema 之後：
+
+```bash
+# 程式碼有改 → 重新部署 worker
+wrangler deploy
+
+# schema.sql 有改 → 套用新表/欄位 (idempotent，安全)
+wrangler d1 execute trading-signals-db --remote --file=schema.sql
+
+# secrets 要改
+wrangler secret put BOT_TOKEN
+```
+
+> 若是從 v9.1.0 升級到 v9.1.1，先把 token 從原始碼移到 secret：
+> 1. `wrangler secret put BOT_TOKEN` → 貼上舊 Token
+> 2. 把 `wrangler.toml [vars]` 補上 `ADMIN_IDS` 和 `BOT_USERNAME`
+> 3. `wrangler deploy`
 
 ---
 
-## 🎉 恭喜完成！
+## 🎉 完成！
 
-你現在擁有一個完整的交易訊號系統：
+可以開始發訊號了：
 
-- ✅ 用戶自主訂閱品種
-- ✅ 個人化資金計算
-- ✅ 安靜時段設定
-- ✅ 會員管理系統
-- ✅ 績效追蹤
-
-**管理員指令速查：**
 ```
-/long NQ 21500 21480 21520 21540   # 做多訊號
-/short ES 5820 5835 5810           # 做空訊號
-/tp1 NQ 21520                      # 止盈1
-/sl NQ 21480                       # 止損
-/bc 系統公告                        # 廣播
-/admin                              # 管理儀表板
-/users                              # 用戶列表
-/orders                             # 待處理訂單
+/long NQ 21500 21480 21520 21540        # 做多
+/short ES 5820 5835 5810  @vip            # 做空 (VIP only)
+/tp1 NQ 21520                             # 止盈 1
+/sl NQ 21480                              # 止損
+/bc 系統公告                               # 廣播
+/admin                                     # 管理儀表板
 ```
 
-**用戶指令速查：**
-```
-/menu      # 主選單
-/subscribe # 訂閱設定
-/settings  # 個人設定
-/mystats   # 我的績效
-/checkin   # 每日簽到
-/plans     # 方案介紹
-```
+完整指令參考：
+
+- 用戶端 → [USER_GUIDE.md](./USER_GUIDE.md)
+- 管理員 → [ADMIN_GUIDE.md](./ADMIN_GUIDE.md)
