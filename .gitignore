@@ -3,7 +3,14 @@ node_modules/
 
 # Build output
 dist/
+.dist/
 .wrangler/
+
+# vitest / coverage
+coverage/
+
+# package-lock (optional; uncomment if you don't want to track)
+# package-lock.json
 
 # Environment
 .env

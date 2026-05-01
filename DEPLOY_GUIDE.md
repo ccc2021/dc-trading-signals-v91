@@ -1,4 +1,4 @@
-# 部署完整教學 — DC Trading Signals Pro v9.1
+# 部署完整教學 — DC Trading Signals Pro v9.2
 
 > 從零開始，把這套系統部署到 Cloudflare 上。預計 **15–30 分鐘**。
 
@@ -371,16 +371,28 @@ wrangler dev
 
 ```bash
 # 程式碼有改 → 重新部署 worker
-wrangler deploy
+npm run deploy           # 等同 wrangler deploy
 
 # schema.sql 有改 → 套用新表/欄位 (idempotent，安全)
-wrangler d1 execute trading-signals-db --remote --file=schema.sql
+npm run db:init          # 等同 wrangler d1 execute --remote --file=schema.sql
+
+# 既有 DB 升版 → 跑 migrations
+npm run db:migrate       # 等同 wrangler d1 execute --remote --file=migrations.sql
 
 # secrets 要改
 wrangler secret put BOT_TOKEN
+wrangler secret put TV_WEBHOOK_SECRET   # v9.2 新增 (可選)
 ```
 
-> 若是從 v9.1.0 升級到 v9.1.1，先把 token 從原始碼移到 secret：
+> ### 升級到 v9.2.0
+> 1. `git pull && npm install`
+> 2. `npm run db:migrate` （重複欄位錯誤可忽略，那只代表欄位已存在）
+> 3. `npm run deploy`
+> 4. Bot 內：`/selftest` 應全綠；`/synccmds` 同步 Bot menu
+> 5. （選用）`wrangler secret put TV_WEBHOOK_SECRET` 啟用 TradingView 整合
+> 6. `npm run test:run` 跑 70 個單元測試確認核心邏輯
+>
+> ### 升級到 v9.1.1（從 v9.1.0）
 > 1. `wrangler secret put BOT_TOKEN` → 貼上舊 Token
 > 2. 把 `wrangler.toml [vars]` 補上 `ADMIN_IDS` 和 `BOT_USERNAME`
 > 3. `wrangler deploy`

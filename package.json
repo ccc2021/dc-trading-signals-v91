@@ -1,0 +1,23 @@
+{
+  "name": "dc-trading-signals-v91",
+  "version": "9.2.0",
+  "private": true,
+  "type": "module",
+  "description": "DC Trading Signals Pro — Telegram bot on Cloudflare Workers + D1",
+  "scripts": {
+    "lint": "node --check worker.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run --outdir=.dist",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "db:init": "wrangler d1 execute trading-signals-db --remote --file=schema.sql",
+    "db:migrate": "wrangler d1 execute trading-signals-db --remote --file=migrations.sql",
+    "db:init:local": "wrangler d1 execute trading-signals-db --local --file=schema.sql"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
+  }
+}

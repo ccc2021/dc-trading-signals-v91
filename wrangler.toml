@@ -6,7 +6,8 @@ compatibility_date = "2024-01-01"
 # 公開設定 (vars)：可以放在這裡，會被 git 追蹤
 # 機敏資訊 (secrets)：請用 `wrangler secret put` 注入，不要寫在這裡
 #   wrangler secret put BOT_TOKEN
-#   wrangler secret put WEBHOOK_SECRET   # 可選
+#   wrangler secret put WEBHOOK_SECRET    # 可選，Telegram webhook 防偽
+#   wrangler secret put TV_WEBHOOK_SECRET # 可選，TradingView /webhook/tv 驗證
 # ═══════════════════════════════════════════════════════════════════════════════
 [vars]
 ADMIN_IDS    = "YOUR_TELEGRAM_USER_ID"   # 例 "810479094"，多管理員逗號分隔 "111,222"
@@ -26,13 +27,15 @@ database_id   = "YOUR_DATABASE_ID"
 # ═══════════════════════════════════════════════════════════════════════════════
 # 排程 (cron) - UTC 時間
 #   "0 16 * * *" → 台北 00:00  會員過期檢查 (handleExpireCheck)
-#   "0 0  * * *" → 台北 08:00  到期前提醒 (handleExpireReminder)
+#   "0 0  * * *" → 台北 08:00  到期前提醒 + 每日績效報告 (handleDailyReport)
+#   "0 1  * * 0" → 週日台北 09:00 每週績效報告 (handleWeeklyReport)
 #   "0 *  * * *" → 每小時      安靜時段待發訊號補送 (handleQueuedSignals)
 # ═══════════════════════════════════════════════════════════════════════════════
 [triggers]
 crons = [
   "0 16 * * *",
   "0 0 * * *",
+  "0 1 * * 0",
   "0 * * * *"
 ]
 

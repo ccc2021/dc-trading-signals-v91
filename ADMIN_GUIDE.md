@@ -291,15 +291,80 @@ wrangler d1 execute trading-signals-db --remote \
 
 ---
 
+## 🆕 v9.2 新管理員指令
+
+### 報告
+
+```
+/daily        立刻廣播當日績效報告
+/weekly       立刻廣播週報 (含各品種拆分)
+```
+
+兩者也都有 cron 自動觸發（每日 08:00 / 週日 09:00 台北時間）。
+
+### 用戶資料
+
+```
+/note <user_id> <備註>     設定 admin_note
+/exec <signal_uid> <user_id> <entry> <contracts> [exit] [pnl] [notes]
+                          手動補登用戶實際成交資料
+```
+
+### 群組管理
+
+```
+/groupnew  <name> [描述]              建立群組
+/grouplist                            列出全部群組
+/groupinfo <name>                     看成員（最多 50）
+/groupadd  <user_id> <name>           加人
+/grouprm   <user_id> <name>           移除
+/groupdel  <name>                     刪除整個群組
+```
+
+群組建立後可在發訊 / 廣播時用 `@群組名` 指定，例：
+```
+/long NQ 21500 21480 21520 @beta
+/bc @beta 測試訊息
+```
+
+### 風控
+
+```
+/be <品種>    把該品種最新 active 訊號的止損移到 entry，並廣播通知
+/daytrade <long|short> <品種> <進場> <止損> <TP1>...   日內訊號 (signal_type=daytrade)
+```
+
+### 系統
+
+```
+/synccmds     把指令清單推到 Telegram bot menu
+/selftest     系統自檢 (env / D1 / 表 / 欄位 / webhook)
+```
+
+### 全域設定
+
+直接改 D1 的 `system_config`（或寫個自訂指令）：
+
+| key | 用途 |
+|-----|------|
+| `global_be_on_tp1` | `1` 開啟 = 每次 `/tp1` 自動廣播 BE 更新 |
+| `pin_channel_id` | 公告頻道 ID，發訊時自動 pin |
+
+```bash
+wrangler d1 execute trading-signals-db --remote \
+  --command="UPDATE system_config SET value='1' WHERE key='global_be_on_tp1'"
+```
+
 ## 📋 快速速查
 
 ```
-發訊      /long  /short  /scalp /swing
-止盈損    /tp1 /tp2 /tp3 /sl /close /update
-廣播      /bc /announce /alert
-用戶      /users /user /pro /vip /adddays /ban /unban /msg
+發訊      /long /short /scalp /swing /daytrade
+止盈損    /tp1 /tp2 /tp3 /sl /close /update /be
+廣播      /bc /announce /alert  /daily /weekly
+用戶      /users /user /pro /vip /adddays /ban /unban /msg /note /exec
+群組      /groupnew /grouplist /groupinfo /groupadd /grouprm /groupdel
 訂單      /orders /confirm /reject
-系統      /admin /dash /perf /config /pause /resume
+系統      /admin /dash /perf /config /pause /resume /selftest /synccmds
 設定      /setprice /setcontact /settrial /sendtest
 ```
 

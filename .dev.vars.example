@@ -17,6 +17,10 @@ BOT_TOKEN=1234567890:ABCDEF_your_bot_token_here
 # 設定後 setWebhook 時務必帶上 secret_token=<同樣值>
 WEBHOOK_SECRET=
 
+# 可選：TradingView webhook 驗證密鑰
+# 設定後 TV alert 必須帶 header X-TV-Secret: <同樣值>
+TV_WEBHOOK_SECRET=
+
 # 以下若已寫在 wrangler.toml [vars] 可不必重複放
 ADMIN_IDS=810479094
 BOT_USERNAME=Dan_mix_bot

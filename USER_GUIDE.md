@@ -230,6 +230,30 @@
 
 ---
 
+## 🆕 v9.2 新功能
+
+### 📐 計算機（即時、不用會員）
+
+```
+/rr 21500 21480 21540          # 算 R:R = 1:2
+/size NQ 21500 21480           # 依你的資金/風險算建議口數
+```
+
+`/size` 會用你的 `/capital` 與 `/risk` 設定，搭配品種 tick value 自動算。
+
+### 🛡️ 風控進階
+
+```
+/setlimit 50      # 每日虧損上限 50 點，達上限後訊號卡會印警示
+/setlimit 0       # 取消上限
+/setbe on         # TP1 達成時系統建議移動止損到成本
+/setmax 1         # 同品種最多同時 1 張未平倉，超過時警示
+/img on           # 訊號改用圖片版（含 entry/sl/tp 圖表）
+/img off          # 回純文字
+```
+
+> 警示是**提醒**，不會阻擋訊號發送。
+
 ## ❓ 完整指令清單
 
 ```
@@ -251,11 +275,19 @@
 
 設定
   /settings      設定總覽
-  /notify        通知開關
+  /notify        通知開關 (含每週報告)
   /quiet         安靜時段
   /capital N     資金 N 美元
   /risk N        風險 N %
   /timezone TZ   時區
+  /setlimit N    每日虧損上限 (點數)
+  /setbe on/off  TP1 自動 BE 提醒
+  /setmax N      同品種最大同時持倉
+  /img  on/off   訊號圖片版
+
+計算機
+  /rr E S T      風險報酬比 (免會員)
+  /size T E S    建議口數
 
 訊號
   /signals       最新訊號

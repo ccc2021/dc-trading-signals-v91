@@ -4,8 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  VERSION: '9.1.1',
-  BUILD: 'UserSubscribe',
+  VERSION: '9.2.0',
+  BUILD: 'FeaturePack',
 
   // ⚠️ 機敏資訊請以 wrangler secret/vars 注入，請勿寫死於原始碼。
   // 必填 vars/secrets (見 wrangler.toml 與 DEPLOY_GUIDE.md):
@@ -17,6 +17,7 @@ const CONFIG = {
   ADMIN_IDS: [],
   BOT_USERNAME: '',
   WEBHOOK_SECRET: '',
+  TV_WEBHOOK_SECRET: '',
 
   // 會員等級
   TIERS: {
@@ -59,6 +60,7 @@ function initConfig(env) {
   CONFIG.BOT_TOKEN = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
   CONFIG.BOT_USERNAME = env.BOT_USERNAME || CONFIG.BOT_USERNAME;
   CONFIG.WEBHOOK_SECRET = env.WEBHOOK_SECRET || CONFIG.WEBHOOK_SECRET;
+  CONFIG.TV_WEBHOOK_SECRET = env.TV_WEBHOOK_SECRET || CONFIG.TV_WEBHOOK_SECRET;
   if (env.ADMIN_IDS) {
     CONFIG.ADMIN_IDS = String(env.ADMIN_IDS)
       .split(',').map(s => s.trim()).filter(Boolean);
@@ -80,6 +82,99 @@ const genOrderId = () => 'ORD' + Date.now().toString(36).toUpperCase();
 const isAdmin = (id) => CONFIG.ADMIN_IDS.includes(String(id));
 const tierName = (t) => (CONFIG.TIERS[t]?.emoji || '👤') + ' ' + (CONFIG.TIERS[t]?.name || '免費會員');
 const tierEmoji = (t) => CONFIG.TIERS[t]?.emoji || '👤';
+
+// ─── 純計算（可被單元測試）─────────────────────────────────────────────────
+function tickValueOf(ticker, symbolMeta) {
+  return Number(symbolMeta?.tick_value ?? CONFIG.DEFAULT_TICK_VALUE[ticker] ?? 5);
+}
+
+function calculateRR(entry, sl, tp) {
+  const e = Number(entry), s = Number(sl), t = Number(tp);
+  if (!isFinite(e) || !isFinite(s) || !isFinite(t)) return null;
+  const risk = Math.abs(e - s);
+  const reward = Math.abs(t - e);
+  if (risk === 0) return null;
+  return reward / risk;
+}
+
+function calculateSize(capital, riskPercent, entry, sl, tickValue) {
+  const cap = Number(capital), pct = Number(riskPercent);
+  const e = Number(entry), s = Number(sl), tv = Number(tickValue);
+  if (!isFinite(cap) || !isFinite(pct) || !isFinite(e) || !isFinite(s) || !isFinite(tv)) return null;
+  const risk = Math.abs(e - s);
+  if (risk <= 0 || tv <= 0 || cap <= 0 || pct <= 0) return null;
+  const riskAmount = cap * (pct / 100);
+  return {
+    riskAmount,
+    riskPoints: risk,
+    contracts: riskAmount / (risk * tv),
+    perContractRisk: risk * tv
+  };
+}
+
+function parseTradingViewPayload(body) {
+  if (!body || typeof body !== 'object') return { ok: false, error: 'invalid_body' };
+  const action = String(body.action || '').toUpperCase();
+  if (action !== 'LONG' && action !== 'SHORT') return { ok: false, error: 'invalid_action' };
+  const ticker = String(body.ticker || '').toUpperCase();
+  if (!/^[A-Z0-9]{1,10}$/.test(ticker)) return { ok: false, error: 'invalid_ticker' };
+  const entry = Number(body.entry), sl = Number(body.sl);
+  if (!isFinite(entry) || !isFinite(sl)) return { ok: false, error: 'invalid_price' };
+  const tp1 = body.tp1 != null ? Number(body.tp1) : null;
+  const tp2 = body.tp2 != null ? Number(body.tp2) : null;
+  const tp3 = body.tp3 != null ? Number(body.tp3) : null;
+  const type = ['scalp', 'swing', 'daytrade'].includes(body.type) ? body.type : 'scalp';
+  const target = body.target ? String(body.target).toLowerCase() : 'all';
+  const isVipOnly = target === 'vip' ? 1 : 0;
+  return { ok: true, signal: { action, ticker, entry, sl, tp1, tp2, tp3, type, target, isVipOnly } };
+}
+
+function localDateString(timezone, now = new Date()) {
+  // 回傳該時區的 YYYY-MM-DD
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone || 'Asia/Taipei',
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    return fmt.format(now);
+  } catch {
+    return new Intl.DateTimeFormat('en-CA').format(now);
+  }
+}
+
+// 多語系字串
+const STRINGS = {
+  'zh-TW': {
+    main_title: '📱 DC Trading Signals',
+    user_label: '用戶',
+    days_left: '剩餘 %d 天',
+    btn_signals: '📊 最新訊號', btn_mystats: '📈 我的績效',
+    btn_subscribe: '🎯 訂閱設定', btn_settings: '⚙️ 個人設定',
+    btn_plans: '💎 升級會員', btn_invite: '🎁 邀請好友',
+    btn_contact: '📞 聯繫客服', btn_help: '❓ 幫助說明',
+    help_title: '❓ <b>使用說明</b>'
+  },
+  en: {
+    main_title: '📱 DC Trading Signals',
+    user_label: 'User',
+    days_left: '%d days left',
+    btn_signals: '📊 Signals', btn_mystats: '📈 My Stats',
+    btn_subscribe: '🎯 Subscribe', btn_settings: '⚙️ Settings',
+    btn_plans: '💎 Upgrade', btn_invite: '🎁 Invite',
+    btn_contact: '📞 Contact', btn_help: '❓ Help',
+    help_title: '❓ <b>Help</b>'
+  }
+};
+
+function t(settingsOrLang, key, ...args) {
+  const lang = typeof settingsOrLang === 'string'
+    ? settingsOrLang
+    : (settingsOrLang?.language || 'zh-TW');
+  const dict = STRINGS[lang] || STRINGS['zh-TW'];
+  let s = dict[key] ?? STRINGS['zh-TW'][key] ?? key;
+  for (const a of args) s = s.replace('%d', a).replace('%s', a);
+  return s;
+}
 const fmtNum = (n) => n?.toLocaleString() || '0';
 const fmtPrice = (n) => n?.toFixed(2) || '0.00';
 const fmtDate = (d) => d ? new Date(d).toLocaleDateString('zh-TW') : '-';
@@ -114,6 +209,67 @@ async function editTg(chatId, msgId, text, kb = null) {
       body: JSON.stringify(body)
     });
   } catch (e) {}
+}
+
+async function sendPhoto(chatId, photoUrl, caption = '', kb = null) {
+  const body = { chat_id: chatId, photo: photoUrl, caption, parse_mode: 'HTML' };
+  if (kb) body.reply_markup = kb;
+  try {
+    const res = await fetch(`${TG()}/sendPhoto`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return res.json();
+  } catch (e) { return { ok: false }; }
+}
+
+async function pinChatMessage(chatId, msgId, disableNotification = true) {
+  try {
+    return await fetch(`${TG()}/pinChatMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: msgId, disable_notification: disableNotification })
+    }).then(r => r.json());
+  } catch (e) { return { ok: false }; }
+}
+
+async function answerInlineQuery(queryId, results, cacheTime = 60) {
+  try {
+    return await fetch(`${TG()}/answerInlineQuery`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inline_query_id: queryId, results, cache_time: cacheTime, is_personal: true })
+    }).then(r => r.json());
+  } catch (e) { return { ok: false }; }
+}
+
+// 訊號圖片 URL（用 QuickChart 生成）
+function buildSignalPhotoUrl(signal) {
+  const { ticker, action, entry_price, stop_loss, tp1, tp2, tp3 } = signal;
+  const labels = ['SL', 'Entry'];
+  const data = [stop_loss, entry_price];
+  if (tp1) { labels.push('TP1'); data.push(tp1); }
+  if (tp2) { labels.push('TP2'); data.push(tp2); }
+  if (tp3) { labels.push('TP3'); data.push(tp3); }
+  const colors = labels.map(l =>
+    l === 'SL' ? '#ef4444' : l === 'Entry' ? (action === 'LONG' ? '#10b981' : '#f59e0b') : '#3b82f6'
+  );
+  const config = {
+    type: 'bar',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+    options: {
+      indexAxis: 'y',
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `${action} ${ticker}`, color: '#fff', font: { size: 18 } }
+      },
+      scales: {
+        x: { ticks: { color: '#ccc' }, grid: { color: '#333' } },
+        y: { ticks: { color: '#ccc' }, grid: { color: '#333' } }
+      }
+    }
+  };
+  const url = 'https://quickchart.io/chart?bkg=%231a1a2e&w=600&h=400&c=' +
+    encodeURIComponent(JSON.stringify(config));
+  return url;
 }
 
 async function answerCb(cbId, text = '', showAlert = false) {
@@ -378,26 +534,62 @@ function formatAlertCard(message) {
   return msg;
 }
 
-function formatDailyReport(stats) {
+function formatDailyReport(stats, dateLabel = null) {
+  const label = dateLabel || new Date().toLocaleDateString('zh-TW');
+  const total = stats?.total || 0;
+  const wins = stats?.wins || 0;
+  const losses = stats?.losses || 0;
+  const pnl = stats?.pnl || 0;
+  const winRate = total > 0 ? ((wins / total) * 100).toFixed(1) : '0.0';
   let msg = `╔═══════════════════════════╗\n`;
   msg += `║  📊 <b>每日績效報告</b>\n`;
-  msg += `║  ${new Date().toLocaleDateString('zh-TW')}\n`;
+  msg += `║  ${label}\n`;
   msg += `╠═══════════════════════════╣\n`;
   msg += `║\n`;
   msg += `║  📈 今日戰績\n`;
   msg += `║  ─────────────────────\n`;
-  msg += `║  總交易  │ ${stats.total || 0} 筆\n`;
-  msg += `║  獲利    │ ${stats.wins || 0} 筆  ✅\n`;
-  msg += `║  虧損    │ ${stats.losses || 0} 筆  ❌\n`;
-  const winRate = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(1) : 0;
-  msg += `║  勝率    │ ${winRate}%  ${winRate >= 60 ? '🔥' : ''}\n`;
+  msg += `║  總交易  │ ${total} 筆\n`;
+  msg += `║  獲利    │ ${wins} 筆  ✅\n`;
+  msg += `║  虧損    │ ${losses} 筆  ❌\n`;
+  msg += `║  勝率    │ ${winRate}%  ${parseFloat(winRate) >= 60 ? '🔥' : ''}\n`;
   msg += `║\n`;
   msg += `╠═══════════════════════════╣\n`;
   msg += `║\n`;
   msg += `║  💰 盈虧統計\n`;
   msg += `║  ─────────────────────\n`;
-  msg += `║  淨盈虧  │ ${stats.pnl >= 0 ? '+' : ''}${fmtPrice(stats.pnl || 0)} 點\n`;
+  msg += `║  淨盈虧  │ ${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)} 點\n`;
   msg += `║\n`;
+  msg += `╚═══════════════════════════╝`;
+  return msg;
+}
+
+function formatWeeklyReport(stats, perSymbol = []) {
+  const total = stats?.total || 0;
+  const wins = stats?.wins || 0;
+  const losses = stats?.losses || 0;
+  const pnl = stats?.pnl || 0;
+  const winRate = total > 0 ? ((wins / total) * 100).toFixed(1) : '0.0';
+  let msg = `╔═══════════════════════════╗\n`;
+  msg += `║  📅 <b>每週績效報告</b>\n`;
+  msg += `║  近 7 日\n`;
+  msg += `╠═══════════════════════════╣\n`;
+  msg += `║\n`;
+  msg += `║  📈 戰績\n`;
+  msg += `║  ─────────────────────\n`;
+  msg += `║  總交易  │ ${total} 筆\n`;
+  msg += `║  勝率    │ ${winRate}%\n`;
+  msg += `║  淨盈虧  │ ${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)} 點\n`;
+  msg += `║\n`;
+  if (perSymbol.length > 0) {
+    msg += `╠═══════════════════════════╣\n`;
+    msg += `║  📊 各品種\n`;
+    msg += `║  ─────────────────────\n`;
+    for (const r of perSymbol.slice(0, 8)) {
+      const wr = r.total > 0 ? ((r.wins / r.total) * 100).toFixed(0) : '0';
+      msg += `║  ${(r.ticker || '').padEnd(4)} │ ${String(r.total).padStart(3)}筆 ${wr.padStart(3)}% ${r.pnl >= 0 ? '+' : ''}${fmtPrice(r.pnl)}\n`;
+    }
+    msg += `║\n`;
+  }
   msg += `╚═══════════════════════════╝`;
   return msg;
 }
@@ -459,6 +651,18 @@ async function broadcastSignal(db, signal) {
   const symbolMeta = await db.prepare('SELECT * FROM symbols WHERE symbol = ?')
     .bind(signal.ticker).first();
 
+  // pin 到頻道（若有設定）
+  const pinChannelId = await getConfig(db, 'pin_channel_id');
+  if (pinChannelId) {
+    try {
+      const cardMsg = formatSignalCard(signal, null, signal.is_vip_only ? true : false, symbolMeta);
+      const r = await sendTg(pinChannelId, cardMsg);
+      if (r?.ok && r.result?.message_id) {
+        await pinChatMessage(pinChannelId, r.result.message_id);
+      }
+    } catch (e) {}
+  }
+
   // 取得所有付費會員
   const users = await db.prepare(`
     SELECT u.user_id, u.tier, us.*
@@ -484,14 +688,49 @@ async function broadcastSignal(db, signal) {
       continue;
     }
 
+    // ───── v9.2 風控提示 ─────
+    let riskWarn = '';
+
+    // 1) 每日虧損上限：累計用戶當日已執行訊號的虧損
+    if (user.daily_loss_limit && user.daily_loss_limit > 0) {
+      const today = localDateString(user.timezone || 'Asia/Taipei');
+      const lossRow = await db.prepare(`
+        SELECT COALESCE(SUM(s.pnl_points), 0) AS total_pnl
+        FROM user_executions ue
+        JOIN signals s ON ue.signal_uid = s.signal_uid
+        WHERE ue.user_id = ? AND ue.status = 'executed'
+          AND s.result = 'loss'
+          AND date(ue.created_at) = ?
+      `).bind(user.user_id, today).first();
+      const lossPts = Math.abs(lossRow?.total_pnl || 0);
+      if (lossPts >= user.daily_loss_limit) {
+        riskWarn += `\n⚠️ 已達每日虧損上限 (${lossPts.toFixed(1)}/${user.daily_loss_limit} 點)`;
+      }
+    }
+
+    // 2) 同品種最大同時持倉提醒
+    if (user.max_concurrent && user.max_concurrent > 0) {
+      const concRow = await db.prepare(`
+        SELECT COUNT(*) AS c
+        FROM user_executions ue
+        JOIN signals s ON ue.signal_uid = s.signal_uid
+        WHERE ue.user_id = ? AND ue.status = 'executed'
+          AND s.ticker = ? AND s.status = 'active'
+      `).bind(user.user_id, signal.ticker).first();
+      const conc = concRow?.c || 0;
+      if (conc >= user.max_concurrent) {
+        riskWarn += `\n⚠️ ${signal.ticker} 已有 ${conc} 張未平倉，達上限`;
+      }
+    }
+
     // 格式化訊號（個人化）
     const isVip = user.tier === 'vip';
-    const msg = formatSignalCard(signal, user, isVip, symbolMeta);
-    
+    let msg = formatSignalCard(signal, user, isVip, symbolMeta);
+    if (riskWarn) msg += `\n${riskWarn}`;
+
     // 檢查安靜時段
     if (await isInQuietHours(user)) {
       // 加入待發佇列
-      const quietEnd = user.quiet_end;
       await db.prepare(`
         INSERT INTO queued_signals (user_id, signal_uid, message, scheduled_at)
         VALUES (?, ?, ?, datetime('now', '+8 hours'))
@@ -499,7 +738,7 @@ async function broadcastSignal(db, signal) {
       queued++;
       continue;
     }
-    
+
     // 發送訊號
     const kb = {
       inline_keyboard: [[
@@ -508,7 +747,15 @@ async function broadcastSignal(db, signal) {
       ]]
     };
     
-    const r = await sendTg(user.user_id, msg, kb);
+    let r;
+    if (user.use_photo) {
+      const photoUrl = buildSignalPhotoUrl(signal);
+      r = await sendPhoto(user.user_id, photoUrl, msg, kb);
+      // QuickChart 失敗 fallback 純文字
+      if (!r?.ok) r = await sendTg(user.user_id, msg, kb);
+    } else {
+      r = await sendTg(user.user_id, msg, kb);
+    }
     if (r?.ok) {
       sent++;
       // 累計接收數，作為試用判斷的旁證
@@ -586,6 +833,8 @@ async function broadcastMessage(db, message, targetGroup = 'all', notifyType = '
     if (notifyType === 'announcement' && !user.notify_announcement) continue;
     if (notifyType === 'alert' && !user.notify_alert) continue;
     if (notifyType === 'daily_report' && !user.notify_daily_report) continue;
+    if (notifyType === 'weekly_report' && !user.notify_weekly_report) continue;
+    if (notifyType === 'update' && !user.notify_update) continue;
     
     const r = await sendTg(user.user_id, message);
     if (r?.ok) sent++;
@@ -777,9 +1026,10 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     m += `\n<b>系統通知</b>\n`;
     buttons.push([
       { text: (settings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'toggle_notify_daily' },
-      { text: (settings.notify_announcement ? '✅' : '⬜') + ' 重要公告', callback_data: 'toggle_notify_announce' }
+      { text: (settings.notify_weekly_report ? '✅' : '⬜') + ' 每週報告', callback_data: 'toggle_notify_weekly' }
     ]);
     buttons.push([
+      { text: (settings.notify_announcement ? '✅' : '⬜') + ' 重要公告', callback_data: 'toggle_notify_announce' },
       { text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'toggle_notify_alert' }
     ]);
     
@@ -1367,6 +1617,84 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     return handleUserCommand(cid, uid, '/plans', [], env);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // /size <ticker> <entry> <sl> — 依用戶資金/風險算建議口數
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/size') {
+    if (args.length < 3) return sendTg(cid, `用法：/size <品種> <進場> <止損>\n例：/size NQ 21500 21480`);
+    const ticker = args[0].toUpperCase();
+    const entry = parseFloat(args[1]);
+    const sl = parseFloat(args[2]);
+    if (!isFinite(entry) || !isFinite(sl)) return sendTg(cid, `❌ 進場/止損需為數字`);
+    const meta = await db.prepare('SELECT * FROM symbols WHERE symbol = ?').bind(ticker).first();
+    const tv = tickValueOf(ticker, meta);
+    const calc = calculateSize(settings.capital, settings.risk_percent, entry, sl, tv);
+    if (!calc) return sendTg(cid, `❌ 計算失敗，請檢查參數與資金設定`);
+    let m = `📐 <b>口數計算 — ${ticker}</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    m += `資金 │ $${fmtNum(settings.capital)}\n`;
+    m += `風險 │ ${settings.risk_percent}% = $${fmtNum(calc.riskAmount.toFixed(0))}\n`;
+    m += `止損 │ ${calc.riskPoints.toFixed(2)} 點 ($${calc.perContractRisk.toFixed(2)} / 口)\n`;
+    m += `━━━━━━━━━━━━━━━━━━\n`;
+    m += `📊 建議口數 │ <b>${calc.contracts.toFixed(2)} 口</b>`;
+    return sendTg(cid, m);
+  }
+
+  // /rr <entry> <sl> <tp> — 報酬風險比 (free 也可用)
+  if (cmd === '/rr') {
+    if (args.length < 3) return sendTg(cid, `用法：/rr <進場> <止損> <目標>\n例：/rr 21500 21480 21540`);
+    const e = parseFloat(args[0]), s = parseFloat(args[1]), tp = parseFloat(args[2]);
+    const rr = calculateRR(e, s, tp);
+    if (rr == null) return sendTg(cid, `❌ 參數錯誤或止損與進場相同`);
+    const risk = Math.abs(e - s), reward = Math.abs(tp - e);
+    let m = `🎯 <b>R:R 計算</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    m += `風險 │ ${risk.toFixed(2)} 點\n`;
+    m += `報酬 │ ${reward.toFixed(2)} 點\n`;
+    m += `R:R  │ <b>1:${rr.toFixed(2)}</b>  ${rr >= 2 ? '🔥' : rr >= 1 ? '✅' : '⚠️'}`;
+    return sendTg(cid, m);
+  }
+
+  // /setlimit <點數> — 設定每日虧損上限
+  if (cmd === '/setlimit') {
+    if (args.length === 0) {
+      return sendTg(cid, `目前每日虧損上限：${settings.daily_loss_limit || 0} 點 (0 = 不限)\n用法：/setlimit <點數>\n例：/setlimit 50`);
+    }
+    const v = parseFloat(args[0]);
+    if (!isFinite(v) || v < 0) return sendTg(cid, `❌ 請輸入 ≥ 0 的數字`);
+    await updateUserSettings(db, uid, { daily_loss_limit: v });
+    return sendTg(cid, v === 0 ? `✅ 已關閉虧損上限` : `✅ 每日虧損上限設為 ${v} 點`);
+  }
+
+  // /setbe on|off
+  if (cmd === '/setbe') {
+    if (args.length === 0) {
+      return sendTg(cid, `目前 auto-BE：${settings.auto_be ? '✅ 啟用' : '⬜ 關閉'}\n用法：/setbe on 或 /setbe off`);
+    }
+    const on = args[0].toLowerCase() === 'on';
+    await updateUserSettings(db, uid, { auto_be: on ? 1 : 0 });
+    return sendTg(cid, `✅ Auto-BE 已${on ? '啟用' : '關閉'}\n(TP1 達成時系統會建議移動止損到成本)`);
+  }
+
+  // /setmax <N> — 同品種最大同時持倉提醒
+  if (cmd === '/setmax') {
+    if (args.length === 0) {
+      return sendTg(cid, `目前同品種上限：${settings.max_concurrent || 0} (0 = 不限)\n用法：/setmax <N>`);
+    }
+    const v = parseInt(args[0]);
+    if (!Number.isInteger(v) || v < 0) return sendTg(cid, `❌ 需 ≥ 0 整數`);
+    await updateUserSettings(db, uid, { max_concurrent: v });
+    return sendTg(cid, `✅ 已設定上限 ${v} (0 = 不限)`);
+  }
+
+  // /img on|off — 訊號圖片版本
+  if (cmd === '/img') {
+    if (args.length === 0) {
+      return sendTg(cid, `目前圖片模式：${settings.use_photo ? '✅ 啟用' : '⬜ 關閉'}\n/img on 或 /img off`);
+    }
+    const on = args[0].toLowerCase() === 'on';
+    await updateUserSettings(db, uid, { use_photo: on ? 1 : 0 });
+    return sendTg(cid, `✅ 圖片模式已${on ? '啟用' : '關閉'}`);
+  }
+
   return null;
 }
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1620,26 +1948,34 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
       ],
       [
         { text: (settings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'ntf_daily' },
-        { text: (settings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' }
+        { text: (settings.notify_weekly_report ? '✅' : '⬜') + ' 每週報告', callback_data: 'ntf_weekly' }
       ],
-      [{ text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }],
+      [
+        { text: (settings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' },
+        { text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }
+      ],
       [{ text: '« 返回', callback_data: 'u_settings' }]
     ];
-    
+
     return editTg(cid, msgId, m, { inline_keyboard: buttons });
   }
-  
+
   // 切換通知設定
-  if (data.startsWith('ntf_')) {
+  if (data.startsWith('ntf_') || data.startsWith('toggle_notify_')) {
+    // 同時支援 ntf_* (來自選單) 與 toggle_notify_* (來自 /notify 指令)
+    const key = data.startsWith('toggle_notify_')
+      ? 'ntf_' + data.replace('toggle_notify_', '').replace('weekly', 'weekly').replace('daily', 'daily').replace('announce', 'announce')
+      : data;
     const field = {
       'ntf_entry': 'notify_entry',
       'ntf_tp': 'notify_tp',
       'ntf_sl': 'notify_sl',
       'ntf_update': 'notify_update',
       'ntf_daily': 'notify_daily_report',
+      'ntf_weekly': 'notify_weekly_report',
       'ntf_announce': 'notify_announcement',
       'ntf_alert': 'notify_alert'
-    }[data];
+    }[key];
     
     if (field) {
       const newValue = settings[field] ? 0 : 1;
@@ -1664,9 +2000,12 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
         ],
         [
           { text: (newSettings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'ntf_daily' },
-          { text: (newSettings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' }
+          { text: (newSettings.notify_weekly_report ? '✅' : '⬜') + ' 每週報告', callback_data: 'ntf_weekly' }
         ],
-        [{ text: (newSettings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }],
+        [
+          { text: (newSettings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' },
+          { text: (newSettings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }
+        ],
         [{ text: '« 返回', callback_data: 'u_settings' }]
       ];
       
@@ -1879,10 +2218,62 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
     return;
   }
 
-  // 績效篩選佔位 (避免按鈕無回應)
-  if (data === 'mystats_symbol' || data === 'mystats_month') {
-    await answerCb(null, '此功能即將推出');
-    return;
+  // 績效：按品種分桶
+  if (data === 'mystats_symbol') {
+    const rows = await db.prepare(`
+      SELECT s.ticker,
+             COUNT(*) AS total,
+             SUM(CASE WHEN s.result = 'win' THEN 1 ELSE 0 END) AS wins,
+             SUM(s.pnl_points) AS pnl
+      FROM user_executions ue
+      JOIN signals s ON ue.signal_uid = s.signal_uid
+      WHERE ue.user_id = ? AND ue.status = 'executed'
+        AND ue.created_at >= datetime('now', '-90 days')
+      GROUP BY s.ticker
+      ORDER BY total DESC
+    `).bind(uid).all();
+    let m = `📊 <b>按品種績效 (近90天)</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    if (!rows.results || rows.results.length === 0) {
+      m += `\n尚無已執行的訊號\n標記訊號為「✅ 已執行」來累積數據`;
+    } else {
+      for (const r of rows.results) {
+        const wr = r.total > 0 ? ((r.wins / r.total) * 100).toFixed(0) : '0';
+        const pnl = r.pnl || 0;
+        m += `${r.ticker.padEnd(4)}  ${String(r.total).padStart(3)}筆  ${wr.padStart(3)}%  ${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)}\n`;
+      }
+    }
+    return editTg(cid, msgId, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_mystats' }]] });
+  }
+
+  // 績效：按月份分桶 (最近 6 個月)
+  if (data === 'mystats_month') {
+    const rows = await db.prepare(`
+      SELECT strftime('%Y-%m', ue.created_at) AS ym,
+             COUNT(*) AS total,
+             SUM(CASE WHEN s.result = 'win' THEN 1 ELSE 0 END) AS wins,
+             SUM(s.pnl_points) AS pnl
+      FROM user_executions ue
+      JOIN signals s ON ue.signal_uid = s.signal_uid
+      WHERE ue.user_id = ? AND ue.status = 'executed'
+        AND ue.created_at >= datetime('now', '-6 months')
+      GROUP BY ym
+      ORDER BY ym DESC
+    `).bind(uid).all();
+    let m = `📅 <b>近 6 個月績效</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    if (!rows.results || rows.results.length === 0) {
+      m += `\n尚無資料`;
+    } else {
+      // 計算最大值用於做柱狀圖
+      const maxAbs = Math.max(...rows.results.map(r => Math.abs(r.pnl || 0)), 1);
+      for (const r of rows.results) {
+        const wr = r.total > 0 ? ((r.wins / r.total) * 100).toFixed(0) : '0';
+        const pnl = r.pnl || 0;
+        const barLen = Math.round((Math.abs(pnl) / maxAbs) * 12);
+        const bar = (pnl >= 0 ? '🟩' : '🟥').repeat(Math.max(barLen, 1));
+        m += `${r.ym}  ${String(r.total).padStart(2)}筆 ${wr.padStart(3)}%\n${bar} ${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)}\n\n`;
+      }
+    }
+    return editTg(cid, msgId, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_mystats' }]] });
   }
 
   // 複製邀請連結
@@ -2187,10 +2578,38 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     }
     
     const result = await broadcastExit(db, type, ticker, price, pnl, '恭喜獲利！🎉', signal?.signal_uid);
-    
+
     await logAction(db, uid, type, ticker, `${fmtPrice(price)}`);
-    
-    return sendTg(cid, `✅ ${type} 已發送\n${ticker} @ ${fmtPrice(price)}\n盈虧：${pnl !== null ? (pnl >= 0 ? '+' : '') + fmtPrice(pnl) + '點' : '-'}\n發送：${result.sent} 人`);
+
+    // v9.2: 若全域 BE-on-TP1 開啟且本次是 TP1，自動把止損移到成本
+    let beNote = '';
+    if (signal && type === 'TP1' && (await getConfig(db, 'global_be_on_tp1')) === '1') {
+      await db.prepare(`UPDATE signals SET stop_loss = ? WHERE signal_uid = ?`)
+        .bind(signal.entry_price, signal.signal_uid).run();
+      const beMsg = formatUpdateCard(`${ticker} 止損已自動移至成本價 ${fmtPrice(signal.entry_price)} (TP1 達成)`);
+      const beRes = await broadcastMessage(db, beMsg, 'paid', 'update');
+      beNote = `\n🔄 BE 自動觸發，已通知 ${beRes.sent} 人`;
+      await logAction(db, 'SYSTEM', 'auto_be', ticker, signal.signal_uid);
+    }
+
+    return sendTg(cid, `✅ ${type} 已發送\n${ticker} @ ${fmtPrice(price)}\n盈虧：${pnl !== null ? (pnl >= 0 ? '+' : '') + fmtPrice(pnl) + '點' : '-'}\n發送：${result.sent} 人${beNote}`);
+  }
+
+  // /be <ticker> — 把該品種最新 active 訊號的止損移到 entry
+  if (cmd === '/be') {
+    if (!args[0]) return sendTg(cid, `用法：/be <品種>`);
+    const ticker = args[0].toUpperCase();
+    const sig = await db.prepare(`
+      SELECT * FROM signals WHERE ticker = ? AND status = 'active'
+      ORDER BY created_at DESC LIMIT 1
+    `).bind(ticker).first();
+    if (!sig) return sendTg(cid, `❌ 找不到 ${ticker} 的 active 訊號`);
+    await db.prepare(`UPDATE signals SET stop_loss = ? WHERE signal_uid = ?`)
+      .bind(sig.entry_price, sig.signal_uid).run();
+    const msg = formatUpdateCard(`${ticker} 止損移至成本價 ${fmtPrice(sig.entry_price)}`);
+    const r = await broadcastMessage(db, msg, 'paid', 'update');
+    await logAction(db, uid, 'be', ticker, sig.signal_uid);
+    return sendTg(cid, `✅ ${ticker} BE 已通知 ${r.sent} 人`);
   }
   
   // /sl 止損
@@ -2723,23 +3142,285 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const msg = formatSignalCard(sig, settings, true, meta);
     return sendTg(cid, msg);
   }
+
+  // /synccmds — 把 user 指令清單推到 Telegram bot menu
+  if (cmd === '/synccmds') {
+    const commands = [
+      { command: 'menu',      description: '主選單' },
+      { command: 'signals',   description: '最新訊號' },
+      { command: 'mystats',   description: '我的績效' },
+      { command: 'subscribe', description: '訂閱品種' },
+      { command: 'settings',  description: '個人設定' },
+      { command: 'size',      description: '口數計算' },
+      { command: 'rr',        description: 'R:R 計算' },
+      { command: 'plans',     description: '會員方案' },
+      { command: 'trial',     description: '申請試用' },
+      { command: 'checkin',   description: '每日簽到' },
+      { command: 'invite',    description: '邀請好友' },
+      { command: 'help',      description: '使用說明' }
+    ];
+    try {
+      const r = await fetch(`${TG()}/setMyCommands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ commands })
+      }).then(x => x.json());
+      await logAction(db, uid, 'synccmds', '', `n=${commands.length}`);
+      return sendTg(cid, r?.ok ? `✅ 已同步 ${commands.length} 個指令到 Bot menu` : `❌ 同步失敗：${r?.description}`);
+    } catch (e) {
+      return sendTg(cid, `❌ 失敗：${e.message}`);
+    }
+  }
+
+  // /selftest — 系統自檢
+  if (cmd === '/selftest') {
+    const lines = [];
+    const ok = (b) => b ? '✅' : '❌';
+    lines.push(`<b>🔍 系統自檢</b>`);
+    lines.push(`版本：v${CONFIG.VERSION} ${CONFIG.BUILD}`);
+    lines.push(`━━━━━━━━━━━━━━━━━━`);
+    lines.push(`<b>環境變數</b>`);
+    lines.push(`${ok(!!CONFIG.BOT_TOKEN)} BOT_TOKEN`);
+    lines.push(`${ok(CONFIG.ADMIN_IDS.length > 0)} ADMIN_IDS (${CONFIG.ADMIN_IDS.length})`);
+    lines.push(`${ok(!!CONFIG.BOT_USERNAME)} BOT_USERNAME (${CONFIG.BOT_USERNAME || '-'})`);
+    lines.push(`${ok(!!CONFIG.WEBHOOK_SECRET)} WEBHOOK_SECRET ${CONFIG.WEBHOOK_SECRET ? '' : '(未設定)'}`);
+    lines.push(`${ok(!!CONFIG.TV_WEBHOOK_SECRET)} TV_WEBHOOK_SECRET ${CONFIG.TV_WEBHOOK_SECRET ? '' : '(未設定)'}`);
+
+    lines.push(`\n<b>D1 連線</b>`);
+    let dbOK = false;
+    try {
+      const r = await db.prepare('SELECT 1 AS x').first();
+      dbOK = r?.x === 1;
+    } catch (e) {}
+    lines.push(`${ok(dbOK)} D1`);
+
+    if (dbOK) {
+      const expected = ['users','user_settings','user_executions','signals','performance','symbols','groups','group_members','orders','point_history','admin_logs','system_config','broadcasts','queued_signals'];
+      const tableRow = await db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all();
+      const present = new Set((tableRow.results || []).map(r => r.name));
+      const missing = expected.filter(t => !present.has(t));
+      lines.push(`${ok(missing.length === 0)} 資料表 ${expected.length - missing.length}/${expected.length}` + (missing.length ? `\n   缺：${missing.join(', ')}` : ''));
+
+      // 補缺欄位
+      const cols = await ensureV92Schema(db);
+      const added = cols.filter(c => c.added).map(c => `${c.table}.${c.column}`);
+      lines.push(`${ok(true)} 欄位檢查 ${added.length ? '已補：' + added.join(', ') : '全部齊備'}`);
+
+      // 24h 活動量
+      const sigCount = await db.prepare(`SELECT COUNT(*) AS c FROM signals WHERE created_at >= datetime('now','-1 day')`).first();
+      const userCount = await db.prepare(`SELECT COUNT(*) AS c FROM users`).first();
+      lines.push(`\n<b>活動 (24h)</b>`);
+      lines.push(`📊 訊號 ${sigCount?.c || 0} 筆`);
+      lines.push(`👥 用戶 ${userCount?.c || 0} 人`);
+    }
+
+    // webhookInfo
+    try {
+      const r = await fetch(`${TG()}/getWebhookInfo`).then(x => x.json());
+      if (r?.ok) {
+        lines.push(`\n<b>Webhook</b>`);
+        lines.push(`${ok(!!r.result.url)} URL: ${r.result.url || '(未設)'}`);
+        lines.push(`📥 pending: ${r.result.pending_update_count}`);
+        if (r.result.last_error_message) {
+          lines.push(`⚠️ ${r.result.last_error_message}`);
+        }
+      }
+    } catch (e) {}
+
+    return sendTg(cid, lines.join('\n'));
+  }
   
+  // ═══════════════════════════════════════════════════════════════════════════
+  // v9.2 新增：每日 / 週報 立刻廣播
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/daily') {
+    const r = await handleDailyReport(env);
+    await logAction(db, uid, 'daily_report', '', `sent=${r.sent}`);
+    return sendTg(cid, `✅ 每日報告已發送 | ${r.sent} 人`);
+  }
+
+  if (cmd === '/weekly') {
+    const r = await handleWeeklyReport(env);
+    await logAction(db, uid, 'weekly_report', '', `sent=${r.sent}`);
+    return sendTg(cid, `✅ 週報已發送 | ${r.sent} 人`);
+  }
+
+  // /note <user_id> <text> — 設定 admin_note
+  if (cmd === '/note') {
+    if (args.length < 2) return sendTg(cid, `用法：/note <user_id> <備註>`);
+    const target = args[0];
+    const note = args.slice(1).join(' ');
+    await updateUser(db, target, { admin_note: note });
+    await logAction(db, uid, 'note', target, note.slice(0, 60));
+    return sendTg(cid, `✅ 已更新 ${target} 的備註`);
+  }
+
+  // /exec <signal_uid> <user_id> <entry> <contracts> [exit] [pnl] [notes]
+  if (cmd === '/exec') {
+    if (args.length < 4) {
+      return sendTg(cid, `用法：/exec <signal_uid> <user_id> <entry> <contracts> [exit] [pnl] [notes]`);
+    }
+    const [signalUid, userId, entryStr, ctsStr, exitStr, pnlStr, ...rest] = args;
+    const actual_entry = parseFloat(entryStr);
+    const actual_contracts = parseFloat(ctsStr);
+    const actual_exit = exitStr != null ? parseFloat(exitStr) : null;
+    const actual_pnl = pnlStr != null ? parseFloat(pnlStr) : null;
+    const notes = rest.join(' ') || null;
+    if (!isFinite(actual_entry) || !isFinite(actual_contracts)) {
+      return sendTg(cid, `❌ entry / contracts 必須是數字`);
+    }
+    await db.prepare(`
+      INSERT INTO user_executions (user_id, signal_uid, status, actual_entry, actual_contracts, actual_exit, actual_pnl, notes, created_at, updated_at)
+      VALUES (?, ?, 'executed', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      ON CONFLICT(user_id, signal_uid) DO UPDATE SET
+        status='executed',
+        actual_entry=excluded.actual_entry,
+        actual_contracts=excluded.actual_contracts,
+        actual_exit=COALESCE(excluded.actual_exit, user_executions.actual_exit),
+        actual_pnl=COALESCE(excluded.actual_pnl, user_executions.actual_pnl),
+        notes=COALESCE(excluded.notes, user_executions.notes),
+        updated_at=datetime('now')
+    `).bind(userId, signalUid, actual_entry, actual_contracts, actual_exit, actual_pnl, notes).run();
+    await logAction(db, uid, 'exec', `${userId}:${signalUid}`, `${actual_entry}@${actual_contracts}`);
+    return sendTg(cid, `✅ 已記錄執行：${userId} #${signalUid}\n進場 ${actual_entry} × ${actual_contracts}`);
+  }
+
+  // /daytrade <long|short> <ticker> <entry> <sl> <tp1> ...
+  if (cmd === '/daytrade') {
+    if (args.length < 5) {
+      return sendTg(cid, `用法：/daytrade [long|short] [品種] [進場] [止損] [TP1]...`);
+    }
+    const action = args[0].toUpperCase();
+    if (action !== 'LONG' && action !== 'SHORT') return sendTg(cid, `❌ 第一個參數需為 long 或 short`);
+    const ticker = args[1].toUpperCase();
+    const entry = parseFloat(args[2]);
+    const sl = parseFloat(args[3]);
+    const tp1 = args[4] ? parseFloat(args[4]) : null;
+    const tp2 = args[5] && !args[5].startsWith('@') ? parseFloat(args[5]) : null;
+    const tp3 = args[6] && !args[6].startsWith('@') ? parseFloat(args[6]) : null;
+    let targetGroup = 'all', isVipOnly = false;
+    for (const a of args) {
+      if (a.startsWith('@')) { targetGroup = a.slice(1).toLowerCase(); if (targetGroup === 'vip') isVipOnly = true; break; }
+    }
+    const signalUid = genUID();
+    await db.prepare(`
+      INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, created_at)
+      VALUES (?, ?, ?, 'daytrade', ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind(signalUid, ticker, action, entry, sl, tp1, tp2, tp3, targetGroup, isVipOnly ? 1 : 0).run();
+    const r = await broadcastSignal(db, {
+      signal_uid: signalUid, ticker, action, signal_type: 'daytrade',
+      entry_price: entry, stop_loss: sl, tp1, tp2, tp3, target_group: targetGroup, is_vip_only: isVipOnly
+    });
+    await logAction(db, uid, 'signal', signalUid, `daytrade ${action} ${ticker}`);
+    await db.prepare(`UPDATE signals SET sent_count = ? WHERE signal_uid = ?`).bind(r.sent, signalUid).run();
+    return sendTg(cid, `✅ 🎯 日內訊號已發送\n${action} ${ticker} | 發送 ${r.sent} 人\n#${signalUid}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 群組管理
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/groupnew') {
+    if (!args[0]) return sendTg(cid, `用法：/groupnew <名稱> [描述]`);
+    const name = args[0].toLowerCase();
+    if (!/^[a-z0-9_]{1,20}$/.test(name)) return sendTg(cid, `❌ 名稱只允許小寫英數與底線，最多20字`);
+    const desc = args.slice(1).join(' ') || null;
+    try {
+      await db.prepare(`INSERT INTO groups (group_name, description) VALUES (?, ?)`).bind(name, desc).run();
+      await logAction(db, uid, 'groupnew', name, desc || '');
+      return sendTg(cid, `✅ 已建立群組 @${name}`);
+    } catch (e) {
+      return sendTg(cid, `❌ 群組已存在或建立失敗`);
+    }
+  }
+
+  if (cmd === '/grouplist') {
+    const rows = await db.prepare(`
+      SELECT g.group_name, g.description,
+             (SELECT COUNT(*) FROM group_members WHERE group_name = g.group_name) AS members
+      FROM groups g ORDER BY group_name
+    `).all();
+    if (!rows.results || rows.results.length === 0) return sendTg(cid, `📋 沒有自訂群組`);
+    let m = `📋 <b>自訂群組</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    for (const g of rows.results) {
+      m += `@${g.group_name}  (${g.members || 0} 人)`;
+      if (g.description) m += `  - ${g.description}`;
+      m += `\n`;
+    }
+    return sendTg(cid, m);
+  }
+
+  if (cmd === '/groupinfo') {
+    if (!args[0]) return sendTg(cid, `用法：/groupinfo <名稱>`);
+    const name = args[0].replace(/^@/, '').toLowerCase();
+    const g = await db.prepare(`SELECT * FROM groups WHERE group_name = ?`).bind(name).first();
+    if (!g) return sendTg(cid, `❌ 群組不存在`);
+    const members = await db.prepare(`
+      SELECT gm.user_id, u.username, u.first_name, u.tier
+      FROM group_members gm LEFT JOIN users u ON gm.user_id = u.user_id
+      WHERE gm.group_name = ? ORDER BY gm.added_at DESC LIMIT 50
+    `).bind(name).all();
+    let m = `📋 <b>@${name}</b>\n${g.description || '(無描述)'}\n━━━━━━━━━━━━━━━━━━\n`;
+    if (!members.results || members.results.length === 0) m += `(空)\n`;
+    else for (const u of members.results) {
+      const label = u.username ? `@${u.username}` : (u.first_name || u.user_id);
+      m += `${tierEmoji(u.tier)} ${label}  <code>${u.user_id}</code>\n`;
+    }
+    return sendTg(cid, m);
+  }
+
+  if (cmd === '/groupadd') {
+    if (args.length < 2) return sendTg(cid, `用法：/groupadd <user_id> <群組>`);
+    const userId = args[0];
+    const name = args[1].replace(/^@/, '').toLowerCase();
+    const g = await db.prepare(`SELECT 1 FROM groups WHERE group_name = ?`).bind(name).first();
+    if (!g) return sendTg(cid, `❌ 群組 @${name} 不存在`);
+    try {
+      await db.prepare(`INSERT INTO group_members (group_name, user_id) VALUES (?, ?)`).bind(name, userId).run();
+      await db.prepare(`UPDATE groups SET member_count = member_count + 1 WHERE group_name = ?`).bind(name).run();
+      await logAction(db, uid, 'groupadd', `${userId}->${name}`, '');
+      return sendTg(cid, `✅ 已將 ${userId} 加入 @${name}`);
+    } catch (e) {
+      return sendTg(cid, `⚠️ 已在群組內或新增失敗`);
+    }
+  }
+
+  if (cmd === '/grouprm') {
+    if (args.length < 2) return sendTg(cid, `用法：/grouprm <user_id> <群組>`);
+    const userId = args[0];
+    const name = args[1].replace(/^@/, '').toLowerCase();
+    const r = await db.prepare(`DELETE FROM group_members WHERE group_name = ? AND user_id = ?`).bind(name, userId).run();
+    await db.prepare(`UPDATE groups SET member_count = MAX(0, member_count - 1) WHERE group_name = ?`).bind(name).run();
+    await logAction(db, uid, 'grouprm', `${userId}@${name}`, '');
+    return sendTg(cid, `✅ 已從 @${name} 移除 ${userId}`);
+  }
+
+  if (cmd === '/groupdel') {
+    if (!args[0]) return sendTg(cid, `用法：/groupdel <名稱>`);
+    const name = args[0].replace(/^@/, '').toLowerCase();
+    await db.prepare(`DELETE FROM group_members WHERE group_name = ?`).bind(name).run();
+    await db.prepare(`DELETE FROM groups WHERE group_name = ?`).bind(name).run();
+    await logAction(db, uid, 'groupdel', name, '');
+    return sendTg(cid, `✅ 已刪除群組 @${name}`);
+  }
+
   // /help 管理員幫助
   if (cmd === '/help') {
     let m = `🔐 <b>管理員指令</b>\n\n`;
     m += `<b>發訊</b>\n`;
-    m += `/long [品種] [進場] [止損] [TP1]...\n`;
-    m += `/short [品種] [進場] [止損] [TP1]...\n`;
-    m += `/scalp /swing [方向] [品種]...\n`;
+    m += `/long /short [品種] [進場] [止損] [TP1]...\n`;
+    m += `/scalp /swing /daytrade [方向] [品種]...\n`;
     m += `/tp1 /tp2 /tp3 [品種] [價格]\n`;
-    m += `/sl [品種] [價格]\n`;
-    m += `/close [品種] [價格] [原因]\n\n`;
-    m += `<b>廣播</b>\n`;
-    m += `/bc /announce /update /alert\n\n`;
-    m += `<b>管理</b>\n`;
-    m += `/users /user /pro /vip /adddays\n`;
-    m += `/orders /confirm /reject\n`;
-    m += `/dash /perf /config`;
+    m += `/sl /close /update /alert /be\n\n`;
+    m += `<b>廣播 / 報告</b>\n`;
+    m += `/bc /announce  /daily /weekly  /synccmds\n\n`;
+    m += `<b>用戶</b>\n`;
+    m += `/users /user /pro /vip /adddays /note /exec\n`;
+    m += `/orders /confirm /reject\n\n`;
+    m += `<b>群組</b>\n`;
+    m += `/groupnew /grouplist /groupinfo /groupadd /grouprm /groupdel\n\n`;
+    m += `<b>系統</b>\n`;
+    m += `/dash /perf /config /pause /resume /selftest\n`;
+    m += `/setprice /setcontact /settrial /sendtest`;
     
     return sendTg(cid, m);
   }
@@ -2895,6 +3576,228 @@ async function handleExpireReminder(env) {
   return { reminded: count };
 }
 
+async function handleDailyReport(env) {
+  const db = env.DB;
+  const stats = await db.prepare(`
+    SELECT COUNT(*) as total,
+           SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+           SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
+           SUM(pnl_points) as pnl
+    FROM performance
+    WHERE created_at >= datetime('now', '-1 day')
+  `).first();
+  const msg = formatDailyReport(stats);
+  const r = await broadcastMessage(db, msg, 'paid', 'daily_report');
+  return { sent: r.sent };
+}
+
+async function handleWeeklyReport(env) {
+  const db = env.DB;
+  const stats = await db.prepare(`
+    SELECT COUNT(*) as total,
+           SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+           SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
+           SUM(pnl_points) as pnl
+    FROM performance
+    WHERE created_at >= datetime('now', '-7 days')
+  `).first();
+  const perSymbolRows = await db.prepare(`
+    SELECT ticker,
+           COUNT(*) as total,
+           SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+           SUM(pnl_points) as pnl
+    FROM performance
+    WHERE created_at >= datetime('now', '-7 days')
+    GROUP BY ticker
+    ORDER BY total DESC
+  `).all();
+  const msg = formatWeeklyReport(stats, perSymbolRows.results || []);
+  // 用客製 broadcast：依每個用戶的 notify_weekly_report
+  const users = await db.prepare(`
+    SELECT u.user_id, us.notify_weekly_report
+    FROM users u
+    LEFT JOIN user_settings us ON u.user_id = us.user_id
+    WHERE u.is_active = 1 AND u.is_banned = 0 AND u.tier != 'free'
+  `).all();
+  let sent = 0;
+  for (const u of users.results || []) {
+    if (!u.notify_weekly_report) continue;
+    const r = await sendTg(u.user_id, msg);
+    if (r?.ok) sent++;
+    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 100));
+  }
+  return { sent };
+}
+
+// ─── 執行期 schema 檢查 / 自動補欄位 ───────────────────────────────────────
+async function ensureColumn(db, table, column, ddl) {
+  try {
+    const cols = await db.prepare(`PRAGMA table_info(${table})`).all();
+    const exists = (cols.results || []).some(c => c.name === column);
+    if (!exists) {
+      await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`).run();
+      return { added: true };
+    }
+    return { added: false };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+async function ensureV92Schema(db) {
+  // v9.2 新增欄位 (idempotent)
+  const tasks = [
+    ['user_settings', 'auto_be',           'INTEGER DEFAULT 0'],
+    ['user_settings', 'daily_loss_limit',  'REAL DEFAULT 0'],
+    ['user_settings', 'max_concurrent',    'INTEGER DEFAULT 0'],
+    ['user_settings', 'use_photo',         'INTEGER DEFAULT 0'],
+    ['orders',        'payment_method',    'TEXT'],   // 既有但保險
+  ];
+  const results = [];
+  for (const [t, c, d] of tasks) {
+    results.push({ table: t, column: c, ...(await ensureColumn(db, t, c, d)) });
+  }
+  return results;
+}
+
+// ─── TradingView webhook ──────────────────────────────────────────────────
+async function handleTradingViewWebhook(request, env) {
+  // 驗證 secret
+  if (CONFIG.TV_WEBHOOK_SECRET) {
+    const got = request.headers.get('X-TV-Secret');
+    if (got !== CONFIG.TV_WEBHOOK_SECRET) {
+      return json({ error: 'unauthorized' }, 401);
+    }
+  } else {
+    return json({ error: 'TV_WEBHOOK_SECRET not configured' }, 503);
+  }
+
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: 'invalid_json' }, 400); }
+
+  const parsed = parseTradingViewPayload(body);
+  if (!parsed.ok) return json({ error: parsed.error }, 400);
+
+  const { action, ticker, entry, sl, tp1, tp2, tp3, type, target, isVipOnly } = parsed.signal;
+  const db = env.DB;
+
+  // 檢查暫停
+  const paused = await getConfig(db, 'signals_paused');
+  if (paused === '1') return json({ error: 'signals_paused' }, 423);
+
+  const signalUid = genUID();
+  await db.prepare(`
+    INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(signalUid, ticker, action, type, entry, sl, tp1, tp2, tp3, target, isVipOnly).run();
+
+  const signal = {
+    signal_uid: signalUid, ticker, action, signal_type: type,
+    entry_price: entry, stop_loss: sl, tp1, tp2, tp3,
+    target_group: target, is_vip_only: isVipOnly
+  };
+  const result = await broadcastSignal(db, signal);
+  await db.prepare(`UPDATE signals SET sent_count = ? WHERE signal_uid = ?`).bind(result.sent, signalUid).run();
+  await logAction(db, 'TRADINGVIEW', 'signal', signalUid, `${action} ${ticker} via TV`);
+
+  return json({ ok: true, signal_uid: signalUid, ...result });
+}
+
+// ─── 公開統計 ─────────────────────────────────────────────────────────────
+async function collectPublicStats(db) {
+  const buckets = [1, 7, 30, 90];
+  const summary = {};
+  for (const days of buckets) {
+    const r = await db.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) AS wins,
+             SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) AS losses,
+             COALESCE(SUM(pnl_points), 0) AS pnl
+      FROM performance WHERE created_at >= datetime('now', '-' || ? || ' days')
+    `).bind(days).first();
+    const total = r?.total || 0;
+    summary[`d${days}`] = {
+      total,
+      wins: r?.wins || 0,
+      losses: r?.losses || 0,
+      pnl: Number((r?.pnl || 0).toFixed(2)),
+      win_rate: total > 0 ? Number(((r.wins / total) * 100).toFixed(1)) : 0
+    };
+  }
+
+  const perSymbol = await db.prepare(`
+    SELECT ticker,
+           COUNT(*) AS total,
+           SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) AS wins,
+           COALESCE(SUM(pnl_points), 0) AS pnl
+    FROM performance WHERE created_at >= datetime('now', '-30 days')
+    GROUP BY ticker ORDER BY total DESC LIMIT 12
+  `).all();
+
+  return {
+    version: CONFIG.VERSION,
+    generated_at: new Date().toISOString(),
+    summary,
+    by_symbol: (perSymbol.results || []).map(r => ({
+      ticker: r.ticker,
+      total: r.total,
+      wins: r.wins || 0,
+      win_rate: r.total > 0 ? Number(((r.wins / r.total) * 100).toFixed(1)) : 0,
+      pnl: Number((r.pnl || 0).toFixed(2))
+    }))
+  };
+}
+
+function renderStatsPage(data) {
+  const card = (label, s) => `
+    <div class="card">
+      <div class="card-h">${label}</div>
+      <div class="big">${s.total} <span class="muted">筆</span></div>
+      <div>勝率 <b>${s.win_rate}%</b> · 淨 <b class="${s.pnl >= 0 ? 'pos' : 'neg'}">${s.pnl >= 0 ? '+' : ''}${s.pnl}</b> 點</div>
+    </div>`;
+  const rows = data.by_symbol.map(r => `
+    <tr><td>${r.ticker}</td><td>${r.total}</td><td>${r.win_rate}%</td>
+        <td class="${r.pnl >= 0 ? 'pos' : 'neg'}">${r.pnl >= 0 ? '+' : ''}${r.pnl}</td></tr>`).join('');
+
+  return `<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DC Trading Signals — 公開績效</title>
+<style>
+  :root{--bg:#0b1220;--fg:#e7eefb;--muted:#9aa9c2;--card:#131c30;--pos:#34d399;--neg:#f87171;--accent:#60a5fa}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+  .wrap{max-width:880px;margin:0 auto;padding:32px 20px}
+  h1{font-size:28px;margin:0 0 8px} .sub{color:var(--muted);margin-bottom:24px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:28px}
+  .card{background:var(--card);border-radius:12px;padding:16px}
+  .card-h{color:var(--muted);font-size:13px;letter-spacing:.05em;margin-bottom:6px}
+  .big{font-size:28px;font-weight:700} .muted{color:var(--muted);font-weight:400;font-size:14px}
+  .pos{color:var(--pos)} .neg{color:var(--neg)}
+  table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
+  th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #1f2a44}
+  th{background:#0e1629;color:var(--muted);font-weight:500;font-size:13px}
+  tr:last-child td{border:none}
+  .foot{margin-top:24px;color:var(--muted);font-size:12px;text-align:center}
+</style></head><body><div class="wrap">
+<h1>📊 DC Trading Signals</h1>
+<div class="sub">v${data.version} · 公開績效面板（不含個別用戶資料）</div>
+
+<div class="grid">
+  ${card('近 1 日', data.summary.d1)}
+  ${card('近 7 日', data.summary.d7)}
+  ${card('近 30 日', data.summary.d30)}
+  ${card('近 90 日', data.summary.d90)}
+</div>
+
+<table>
+  <thead><tr><th>品種 (近30日)</th><th>筆數</th><th>勝率</th><th>淨點數</th></tr></thead>
+  <tbody>${rows || `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">尚無資料</td></tr>`}</tbody>
+</table>
+
+<div class="foot">更新時間：${new Date(data.generated_at).toLocaleString('zh-TW',{timeZone:'Asia/Taipei'})} · JSON: <a href="/api/stats" style="color:var(--accent)">/api/stats</a></div>
+</div></body></html>`;
+}
+
 async function handleQueuedSignals(env) {
   const db = env.DB;
   
@@ -2933,7 +3836,33 @@ async function handleWebhook(request, env) {
 
   try {
     const update = await request.json();
-    
+
+    // 處理 Inline Query (用戶在其他聊天打 @bot xxx 時觸發)
+    if (update.inline_query) {
+      const q = update.inline_query;
+      const sigs = await db.prepare(`
+        SELECT * FROM signals
+        WHERE status IN ('active','closed')
+        ORDER BY created_at DESC LIMIT 5
+      `).all();
+      const results = (sigs.results || []).map((s, i) => {
+        const arrow = s.action === 'LONG' ? '🟢' : '🔴';
+        const title = `${arrow} ${s.action} ${s.ticker} @ ${fmtPrice(s.entry_price)}`;
+        return {
+          type: 'article',
+          id: String(i),
+          title,
+          description: `SL ${fmtPrice(s.stop_loss)}${s.tp1 ? ` · TP1 ${fmtPrice(s.tp1)}` : ''}`,
+          input_message_content: {
+            message_text: formatSignalCard(s, null, false, null),
+            parse_mode: 'HTML'
+          }
+        };
+      });
+      await answerInlineQuery(q.id, results);
+      return json({ ok: true });
+    }
+
     // 處理 Callback
     if (update.callback_query) {
       const cb = update.callback_query;
@@ -3032,7 +3961,49 @@ export default {
       const result = await handleQueuedSignals(env);
       return json({ ok: true, ...result });
     }
-    
+
+    // Cron - 每日報告
+    if (url.pathname === '/cron/daily') {
+      const result = await handleDailyReport(env);
+      return json({ ok: true, ...result });
+    }
+
+    // Cron - 週報
+    if (url.pathname === '/cron/weekly') {
+      const result = await handleWeeklyReport(env);
+      return json({ ok: true, ...result });
+    }
+
+    // TradingView webhook 入口
+    if (url.pathname === '/webhook/tv' && request.method === 'POST') {
+      return handleTradingViewWebhook(request, env);
+    }
+
+    // 公開：JSON 統計
+    if (url.pathname === '/api/stats') {
+      const data = await collectPublicStats(env.DB);
+      return new Response(JSON.stringify(data), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'public, max-age=300',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // 公開：HTML 統計頁
+    if (url.pathname === '/stats') {
+      const data = await collectPublicStats(env.DB);
+      return new Response(renderStatsPage(data), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'public, max-age=300'
+        }
+      });
+    }
+
     return json({ error: 'Not found' }, 404);
   },
   
@@ -3047,7 +4018,26 @@ export default {
 
     if (hour === 16) await handleExpireCheck(env);
     if (hour === 0)  await handleExpireReminder(env);
+    // 台北 08:30 = UTC 00:30，最近的整點 cron 是 hour=0；用日期判斷避免重發
+    if (hour === 0)  await handleDailyReport(env);
+    // 週日台北 09:30 = UTC 週日 01:30；用 day-of-week 判斷
+    const wd = new Date().getUTCDay();
+    if (hour === 1 && wd === 0) await handleWeeklyReport(env);
 
     await handleQueuedSignals(env);
   }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 純函式 named exports (供單元測試使用，不影響 Cloudflare runtime)
+// ═══════════════════════════════════════════════════════════════════════════════
+export {
+  CONFIG, STRINGS,
+  formatSignalCard, formatExitCard, formatUpdateCard, formatAlertCard,
+  formatDailyReport, formatWeeklyReport,
+  isInQuietHours, parseJSON, daysLeft,
+  fmtPrice, fmtNum,
+  genUID, genRef, genOrderId,
+  tickValueOf, calculateRR, calculateSize,
+  parseTradingViewPayload, localDateString, t
 };

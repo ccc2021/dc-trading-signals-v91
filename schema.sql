@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS user_settings (
   timezone TEXT DEFAULT 'Asia/Taipei',
   language TEXT DEFAULT 'zh-TW',
 
+  -- v9.2 新增
+  auto_be INTEGER DEFAULT 0,                -- TP1 達成自動建議移動止損到成本
+  daily_loss_limit REAL DEFAULT 0,          -- 每日虧損上限 (點數)，0 = 不限
+  max_concurrent INTEGER DEFAULT 0,         -- 同品種最大同時持倉提醒，0 = 不限
+  use_photo INTEGER DEFAULT 0,              -- 收訊號圖片版本
+
   updated_at TEXT DEFAULT (datetime('now')),
 
   FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -371,4 +377,8 @@ INSERT OR IGNORE INTO system_config (key, value) VALUES
 ('payment_bank',         '國泰世華 (013)'),
 ('payment_account',      '123-456-789012'),
 ('payment_name',         '王大明'),
-('welcome_message',      '歡迎使用 DC Trading Signals！');
+('welcome_message',      '歡迎使用 DC Trading Signals！'),
+-- v9.2 新增系統設定
+('global_be_on_tp1',     '0'),         -- TP1 達成時自動發 BE 訊息
+('pin_channel_id',       ''),          -- 訊號自動 pin 的頻道 ID (空字串=不啟用)
+('schema_version',       '9.2.0');

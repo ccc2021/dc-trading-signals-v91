@@ -1,4 +1,4 @@
-# DC Trading Signals Pro v9.1
+# DC Trading Signals Pro v9.2
 
 > 用戶自主訂閱的 Telegram 交易訊號系統
 > 全部跑在 Cloudflare Workers + D1，零伺服器、零月費起步
@@ -16,6 +16,8 @@
 | **[DEPLOY_GUIDE.md](./DEPLOY_GUIDE.md)** | 第一次部署 | 從 0 到上線的完整步驟（含 secrets 設定） |
 | **[USER_GUIDE.md](./USER_GUIDE.md)** | 訂閱用戶 | 所有用戶指令、訂閱流程、設定教學 |
 | **[ADMIN_GUIDE.md](./ADMIN_GUIDE.md)** | 管理員 | 發訊指令、用戶管理、訂單處理 |
+| **[INTEGRATIONS.md](./INTEGRATIONS.md)** | 整合者 | TradingView webhook、`/stats` 公開頁、Inline mode、Pin 頻道 |
+| **[FEATURES_v9.2.md](./FEATURES_v9.2.md)** | 升級者 | v9.2 新增功能總覽 + 14 條煙霧測試 |
 | **[FULL_SPEC.md](./FULL_SPEC.md)** | 開發者 | 系統規格與架構 |
 
 ---
@@ -162,11 +164,37 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
 
 完整清單見 [USER_GUIDE.md](./USER_GUIDE.md) 與 [ADMIN_GUIDE.md](./ADMIN_GUIDE.md)。
 
-## 🔄 升級指引（從 v9.1.0 → v9.1.1）
+## 🔄 升級指引
 
-v9.1.1 修正下列問題，**全部向下相容**，更新只需重新部署：
+### 從 v9.1.x → v9.2.0
 
-- 🔒 BOT_TOKEN/ADMIN_IDS 改由環境變數讀取（請先 `wrangler secret put BOT_TOKEN` 再部署）
+```bash
+git pull
+npm install                     # 取得 vitest（測試用）
+npm run db:migrate              # 套用新欄位 (重複欄位錯誤可忽略)
+npm run deploy
+# Bot 內：/selftest /synccmds
+```
+
+**v9.2.0 新增（總計 18 個新指令、3 個新端點）：**
+
+- 📊 自動每日/週績效報告 (cron)
+- 📐 `/size` `/rr` 計算機（用戶端）
+- 🛡️ 風控進階：每日虧損上限、auto-BE on TP1、同品種上限
+- 🔌 TradingView webhook (`POST /webhook/tv`)
+- 🌐 公開績效面板 `/stats` (HTML) + `/api/stats` (JSON)
+- 👥 群組管理指令（建立/加人/列表）
+- 🖼️ 訊號圖片版（QuickChart）
+- 📌 Pin 訊號到公告頻道
+- 🔍 Inline mode 分享訊號
+- 🌏 EN locale scaffolding (主選單 + help)
+- ✅ 70 個單元測試 (vitest)
+
+完整列表 → [FEATURES_v9.2.md](./FEATURES_v9.2.md)
+
+### 從 v9.1.0 → v9.1.1
+
+- 🔒 BOT_TOKEN/ADMIN_IDS 改由環境變數讀取
 - 🐛 修正非管理員可觸發 `adm_*` callback 的權限漏洞
 - 🐛 修正所有品種 tick value 都被當成 5 的計算錯誤
 - ✨ 新增 `/history` `/redeem` `/timezone` `/renew` 用戶指令
