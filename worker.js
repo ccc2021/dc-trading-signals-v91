@@ -154,7 +154,7 @@ async function getUserSettings(db, id) {
       user_id: String(id),
       capital: 10000,
       risk_percent: 1.0,
-      subscribed_symbols: '["NQ","ES","GC","USTEC"]',
+      subscribed_symbols: '["NQ","ES","GC","USTEC","XAUUSD"]',
       signal_types: '["scalp","swing"]',
       notify_entry: 1,
       notify_tp: 1,
@@ -298,7 +298,7 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
   msg += `┃  ⏰ ${fmtTime()}\n`;
   msg += `┃  🔖 #${signal.signal_uid}\n`;
-  const chartUrl = firstUrl(signal.note);
+  const chartUrl = signalMediaUrl(signal);
   if (chartUrl) msg += `┃  📸 <a href="${escHtml(chartUrl)}">圖表快照 / TV 圖表</a>\n`;
 
   if (signal.is_vip_only) {
@@ -311,7 +311,11 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
 	}
 
 function signalPreviewOptions(signal) {
-  return firstUrl(signal?.note) ? { disablePreview: false } : {};
+  return signalMediaUrl(signal) ? { disablePreview: false } : {};
+}
+
+function signalMediaUrl(signal) {
+  return firstUrl(signal?.snapshot_url) || firstUrl(signal?.chart_url) || firstUrl(signal?.note);
 }
 
 function formatExitCard(type, ticker, price, pnl, note = '') {
@@ -2765,13 +2769,15 @@ async function ensureAdminSchema(db) {
   await addColumnIfMissing(db, 'signals', 'source', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'strategy_id', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'tv_alert_uid', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'chart_url', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'snapshot_url', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_active ON strategies(is_active)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}')
+    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}')
   `).run();
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS tradingview_sources (
@@ -2814,7 +2820,7 @@ async function ensureAdminSchema(db) {
     await db.prepare(`
       INSERT INTO tradingview_sources (source_id, name, webhook_secret, default_strategy_id, allowed_symbols, default_signal_type, target_group, auto_send, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
+    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
   }
 }
 
@@ -2905,6 +2911,8 @@ async function createAdminSignal(db, adminId, payload) {
   const sendNow = payload.send !== false;
   const targetGroup = String(payload.target_group || payload.targetGroup || (payload.is_vip_only ? 'vip' : 'all')).trim().toLowerCase() || 'all';
   const isVipOnly = payload.is_vip_only === true || payload.isVipOnly === true || targetGroup === 'vip';
+  const chartUrl = cleanUrl(payload.chart_url || payload.chartUrl || payload.chart);
+  const snapshotUrl = cleanUrl(payload.snapshot_url || payload.snapshotUrl || payload.image_url || payload.imageUrl || payload.screenshot_url || payload.screenshotUrl);
   const paused = await getConfig(db, 'signals_paused');
   if (sendNow && paused === '1') throw new Error('訊號目前已暫停，請先恢復或儲存草稿');
 
@@ -2912,11 +2920,11 @@ async function createAdminSignal(db, adminId, payload) {
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
-      tp1, tp2, tp3, note, target_group, is_vip_only, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     signalUid, ticker, action, signalType, entry, stopLoss,
-    tp1, tp2, tp3, payload.note || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
+    tp1, tp2, tp3, payload.note || null, chartUrl || null, snapshotUrl || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
   ).run();
 
   const signal = {
@@ -2930,6 +2938,8 @@ async function createAdminSignal(db, adminId, payload) {
     tp2,
     tp3,
     note: payload.note || '',
+    chart_url: chartUrl,
+    snapshot_url: snapshotUrl,
     target_group: targetGroup,
     is_vip_only: isVipOnly ? 1 : 0
   };
@@ -3158,15 +3168,22 @@ function tvOrderPrice(payload) {
   ));
 }
 
-function tvChartUrl(payload, ticker) {
-  const explicit = String(firstTvValue(
+function cleanUrl(value) {
+  const explicit = String(firstTvValue(value)).trim();
+  return /^https?:\/\//i.test(explicit) ? explicit : '';
+}
+
+function tvSnapshotUrl(payload) {
+  return cleanUrl(firstTvValue(
     payload.snapshot_url, payload.snapshotUrl,
     payload.screenshot_url, payload.screenshotUrl,
-    payload.image_url, payload.imageUrl,
-    payload.chart_url, payload.chartUrl,
-    payload.chart, payload.url
-  )).trim();
-  if (/^https?:\/\//i.test(explicit)) return explicit;
+    payload.image_url, payload.imageUrl
+  ));
+}
+
+function tvChartUrl(payload, ticker) {
+  const explicit = cleanUrl(firstTvValue(payload.chart_url, payload.chartUrl, payload.chart, payload.url));
+  if (explicit) return explicit;
   const exchange = String(firstTvValue(payload.exchange, payload.tv_exchange, payload.tvExchange)).trim();
   const tvTicker = String(firstTvValue(payload.ticker, payload.symbol, ticker)).trim();
   const symbol = exchange && tvTicker && !tvTicker.includes(':') ? `${exchange}:${tvTicker}` : tvTicker;
@@ -3332,6 +3349,7 @@ async function buildTvSignalDraft(db, source, payload) {
     : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
+  const snapshotUrl = tvSnapshotUrl(payload);
   const orderId = tvOrderId(payload);
   const orderComment = tvOrderComment(payload);
   const noteParts = [
@@ -3341,7 +3359,8 @@ async function buildTvSignalDraft(db, source, payload) {
     orderComment ? `Comment: ${orderComment}` : '',
     payload.interval ? `週期: ${payload.interval}` : '',
     payload.time ? `時間: ${payload.time}` : '',
-    chartUrl ? `圖表: ${chartUrl}` : ''
+    chartUrl ? `圖表: ${chartUrl}` : '',
+    snapshotUrl ? `截圖: ${snapshotUrl}` : ''
   ].filter(Boolean);
 
   return {
@@ -3355,6 +3374,8 @@ async function buildTvSignalDraft(db, source, payload) {
     tp2: targets[1] || null,
     tp3: targets[2] || null,
     note: noteParts.join(' / '),
+    chart_url: chartUrl,
+    snapshot_url: snapshotUrl,
     target_group: targetGroup,
     is_vip_only: targetGroup === 'vip' ? 1 : 0,
     strategy_id: strategy.strategy_id,
@@ -3370,12 +3391,12 @@ async function createSignalFromTvDraft(db, draft, alertUid, autoSend) {
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
-      tp1, tp2, tp3, note, target_group, is_vip_only, status,
+      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status,
       source, strategy_id, tv_alert_uid, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     draft.signal_uid, draft.ticker, draft.action, draft.signal_type, draft.entry_price, draft.stop_loss,
-    draft.tp1, draft.tp2, draft.tp3, draft.note, draft.target_group, draft.is_vip_only,
+    draft.tp1, draft.tp2, draft.tp3, draft.note, draft.chart_url || null, draft.snapshot_url || null, draft.target_group, draft.is_vip_only,
     shouldSend ? 'active' : 'pending', draft.source, draft.strategy_id, alertUid
   ).run();
 
@@ -3698,6 +3719,7 @@ function renderAdminPage() {
     .btn.ghost { background:#fff; }
     .btn.warn { background:#fff7ed; border-color:#f2c580; color: var(--amber); }
     .btn.danger { background:#fff1f0; border-color:#efb4b0; color: var(--red); }
+    .btn.mini { min-height: 30px; padding: 5px 9px; font-size: 12px; text-decoration: none; display:inline-flex; align-items:center; justify-content:center; }
     .actions { display:flex; gap: 8px; flex-wrap: wrap; align-items:center; }
     table { width:100%; border-collapse: collapse; }
     th, td { padding: 11px 12px; border-bottom:1px solid var(--line); text-align:left; font-size: 13px; vertical-align: middle; }
@@ -3858,7 +3880,7 @@ function renderAdminPage() {
             <section class="panel"><header><h2>最新 Alert 日誌</h2><button class="btn ghost" data-view-target="tradingview" type="button">查看全部</button></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>訊號</th><th>狀態</th></tr></thead><tbody id="overviewTvLogs"></tbody></table></div></section>
           </div>
         </div>
-        <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div></div>
+        <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>圖表</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div></div>
         <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
         <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
@@ -3894,6 +3916,8 @@ function renderSignalFormHtml() {
       <div><label>TP2</label><input name="tp2" inputmode="decimal"></div>
       <div><label>TP3</label><input name="tp3" inputmode="decimal"></div>
       <div><label>發送模式</label><select name="send"><option value="true">立即發送</option><option value="false">只存草稿</option></select></div>
+      <div class="full"><label>TradingView 圖表 URL</label><input name="chart_url" inputmode="url" placeholder="https://www.tradingview.com/chart/..."></div>
+      <div class="full"><label>截圖 / 快照 URL</label><input name="snapshot_url" inputmode="url" placeholder="https://..."></div>
       <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
     </div>
 	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
@@ -4131,23 +4155,30 @@ function renderSignalSymbolOptions() {
   select.disabled = false;
   if (submit) submit.disabled = false;
 }
+function signalMediaButtons(sig) {
+  var links = [];
+  if (sig.chart_url) links.push('<a class="btn ghost mini" href="' + esc(sig.chart_url) + '" target="_blank" rel="noopener">TV</a>');
+  if (sig.snapshot_url) links.push('<a class="btn ghost mini" href="' + esc(sig.snapshot_url) + '" target="_blank" rel="noopener">截圖</a>');
+  return links.length ? '<div class="actions">' + links.join('') + '</div>' : '<span class="muted">-</span>';
+}
 function signalRow(sig, compact) {
   var statusTone = sig.status === 'active' ? 'green' : sig.status === 'closed' ? '' : sig.status === 'cancelled' ? 'red' : 'amber';
   var price = esc(sig.entry_price) + ' / ' + esc(sig.stop_loss) + ' / ' + esc(sig.tp1 || '-');
+  var media = signalMediaButtons(sig);
   var action = sig.status === 'active'
     ? '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>'
     : sig.status === 'pending'
       ? '<button class="btn primary" data-send="' + esc(sig.signal_uid) + '">發送</button><button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>'
       : '';
   if (compact) {
-    return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + price + '</td><td>' + chip(sig.status, statusTone) + '</td><td>' + action + '</td></tr>';
+    return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + price + '</td><td>' + chip(sig.status, statusTone) + '</td><td>' + media + action + '</td></tr>';
   }
-  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + '</td></tr>';
+  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + media + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + '</td></tr>';
 }
 function renderSignals() {
   var signals = filteredSignals();
   document.getElementById('recentSignals').innerHTML = signals.slice(0, 8).map(function (s) { return signalRow(s, true); }).join('') || '<tr><td colspan="6" class="muted">尚無訊號</td></tr>';
-  document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="9" class="muted">尚無訊號</td></tr>';
+  document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="10" class="muted">尚無訊號</td></tr>';
 }
 function orderRow(order, compact) {
   var user = order.username ? '@' + order.username : (order.first_name || order.user_id);
@@ -4302,7 +4333,6 @@ function buildTradingViewAlertMessage() {
   var strategy = getSelectedTvStrategy();
   var action = document.getElementById('tvGenAction').value;
 	  var message = {
-	    secret: source.webhook_secret,
 	    strategy: strategy ? strategy.strategy_id : 'auto',
 	    ticker: '{{ticker}}',
 	    exchange: '{{exchange}}',
@@ -4318,6 +4348,7 @@ function buildTradingViewAlertMessage() {
 	    time: '{{time}}',
 	    interval: '{{interval}}',
 	    chart_url: 'https://www.tradingview.com/chart/?symbol={{exchange}}:{{ticker}}',
+	    snapshot_url: '',
 	    alert_id: '{{ticker}}-{{time}}-' + (strategy ? strategy.strategy_id : 'auto')
 	  };
   return JSON.stringify(message, null, 2);

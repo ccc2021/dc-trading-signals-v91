@@ -55,7 +55,7 @@ CREATE TABLE user_settings (
   risk_percent REAL DEFAULT 1.0,
   
   -- 訂閱品種 (JSON陣列)
-  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC"]',
+  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC","USTEC","XAUUSD"]',
   
   -- 訊號類型偏好 (JSON陣列)
   signal_types TEXT DEFAULT '["scalp","swing"]',
@@ -137,6 +137,8 @@ CREATE TABLE signals (
   
   -- 備註
   note TEXT,
+  chart_url TEXT,
+  snapshot_url TEXT,
   
   -- 發送目標
   target_group TEXT DEFAULT 'all',
@@ -412,7 +414,8 @@ INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, sor
 ('YM', 'E-mini Dow', '道瓊工業', 'index', 1, 5, 3),
 ('RTY', 'E-mini Russell 2000', '羅素2000', 'index', 0.1, 5, 4),
 ('GC', 'Gold Futures', '黃金', 'metal', 0.1, 10, 10),
-('SI', 'Silver Futures', '白銀', 'metal', 0.005, 25, 11),
+('XAUUSD', 'Gold Spot / U.S. Dollar', '黃金現貨', 'metal', 0.01, 1, 11),
+('SI', 'Silver Futures', '白銀', 'metal', 0.005, 25, 12),
 ('CL', 'Crude Oil', '原油', 'energy', 0.01, 10, 20),
 ('NG', 'Natural Gas', '天然氣', 'energy', 0.001, 10, 21),
 ('6E', 'Euro FX', '歐元', 'forex', 0.00005, 6.25, 30),
@@ -426,9 +429,9 @@ INSERT INTO groups (group_name, description) VALUES
 
 -- 預設策略
 INSERT INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}');
+('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}');
 
 -- 系統設定
 INSERT INTO system_config (key, value) VALUES
