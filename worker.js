@@ -6,9 +6,9 @@
 const CONFIG = {
   VERSION: '9.1.0',
   BUILD: 'UserSubscribe',
-  BOT_TOKEN: '8514506641:AAEx72ChhsQKD0OFz4XykgXGgj4E3va_54w',
-  ADMIN_IDS: ['810479094'],
-  BOT_USERNAME: 'Dan_mix_bot',
+  BOT_TOKEN: '',
+  ADMIN_IDS: [],
+  BOT_USERNAME: '',
   
   // 會員等級
   TIERS: {
@@ -42,7 +42,23 @@ const CONFIG = {
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函數
 // ═══════════════════════════════════════════════════════════════════════════════
-const TG = `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
+function parseAdminIds(value) {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+  } catch {}
+  return String(value).split(',').map((id) => id.trim()).filter(Boolean);
+}
+
+function loadRuntimeConfig(env = {}) {
+  CONFIG.BOT_TOKEN = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
+  CONFIG.ADMIN_IDS = parseAdminIds(env.ADMIN_IDS || CONFIG.ADMIN_IDS);
+  CONFIG.BOT_USERNAME = env.BOT_USERNAME || CONFIG.BOT_USERNAME;
+}
+
+const tgApi = () => `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
 const json = (d, s = 200) => new Response(JSON.stringify(d), { 
   status: s, 
   headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } 
@@ -69,7 +85,7 @@ async function sendTg(chatId, text, kb = null) {
   const body = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true };
   if (kb) body.reply_markup = kb;
   try {
-    const res = await fetch(`${TG}/sendMessage`, {
+    const res = await fetch(`${tgApi()}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -82,7 +98,7 @@ async function editTg(chatId, msgId, text, kb = null) {
   const body = { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', disable_web_page_preview: true };
   if (kb) body.reply_markup = kb;
   try {
-    await fetch(`${TG}/editMessageText`, {
+    await fetch(`${tgApi()}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -92,7 +108,7 @@ async function editTg(chatId, msgId, text, kb = null) {
 
 async function answerCb(cbId, text = '', showAlert = false) {
   try {
-    await fetch(`${TG}/answerCallbackQuery`, {
+    await fetch(`${tgApi()}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callback_query_id: cbId, text, show_alert: showAlert })
@@ -2759,6 +2775,7 @@ async function handleWebhook(request, env) {
 
 export default {
   async fetch(request, env, ctx) {
+    loadRuntimeConfig(env);
     const url = new URL(request.url);
     
     // 健康檢查
@@ -2798,6 +2815,7 @@ export default {
   },
   
   async scheduled(event, env, ctx) {
+    loadRuntimeConfig(env);
     // 每日 00:00 - 過期檢查
     // 每日 08:00 - 到期提醒
     // 每小時 - 待發訊號

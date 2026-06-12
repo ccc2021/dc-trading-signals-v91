@@ -4,8 +4,12 @@ compatibility_date = "2024-01-01"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "trading-signals-db"
-database_id = "YOUR_DATABASE_ID"
+database_name = "dc-signals-v91-db"
+database_id = "c659121a-1ab6-4a88-a263-da0e4d585b26"
+
+[vars]
+ADMIN_IDS = "810479094"
+BOT_USERNAME = "Dan_mix_bot"
 
 [triggers]
 crons = [

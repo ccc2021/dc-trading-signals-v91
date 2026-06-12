@@ -78,16 +78,20 @@
 
 ### 1. 建立 D1 資料庫
 ```bash
-wrangler d1 create trading-signals-db
+wrangler d1 create dc-signals-v91-db
 ```
 
 ### 2. 執行 Schema
 ```bash
-wrangler d1 execute trading-signals-db --file=schema.sql
+wrangler d1 execute dc-signals-v91-db --remote --file=schema.sql
 ```
 
-### 3. 更新 wrangler.toml
-將 `YOUR_DATABASE_ID` 替換為實際的 Database ID
+### 3. 設定 Bot Token
+```bash
+wrangler secret put BOT_TOKEN
+```
+
+`ADMIN_IDS` 與 `BOT_USERNAME` 由 `wrangler.toml` 的 `[vars]` 設定。
 
 ### 4. 部署 Worker
 ```bash

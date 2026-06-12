@@ -114,17 +114,17 @@ cd dc-trading-signals-v91
 ### 步驟 4.2：建立資料庫
 
 ```bash
-wrangler d1 create trading-signals-db
+wrangler d1 create dc-signals-v91-db
 ```
 
 **重要！** 執行後會顯示類似：
 
 ```
-✅ Successfully created DB 'trading-signals-db'
+✅ Successfully created DB 'dc-signals-v91-db'
 
 [[d1_databases]]
 binding = "DB"
-database_name = "trading-signals-db"
+database_name = "dc-signals-v91-db"
 database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  ← 複製這個！
 ```
 
@@ -150,7 +150,7 @@ compatibility_date = "2024-01-01"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "trading-signals-db"
+database_name = "dc-signals-v91-db"
 database_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 ```
 
@@ -159,7 +159,7 @@ database_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 ### 步驟 4.4：建立資料表
 
 ```bash
-wrangler d1 execute trading-signals-db --remote --file=schema.sql
+wrangler d1 execute dc-signals-v91-db --remote --file=schema.sql
 ```
 
 看到一堆 `CREATE TABLE` 的輸出就成功了！
@@ -170,18 +170,18 @@ wrangler d1 execute trading-signals-db --remote --file=schema.sql
 
 ### 步驟 5.1：修改 Bot Token（重要！）
 
-1. 用記事本打開 `worker.js`
-2. 找到這行（大約在第 10 行）：
-   ```javascript
-   BOT_TOKEN: '8514506641:AAEx72ChhsQKD0OFz4XykgXGgj4E3va_54w',
+1. 取得 Bot Token（見下一章節）
+2. 在終端機執行：
+   ```bash
+   wrangler secret put BOT_TOKEN
    ```
-3. 把 Token 改成你自己的（見下一章節如何取得）
-4. 找到這行：
-   ```javascript
-   ADMIN_IDS: ['810479094'],
+3. 貼上 Token 後按 Enter。Token 會存進 Cloudflare Worker Secret，不需要寫進 `worker.js`。
+4. 用記事本打開 `wrangler.toml`，在 `[vars]` 裡確認：
+   ```toml
+   ADMIN_IDS = "810479094"
+   BOT_USERNAME = "Dan_mix_bot"
    ```
-5. 把數字改成你自己的 Telegram ID
-6. 儲存檔案
+5. 把 `ADMIN_IDS` 改成你的 Telegram ID；多位管理員可用逗號分隔。
 
 **如何取得你的 Telegram ID：**
 1. 在 Telegram 搜尋 `@userinfobot`
@@ -223,12 +223,14 @@ Published dc-signals-v91 (0.45 sec)
 
 ---
 
-### 步驟 6.2：更新 Token 並重新部署
+### 步驟 6.2：設定 Token 並重新部署
 
-1. 用記事本打開 `worker.js`
-2. 把 `BOT_TOKEN` 改成你的新 Token
-3. 儲存
-4. 重新部署：
+1. 執行：
+   ```bash
+   wrangler secret put BOT_TOKEN
+   ```
+2. 貼上 BotFather 給你的 Token
+3. 重新部署：
    ```bash
    wrangler deploy
    ```
@@ -297,7 +299,7 @@ https://api.telegram.org/bot1234567890:ABCDefGHI/setWebhook?url=https://dc-signa
 ### Q: `D1_ERROR: no such table: users`
 **A:** Schema 沒執行成功。重新執行：
 ```bash
-wrangler d1 execute trading-signals-db --remote --file=schema.sql
+wrangler d1 execute dc-signals-v91-db --remote --file=schema.sql
 ```
 
 ### Q: 如何查看錯誤日誌？
