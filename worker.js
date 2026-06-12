@@ -77,12 +77,14 @@ const fmtDateTime = (d) => d ? new Date(d).toLocaleString('zh-TW', { timeZone: '
 const fmtTime = () => new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
 const daysLeft = (d) => d ? Math.max(0, Math.ceil((new Date(d) - new Date()) / 86400000)) : 0;
 const parseJSON = (s, def = []) => { try { return JSON.parse(s) || def; } catch { return def; } };
+const escHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const firstUrl = (value) => String(value || '').match(/https?:\/\/[^\s<>"']+/)?.[0] || '';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Telegram API
 // ═══════════════════════════════════════════════════════════════════════════════
-async function sendTg(chatId, text, kb = null) {
-  const body = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true };
+async function sendTg(chatId, text, kb = null, options = {}) {
+  const body = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: options.disablePreview !== false };
   if (kb) body.reply_markup = kb;
   try {
     const res = await fetch(`${tgApi()}/sendMessage`, {
@@ -296,14 +298,20 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
   msg += `┃  ⏰ ${fmtTime()}\n`;
   msg += `┃  🔖 #${signal.signal_uid}\n`;
-  
+  const chartUrl = firstUrl(signal.note);
+  if (chartUrl) msg += `┃  📸 <a href="${escHtml(chartUrl)}">圖表快照 / TV 圖表</a>\n`;
+
   if (signal.is_vip_only) {
     msg += `╚═══════════════════════════╝`;
   } else {
     msg += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛`;
   }
   
-  return msg;
+	  return msg;
+	}
+
+function signalPreviewOptions(signal) {
+  return firstUrl(signal?.note) ? { disablePreview: false } : {};
 }
 
 function formatExitCard(type, ticker, price, pnl, note = '') {
@@ -490,7 +498,7 @@ async function broadcastSignal(db, signal) {
       ]]
     };
     
-    const r = await sendTg(user.user_id, msg, kb);
+	    const r = await sendTg(user.user_id, msg, kb, signalPreviewOptions(signal));
     if (r?.ok) sent++; else skipped++;
     
     // 避免頻率限制
@@ -3108,8 +3116,80 @@ function normalizeTvTicker(value) {
   return roots.find((root) => raw.startsWith(root)) || raw;
 }
 
+function firstTvValue(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (!text || text.startsWith('{{')) continue;
+    return value;
+  }
+  return '';
+}
+
+function tvOrderId(payload) {
+  return String(firstTvValue(payload.order_id, payload.orderId, payload.strategy_order_id, payload.strategyOrderId, payload.strategy?.order?.id, payload.id, payload.comment)).trim();
+}
+
+function tvOrderComment(payload) {
+  return String(firstTvValue(payload.order_comment, payload.orderComment, payload.strategy_order_comment, payload.strategyOrderComment, payload.strategy?.order?.comment, payload.comment, payload.message)).trim();
+}
+
+function tvOrderPrice(payload) {
+  return asNumber(firstTvValue(
+    payload.order_price, payload.orderPrice,
+    payload.strategy_order_price, payload.strategyOrderPrice,
+    payload.strategy?.order?.price,
+    payload.entry_price, payload.entry, payload.price, payload.close, payload.last
+  ));
+}
+
+function tvChartUrl(payload, ticker) {
+  const explicit = String(firstTvValue(
+    payload.snapshot_url, payload.snapshotUrl,
+    payload.screenshot_url, payload.screenshotUrl,
+    payload.image_url, payload.imageUrl,
+    payload.chart_url, payload.chartUrl,
+    payload.chart, payload.url
+  )).trim();
+  if (/^https?:\/\//i.test(explicit)) return explicit;
+  const exchange = String(firstTvValue(payload.exchange, payload.tv_exchange, payload.tvExchange)).trim();
+  const tvTicker = String(firstTvValue(payload.ticker, payload.symbol, ticker)).trim();
+  const symbol = exchange && tvTicker && !tvTicker.includes(':') ? `${exchange}:${tvTicker}` : tvTicker;
+  return symbol ? `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}` : '';
+}
+
+function inferTvEventKind(payload) {
+  const text = [payload.event, payload.event_type, payload.type, tvOrderId(payload), tvOrderComment(payload), payload.market_position, payload.marketPosition]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+  const market = String(firstTvValue(payload.market_position, payload.marketPosition)).toLowerCase();
+  const previous = String(firstTvValue(payload.prev_market_position, payload.prevMarketPosition, payload.previous_position, payload.previousPosition)).toLowerCase();
+  if (market === 'flat' && ['long', 'short'].includes(previous)) return 'exit';
+  if (/\b(exit|close|flat|tp|take profit|takeprofit|sl|stop|stop loss|stoploss)\b/.test(text)) return 'exit';
+  return 'entry';
+}
+
+function inferTvExitType(payload) {
+  const text = [payload.exit_type, payload.exitType, payload.event, payload.type, tvOrderId(payload), tvOrderComment(payload)]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+  if (/\btp3\b|take profit 3|takeprofit3/.test(text)) return 'TP3';
+  if (/\btp2\b|take profit 2|takeprofit2/.test(text)) return 'TP2';
+  if (/\btp1\b|\btp\b|take profit|takeprofit/.test(text)) return 'TP1';
+  if (/\bsl\b|stop loss|stoploss|stop/.test(text)) return 'SL';
+  return 'CLOSE';
+}
+
 function normalizeTvAction(payload) {
-  const raw = String(payload.action || payload.side || payload.direction || payload.signal || '').trim().toLowerCase();
+  const market = String(firstTvValue(payload.market_position, payload.marketPosition)).trim().toLowerCase();
+  if (market === 'long') return 'LONG';
+  if (market === 'short') return 'SHORT';
+  const raw = String(firstTvValue(
+    payload.action, payload.side, payload.direction, payload.signal,
+    payload.order_action, payload.orderAction,
+    payload.strategy_order_action, payload.strategyOrderAction,
+    payload.strategy?.order?.action
+  )).trim().toLowerCase();
   if (['long', 'buy', 'bull', 'up', '1'].includes(raw) || raw.includes('long') || raw.includes('buy')) return 'LONG';
   if (['short', 'sell', 'bear', 'down', '-1'].includes(raw) || raw.includes('short') || raw.includes('sell')) return 'SHORT';
   return null;
@@ -3187,12 +3267,12 @@ async function selectTvStrategy(db, source, payload, ticker, signalType) {
 }
 
 async function buildTvSignalDraft(db, source, payload) {
-  const ticker = normalizeTvTicker(payload.ticker || payload.symbol || payload.syminfo || payload.source);
+  const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
   const action = normalizeTvAction(payload);
-  const entryRaw = asNumber(payload.entry_price ?? payload.entry ?? payload.price ?? payload.close ?? payload.last);
+  const entryRaw = tvOrderPrice(payload);
   if (!ticker) throw new Error('TradingView alert 缺少 ticker');
   if (!action) throw new Error('TradingView alert 缺少 action，請傳 LONG/SHORT 或 buy/sell');
-  if (entryRaw === null) throw new Error('TradingView alert 缺少 price/close');
+  if (entryRaw === null) throw new Error('TradingView alert 缺少 strategy.order.price / price / close');
 
   const allowed = parseList(source.allowed_symbols).map((s) => s.toUpperCase());
   if (allowed.length && !allowed.includes(ticker)) throw new Error(`${ticker} 不在此來源允許品種內`);
@@ -3203,7 +3283,7 @@ async function buildTvSignalDraft(db, source, payload) {
   const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' });
   const tickSize = Number(symbol?.tick_size || 0.25);
   const entry = roundToTick(entryRaw, tickSize);
-  const explicitStop = asNumber(payload.stop_loss ?? payload.stopLoss ?? payload.stop);
+  const explicitStop = asNumber(firstTvValue(payload.stop_loss, payload.stopLoss, payload.stop, payload.sl, payload.stop_price, payload.stopPrice));
   const riskPoints = explicitStop !== null
     ? Math.abs(entry - explicitStop)
     : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
@@ -3212,13 +3292,26 @@ async function buildTvSignalDraft(db, source, payload) {
   const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
   const signed = action === 'LONG' ? 1 : -1;
   const stopLoss = explicitStop !== null ? roundToTick(explicitStop, tickSize) : roundToTick(entry - signed * riskPoints, tickSize);
-  const targets = targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
+  const explicitTargets = [
+    asNumber(firstTvValue(payload.tp1, payload.take_profit_1, payload.takeProfit1)),
+    asNumber(firstTvValue(payload.tp2, payload.take_profit_2, payload.takeProfit2)),
+    asNumber(firstTvValue(payload.tp3, payload.take_profit_3, payload.takeProfit3))
+  ];
+  const targets = explicitTargets.some((target) => target !== null)
+    ? explicitTargets.map((target) => target === null ? null : roundToTick(target, tickSize))
+    : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
+  const chartUrl = tvChartUrl(payload, ticker);
+  const orderId = tvOrderId(payload);
+  const orderComment = tvOrderComment(payload);
   const noteParts = [
     `TradingView: ${source.name}`,
     `策略: ${strategy.name}`,
+    orderId ? `Order: ${orderId}` : '',
+    orderComment ? `Comment: ${orderComment}` : '',
     payload.interval ? `週期: ${payload.interval}` : '',
-    payload.time ? `時間: ${payload.time}` : ''
+    payload.time ? `時間: ${payload.time}` : '',
+    chartUrl ? `圖表: ${chartUrl}` : ''
   ].filter(Boolean);
 
   return {
@@ -3262,6 +3355,38 @@ async function createSignalFromTvDraft(db, draft, alertUid, autoSend) {
     await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, draft.signal_uid).run();
   }
   return { signalUid: draft.signal_uid, status: shouldSend ? 'active' : 'pending', delivery, paused: paused === '1' };
+}
+
+async function closeSignalFromTvExit(db, source, payload, alertUid) {
+  const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
+  if (!ticker) throw new Error('TradingView exit alert 缺少 ticker');
+  const price = tvOrderPrice(payload);
+  if (price === null) throw new Error('TradingView exit alert 缺少 strategy.order.price / price / close');
+  const requestedStrategy = String(firstTvValue(payload.strategy, payload.strategy_id, payload.strategyId)).trim();
+  const type = inferTvExitType(payload);
+  const reason = tvOrderComment(payload) || tvOrderId(payload) || `TradingView ${type}`;
+  const query = requestedStrategy && requestedStrategy.toLowerCase() !== 'auto'
+    ? db.prepare(`
+        SELECT * FROM signals
+        WHERE ticker = ? AND source = ? AND strategy_id = ? AND status = 'active'
+        ORDER BY created_at DESC LIMIT 1
+      `).bind(ticker, source.source_id, slugify(requestedStrategy, 'strategy'))
+    : db.prepare(`
+        SELECT * FROM signals
+        WHERE ticker = ? AND source = ? AND status = 'active'
+        ORDER BY created_at DESC LIMIT 1
+      `).bind(ticker, source.source_id);
+  const signal = await query.first();
+  if (!signal) {
+    return { status: 'exit_unmatched', ticker, type, price, reason, delivery: { sent: 0 } };
+  }
+  const result = await closeAdminSignal(db, `tv:${source.source_id}`, signal.signal_uid, {
+    price,
+    type,
+    reason,
+    notify: Boolean(source.auto_send)
+  });
+  return { ...result, status: 'closed', ticker, type, price, reason };
 }
 
 async function upsertTradingViewSource(db, payload) {
@@ -3346,6 +3471,24 @@ async function handleTradingViewWebhook(request, env, sourceId, url) {
   }
 
   try {
+    if (inferTvEventKind(payload) === 'exit') {
+      const result = await closeSignalFromTvExit(db, source, payload, alertUid);
+      await db.prepare(`
+        INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
+      `).bind(
+        alertUid,
+        source.source_id,
+        String(firstTvValue(payload.strategy, payload.strategy_id, payload.strategyId)).trim() || null,
+        result.ticker || null,
+        result.type || 'EXIT',
+        JSON.stringify(payload),
+        result.signalUid || null,
+        result.status
+      ).run();
+      return json({ ok: true, source: source.source_id, ...result });
+    }
+
     const draft = await buildTvSignalDraft(db, source, payload);
     const result = await createSignalFromTvDraft(db, draft, alertUid, source.auto_send);
     await db.prepare(`
@@ -3735,7 +3878,7 @@ function renderStrategyFormHtml() {
       <div><label>品種</label><input name="symbols" placeholder="NQ,ES,GC"></div>
       <div class="full"><label>描述</label><textarea name="description"></textarea></div>
       <div class="full"><label>風控規則 JSON</label><textarea class="copybox" name="rules_json" placeholder='{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close"}'></textarea></div>
-      <div class="full"><label>TradingView Alert 範本</label><textarea class="copybox" name="tv_alert_template" placeholder='{"secret":"{{secret}}","strategy":"auto","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'></textarea></div>
+      <div class="full"><label>TradingView 現有策略 Alert 範本</label><textarea class="copybox" name="tv_alert_template" placeholder='{"secret":"{{secret}}","strategy":"auto","ticker":"{{ticker}}","action":"{{strategy.order.action}}","order_price":"{{strategy.order.price}}","order_id":"{{strategy.order.id}}","market_position":"{{strategy.market_position}}","time":"{{time}}","interval":"{{interval}}"}'></textarea></div>
       <div class="full"><label>維護備註</label><textarea name="note"></textarea></div>
     </div>
     <button class="btn primary" type="submit">儲存策略</button>
@@ -3756,7 +3899,7 @@ function renderTradingViewHtml() {
       <div class="body">${renderTradingViewSourceFormHtml()}</div>
     </section>
     <section class="panel">
-      <header><div><h2>Alert 產生器</h2><p>產生 TradingView 可貼上的通知內容</p></div></header>
+	      <header><div><h2>現有策略 Alert 產生器</h2><p>給 TradingView Strategy Order fills alert 使用</p></div></header>
       <div class="body">${renderTradingViewGeneratorHtml()}</div>
     </section>
     <section class="panel" style="grid-column:1/-1">
@@ -3794,7 +3937,7 @@ function renderTradingViewGeneratorHtml() {
       <div><label>週期</label><input id="tvGenInterval" value="15"></div>
       <div><label>預覽價格</label><input id="tvGenPrice" inputmode="decimal" value="21500"></div>
       <div class="full"><label>Webhook URL</label><input class="readonly" id="tvWebhookUrl" readonly></div>
-      <div class="full"><label>Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
+	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
     <div class="preview" id="tvPreview"></div>
@@ -4124,16 +4267,25 @@ function buildTradingViewAlertMessage() {
   if (!source) return '';
   var strategy = getSelectedTvStrategy();
   var action = document.getElementById('tvGenAction').value;
-  var message = {
-    secret: source.webhook_secret,
-    strategy: strategy ? strategy.strategy_id : 'auto',
-    ticker: '{{ticker}}',
-    action: action === 'AUTO' ? '{{strategy.order.action}}' : action,
-    price: '{{close}}',
-    time: '{{time}}',
-    interval: '{{interval}}',
-    alert_id: '{{ticker}}-{{time}}-' + (strategy ? strategy.strategy_id : 'auto')
-  };
+	  var message = {
+	    secret: source.webhook_secret,
+	    strategy: strategy ? strategy.strategy_id : 'auto',
+	    ticker: '{{ticker}}',
+	    exchange: '{{exchange}}',
+	    action: action === 'AUTO' ? '{{strategy.order.action}}' : action,
+	    order_id: '{{strategy.order.id}}',
+	    order_comment: '{{strategy.order.comment}}',
+	    order_price: '{{strategy.order.price}}',
+	    contracts: '{{strategy.order.contracts}}',
+	    market_position: '{{strategy.market_position}}',
+	    prev_market_position: '{{strategy.prev_market_position}}',
+	    price: '{{strategy.order.price}}',
+	    close: '{{close}}',
+	    time: '{{time}}',
+	    interval: '{{interval}}',
+	    chart_url: 'https://www.tradingview.com/chart/?symbol={{exchange}}:{{ticker}}',
+	    alert_id: '{{ticker}}-{{time}}-' + (strategy ? strategy.strategy_id : 'auto')
+	  };
   return JSON.stringify(message, null, 2);
 }
 function updateTradingViewGenerator() {
