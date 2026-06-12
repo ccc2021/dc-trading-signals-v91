@@ -75,6 +75,25 @@ const fmtPrice = (n) => n?.toFixed(2) || '0.00';
 const fmtDate = (d) => d ? new Date(d).toLocaleDateString('zh-TW') : '-';
 const fmtDateTime = (d) => d ? new Date(d).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-';
 const fmtTime = () => new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+const parseDbTime = (d) => {
+  if (!d) return null;
+  const text = String(d).trim();
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text) ? text : `${text.replace(' ', 'T')}Z`;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+const fmtSignalTime = (d) => {
+  const parsed = parseDbTime(d);
+  if (!parsed) return '-';
+  return parsed.toLocaleString('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).replace(',', '');
+};
 const daysLeft = (d) => d ? Math.max(0, Math.ceil((new Date(d) - new Date()) / 86400000)) : 0;
 const parseJSON = (s, def = []) => { try { return JSON.parse(s) || def; } catch { return def; } };
 const escHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -274,40 +293,39 @@ async function addPoints(db, userId, points, reason) {
 
 function formatSignalCard(signal, userSettings = null, isVip = false) {
   const { ticker, action, entry_price, stop_loss, tp1, tp2, tp3, signal_type } = signal;
-  const typeInfo = CONFIG.SIGNAL_TYPES[signal_type] || { name: '' };
+  const actionInfo = CONFIG.ACTIONS[action] || { emoji: '', name: action };
+  const typeInfo = CONFIG.SIGNAL_TYPES[signal_type] || { emoji: '', name: '' };
   
   const risk = Math.abs(entry_price - stop_loss);
   const reward1 = tp1 ? Math.abs(tp1 - entry_price) : 0;
   const rr = risk > 0 ? (reward1 / risk).toFixed(1) : '0';
 
-  const sideLabel = action === 'LONG' ? 'LONG 做多' : action === 'SHORT' ? 'SHORT 做空' : action;
   const tierLine = signal.is_vip_only ? 'VIP 專屬' : (signal.target_group === 'vip' ? 'VIP' : signal.target_group === 'pro' ? 'Pro 以上' : '付費會員');
   const chartUrl = signalMediaUrl(signal);
   const origin = signal.strategy_id || signal.source || 'TradingView';
 
-  let msg = `<b>${escHtml(ticker)} ${escHtml(sideLabel)}</b>\n`;
-  msg += `${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
+  let msg = `${actionInfo.emoji || ''} <b>${escHtml(action)} ${escHtml(ticker)}</b>\n`;
+  msg += `${typeInfo.emoji || ''} ${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
 
-  msg += `<b>進出場</b>\n`;
-  msg += `進場 <code>${fmtPrice(entry_price)}</code>\n`;
-  msg += `止損 <code>${fmtPrice(stop_loss)}</code>\n\n`;
+  msg += `💰 進場　<code>${fmtPrice(entry_price)}</code>\n`;
+  msg += `🛑 止損　<code>${fmtPrice(stop_loss)}</code>\n\n`;
 
-  msg += `<b>目標價</b>\n`;
-  if (tp1) msg += `TP1 <code>${fmtPrice(tp1)}</code>\n`;
-  if (tp2) msg += `TP2 <code>${fmtPrice(tp2)}</code>\n`;
-  if (tp3 && isVip) msg += `TP3 <code>${fmtPrice(tp3)}</code>  VIP\n`;
-  msg += `\n<b>風控</b>\n`;
-  msg += `風險 <code>${fmtPrice(risk)}</code> 點 · RR <code>1:${rr}</code>\n`;
+  if (tp1) msg += `🎯 TP1　<code>${fmtPrice(tp1)}</code>\n`;
+  if (tp2) msg += `🎯 TP2　<code>${fmtPrice(tp2)}</code>\n`;
+  if (tp3 && isVip) msg += `🎯 TP3　<code>${fmtPrice(tp3)}</code>　VIP\n`;
+  msg += `\n📊 風險　<code>${fmtPrice(risk)}</code> 點\n`;
+  msg += `🎯 報酬　<code>1:${rr}</code>\n`;
 
   if (userSettings && userSettings.capital > 0) {
     const riskAmount = userSettings.capital * (userSettings.risk_percent / 100);
     const tickValue = 5; // 預設 NQ tick value
     const contracts = risk > 0 ? (riskAmount / (risk * tickValue)).toFixed(2) : 0;
-    msg += `倉位參考 $${fmtNum(riskAmount.toFixed(0))} (${userSettings.risk_percent}%) · ${contracts} 口\n`;
+    msg += `\n📊 您的交易參考\n`;
+    msg += `風險金額　$${fmtNum(riskAmount.toFixed(0))} (${userSettings.risk_percent}%)\n`;
+    msg += `建議口數　${contracts} 口\n`;
   }
 
-  msg += `\n<b>來源</b>\n`;
-  msg += `${escHtml(origin)} · ${fmtTime()}\n`;
+  msg += `\n${escHtml(origin)} · ${fmtTime()}\n`;
   msg += `<code>#${escHtml(signal.signal_uid)}</code>`;
   if (chartUrl) msg += `\n<a href="${escHtml(chartUrl)}">查看圖表</a>`;
 
@@ -602,6 +620,49 @@ function renderNotifyKeyboard(settings) {
       [{ text: '« 返回', callback_data: 'u_settings' }]
     ]
   };
+}
+
+function shortSignalId(uid) {
+  const value = String(uid || '');
+  return value.length > 8 ? value.slice(0, 8) : value;
+}
+
+function signalStatusLabel(sig) {
+  if (sig.status === 'active') return '進行中';
+  if (sig.status === 'pending') return '草稿';
+  if (sig.status === 'cancelled') return '取消';
+  if (sig.result === 'win') return '獲利';
+  if (sig.result === 'loss') return '止損';
+  if (sig.result === 'breakeven') return '保本';
+  return sig.status || '-';
+}
+
+function formatSignalListItem(sig, tier, options = {}) {
+  const actionInfo = CONFIG.ACTIONS[sig.action] || { emoji: '', name: sig.action };
+  const typeInfo = CONFIG.SIGNAL_TYPES[sig.signal_type] || { emoji: '', name: sig.signal_type || '訊號' };
+  const side = sig.action === 'LONG' ? 'LONG' : sig.action === 'SHORT' ? 'SHORT' : sig.action;
+  const pnl = sig.pnl_points != null ? ` ${sig.pnl_points >= 0 ? '+' : ''}${fmtPrice(sig.pnl_points)}點` : '';
+  const lines = [
+    `${actionInfo.emoji || ''} <b>${escHtml(side)} ${escHtml(sig.ticker)}</b>`,
+    `${typeInfo.emoji || ''} ${escHtml(typeInfo.name)} · ${escHtml(signalStatusLabel(sig))}${escHtml(pnl)}`,
+    '',
+    `💰 進場　<code>${fmtPrice(sig.entry_price)}</code>`,
+    `🛑 止損　<code>${fmtPrice(sig.stop_loss)}</code>`
+  ];
+  if (sig.tp1 || sig.tp2 || (sig.tp3 && tier === 'vip')) lines.push('');
+  if (sig.tp1) lines.push(`🎯 TP1　<code>${fmtPrice(sig.tp1)}</code>`);
+  if (sig.tp2) lines.push(`🎯 TP2　<code>${fmtPrice(sig.tp2)}</code>`);
+  if (sig.tp3 && tier === 'vip') lines.push(`🎯 TP3　<code>${fmtPrice(sig.tp3)}</code>`);
+  if (options.includeTimes) {
+    const endedAt = sig.closed_at ? fmtSignalTime(sig.closed_at) : '尚未結束';
+    lines.push('');
+    lines.push(`時間　${fmtSignalTime(sig.created_at)} → ${endedAt}`);
+  }
+  if (options.includeId) {
+    lines.push('');
+    lines.push(`單號　<code>${escHtml(shortSignalId(sig.signal_uid))}</code>`);
+  }
+  return lines.join('\n');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1071,11 +1132,10 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     let m = `<b>最新訊號</b>\n\n`;
     
     for (const sig of signals.results) {
-      const status = sig.status === 'active' ? '進行中' : sig.result === 'win' ? '獲利' : sig.result === 'loss' ? '止損' : sig.status;
-      m += `${escHtml(sig.ticker)} ${escHtml(sig.action)} ${fmtPrice(sig.entry_price)} · ${status}\n`;
+      m += `${formatSignalListItem(sig, user.tier)}\n\n`;
     }
     
-    m += `\n已訂閱：${escHtml(subscribedSymbols.join(', ') || '未設定')}`;
+    m += `已訂閱：${escHtml(subscribedSymbols.join(', ') || '未設定')}`;
     
     const kb = {
       inline_keyboard: [
@@ -1105,7 +1165,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     let list = rows.results || [];
     if (subscribedSymbols.length > 0) list = list.filter((sig) => subscribedSymbols.includes(sig.ticker));
     if (cmd === '/lastsignal') list = list.slice(0, 1);
-    else list = list.slice(0, 12);
+    else list = list.slice(0, cmd === '/history' ? 6 : 8);
 
     const title = cmd === '/active' ? '進行中訊號' : cmd === '/lastsignal' ? '最近一筆訊號' : '歷史訊號';
     if (list.length === 0) {
@@ -1116,15 +1176,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
 
     let m = `<b>${title}</b>\n\n`;
     for (const sig of list) {
-      const action = sig.action === 'LONG' ? '做多' : '做空';
-      const status = sig.status === 'active' ? '進行中' : sig.result === 'win' ? '獲利' : sig.result === 'loss' ? '止損' : sig.status;
-      const pnl = sig.pnl_points != null ? ` · ${sig.pnl_points >= 0 ? '+' : ''}${fmtPrice(sig.pnl_points)}點` : '';
-      m += `<b>${escHtml(sig.ticker)} ${action}</b> · ${status}${pnl}\n`;
-      m += `進場 <code>${fmtPrice(sig.entry_price)}</code> / 止損 <code>${fmtPrice(sig.stop_loss)}</code>\n`;
-      if (sig.tp1 || sig.tp2 || sig.tp3) {
-        m += `TP ${[sig.tp1, sig.tp2, sig.tp3].filter(Boolean).map(fmtPrice).join(' / ')}\n`;
-      }
-      m += `<code>#${escHtml(sig.signal_uid)}</code>\n\n`;
+      m += `${formatSignalListItem(sig, user.tier, { includeId: true, includeTimes: cmd === '/history' })}\n\n`;
     }
     return sendTg(cid, m.trim(), {
       inline_keyboard: [
