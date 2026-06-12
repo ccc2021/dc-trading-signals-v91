@@ -133,6 +133,7 @@ async function editTg(chatId, msgId, text, kb = null) {
 }
 
 async function answerCb(cbId, text = '', showAlert = false) {
+  if (!cbId) return;
   try {
     await fetch(`${tgApi()}/answerCallbackQuery`, {
       method: 'POST',
@@ -380,6 +381,103 @@ function formatDailyReport(stats) {
   msg += `<b>盈虧統計</b>\n`;
   msg += `淨盈虧 <code>${stats.pnl >= 0 ? '+' : ''}${fmtPrice(stats.pnl || 0)}</code> 點`;
   return msg;
+}
+
+function normalizeUserCallback(data) {
+  if (!data) return data;
+  if (data.startsWith('toggle_sym_')) return `sym_${data.replace('toggle_sym_', '')}`;
+  if (data.startsWith('toggle_type_')) return `type_${data.replace('toggle_type_', '')}`;
+  if (data.startsWith('set_cap_')) return `cap_${data.replace('set_cap_', '')}`;
+  if (data.startsWith('set_risk_')) return `risk_${data.replace('set_risk_', '')}`;
+  if (data.startsWith('toggle_notify_')) {
+    const key = data.replace('toggle_notify_', '');
+    const map = { entry: 'ntf_entry', tp: 'ntf_tp', sl: 'ntf_sl', update: 'ntf_update', daily: 'ntf_daily', announce: 'ntf_announce', alert: 'ntf_alert' };
+    return map[key] || data;
+  }
+  if (data === 'save_symbols') return 'u_subscribe';
+  if (data === 'save_types') return 'u_signaltype';
+  if (data === 'set_quiet_start' || data === 'set_quiet_end') return 'u_quiet';
+  return data;
+}
+
+function renderQuietText(settings) {
+  let m = `🌙 <b>安靜時段</b>\n\n`;
+  m += `狀態：${settings.quiet_enabled ? '已啟用' : '未啟用'}\n`;
+  m += `開始：<code>${escHtml(settings.quiet_start || '23:00')}</code>\n`;
+  m += `結束：<code>${escHtml(settings.quiet_end || '07:00')}</code>\n\n`;
+  m += `安靜時段內的訊號會排程到結束後推送。`;
+  return m;
+}
+
+function renderQuietKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [{ text: settings.quiet_enabled ? '🔕 關閉' : '🔔 啟用', callback_data: 'toggle_quiet' }],
+      [
+        { text: '開始 22:00', callback_data: 'quiet_s_22' },
+        { text: '開始 23:00', callback_data: 'quiet_s_23' },
+        { text: '開始 00:00', callback_data: 'quiet_s_00' }
+      ],
+      [
+        { text: '結束 06:00', callback_data: 'quiet_e_06' },
+        { text: '結束 07:00', callback_data: 'quiet_e_07' },
+        { text: '結束 08:00', callback_data: 'quiet_e_08' }
+      ],
+      [{ text: '« 返回', callback_data: 'u_settings' }]
+    ]
+  };
+}
+
+function renderCapitalText(settings) {
+  const capital = Number(settings.capital || 0);
+  const riskPercent = Number(settings.risk_percent || 0);
+  const riskAmount = capital * (riskPercent / 100);
+  let m = `💰 <b>資金設定</b>\n\n`;
+  m += `交易資金：<b>$${fmtNum(capital)}</b>\n`;
+  m += `風險比例：<b>${riskPercent}%</b>\n`;
+  m += `單筆風險：<b>$${fmtNum(riskAmount.toFixed(0))}</b>\n\n`;
+  m += `設定後，訊號卡會顯示個人化倉位參考。`;
+  return m;
+}
+
+function renderCapitalKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '$1,000', callback_data: 'cap_1000' },
+        { text: '$5,000', callback_data: 'cap_5000' },
+        { text: '$10,000', callback_data: 'cap_10000' }
+      ],
+      [
+        { text: '$25,000', callback_data: 'cap_25000' },
+        { text: '$50,000', callback_data: 'cap_50000' },
+        { text: '$100,000', callback_data: 'cap_100000' }
+      ],
+      [
+        { text: '風險 0.5%', callback_data: 'risk_0.5' },
+        { text: '風險 1%', callback_data: 'risk_1' },
+        { text: '風險 2%', callback_data: 'risk_2' }
+      ],
+      [{ text: '« 返回', callback_data: 'u_settings' }]
+    ]
+  };
+}
+
+async function renderOrderPicker(cid, msgId, db, tier) {
+  const prices = {
+    1: await getConfig(db, `${tier}_price_1m`) || (tier === 'vip' ? '599' : '299'),
+    3: await getConfig(db, `${tier}_price_3m`) || (tier === 'vip' ? '1617' : '807'),
+    12: await getConfig(db, `${tier}_price_12m`) || (tier === 'vip' ? '5748' : '2868')
+  };
+  let m = `💳 <b>訂閱 ${tierName(tier)}</b>\n\n`;
+  m += `選擇訂閱時長，系統會建立付款訂單。`;
+  const buttons = [
+    [{ text: `1個月 NT$${prices[1]}`, callback_data: `buy_${tier}_1` }],
+    [{ text: `3個月 NT$${prices[3]} (省10%)`, callback_data: `buy_${tier}_3` }],
+    [{ text: `12個月 NT$${prices[12]} (省20%)`, callback_data: `buy_${tier}_12` }],
+    [{ text: '« 返回', callback_data: 'u_plans' }]
+  ];
+  return editTg(cid, msgId, m, { inline_keyboard: buttons });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -707,9 +805,8 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // 個人設定 /settings
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/settings') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  ⚙️ <b>個人設定</b>\n`;
-    m += `└─────────────────────────────┘\n`;
+    let m = `⚙️ <b>個人設定</b>\n\n`;
+    m += `管理通知、安靜時段、資金風控與時區。`;
     
     const kb = {
       inline_keyboard: [
@@ -721,6 +818,22 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       ]
     };
     
+    return sendTg(cid, m, kb);
+  }
+
+  if (cmd === '/timezone') {
+    let m = `🌍 <b>時區設定</b>\n\n`;
+    m += `目前時區：<code>${escHtml(settings.timezone || 'Asia/Taipei')}</code>\n\n`;
+    m += `選擇您希望報表與通知顯示的時間基準。`;
+    const kb = {
+      inline_keyboard: [
+        [{ text: '台北 UTC+8', callback_data: 'tz_Asia/Taipei' }],
+        [{ text: '東京 UTC+9', callback_data: 'tz_Asia/Tokyo' }],
+        [{ text: '紐約 UTC-5/-4', callback_data: 'tz_America/New_York' }],
+        [{ text: '倫敦 UTC+0/+1', callback_data: 'tz_Europe/London' }],
+        [{ text: '« 返回', callback_data: 'u_settings' }]
+      ]
+    };
     return sendTg(cid, m, kb);
   }
   
@@ -762,26 +875,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // 安靜時段 /quiet
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/quiet') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🌙 <b>安靜時段</b>\n`;
-    m += `│  此時段內不會收到通知\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    
-    m += `狀態：${settings.quiet_enabled ? '✅ 已啟用' : '⬜ 未啟用'}\n\n`;
-    m += `開始時間：${settings.quiet_start}\n`;
-    m += `結束時間：${settings.quiet_end}\n\n`;
-    m += `📝 安靜時段的訊號會在結束後推送\n`;
-    
-    const buttons = [
-      [{ text: settings.quiet_enabled ? '🔕 關閉安靜時段' : '🔔 啟用安靜時段', callback_data: 'toggle_quiet' }],
-      [
-        { text: '⏰ 設定開始時間', callback_data: 'set_quiet_start' },
-        { text: '⏰ 設定結束時間', callback_data: 'set_quiet_end' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return sendTg(cid, m, { inline_keyboard: buttons });
+    return sendTg(cid, renderQuietText(settings), renderQuietKeyboard(settings));
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -801,39 +895,9 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       }
     }
     
-    const riskAmount = settings.capital * (settings.risk_percent / 100);
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  💰 <b>資金設定</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `交易資金：$${fmtNum(settings.capital)}\n`;
-    m += `風險比例：${settings.risk_percent}%\n`;
-    m += `單筆風險：$${fmtNum(riskAmount.toFixed(0))}\n\n`;
-    m += `📝 設定後訊號會顯示建議口數\n`;
-    
-    const buttons = [
-      [
-        { text: '$1,000', callback_data: 'set_cap_1000' },
-        { text: '$5,000', callback_data: 'set_cap_5000' },
-        { text: '$10,000', callback_data: 'set_cap_10000' }
-      ],
-      [
-        { text: '$25,000', callback_data: 'set_cap_25000' },
-        { text: '$50,000', callback_data: 'set_cap_50000' },
-        { text: '$100,000', callback_data: 'set_cap_100000' }
-      ],
-      [
-        { text: '0.5%', callback_data: 'set_risk_0.5' },
-        { text: '1%', callback_data: 'set_risk_1' },
-        { text: '1.5%', callback_data: 'set_risk_1.5' },
-        { text: '2%', callback_data: 'set_risk_2' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    m += `\n指令：\n/capital [金額] - 設定資金\n/risk [比例] - 設定風險%`;
-    
-    return sendTg(cid, m, { inline_keyboard: buttons });
+    let m = renderCapitalText(settings);
+    m += `\n\n指令：\n/capital [金額]\n/risk [比例]`;
+    return sendTg(cid, m, renderCapitalKeyboard());
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -926,6 +990,24 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     return sendTg(cid, m, { inline_keyboard: buttons });
   }
+
+  if (cmd === '/renew' || cmd === '/upgrade') {
+    const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
+    let m = `🔄 <b>續費 / 升級</b>\n\n`;
+    m += `目前方案：${tierName(user.tier)}\n`;
+    if (user.tier !== 'free') {
+      m += `到期日：${fmtDate(user.tier_expires_at)}\n`;
+      m += `剩餘：${dl} 天\n`;
+    }
+    m += `\n選擇方案後會建立付款訂單。`;
+    const buttons = [
+      [{ text: '⭐ Pro 續費', callback_data: 'order_pro' }],
+      [{ text: '👑 VIP 升級 / 續費', callback_data: 'order_vip' }],
+      [{ text: '📞 聯繫客服', callback_data: 'u_contact' }],
+      [{ text: '« 返回', callback_data: 'u_menu' }]
+    ];
+    return sendTg(cid, m, { inline_keyboard: buttons });
+  }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 申請試用 /trial
@@ -1007,6 +1089,53 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     return sendTg(cid, m, kb);
   }
+
+  if (cmd === '/active' || cmd === '/history' || cmd === '/lastsignal') {
+    if (user.tier === 'free') {
+      return sendTg(cid, `此功能需要訂閱會員\n\n使用 /trial 申請試用`, {
+        inline_keyboard: [[{ text: '查看方案', callback_data: 'u_plans' }]]
+      });
+    }
+    const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
+    const statusFilter = cmd === '/active' ? "status = 'active'" : "status IN ('active','closed','cancelled')";
+    const rows = await db.prepare(`
+      SELECT * FROM signals
+      WHERE ${statusFilter}
+      ORDER BY created_at DESC
+      LIMIT 40
+    `).all();
+    let list = rows.results || [];
+    if (subscribedSymbols.length > 0) list = list.filter((sig) => subscribedSymbols.includes(sig.ticker));
+    if (cmd === '/lastsignal') list = list.slice(0, 1);
+    else list = list.slice(0, 12);
+
+    const title = cmd === '/active' ? '進行中訊號' : cmd === '/lastsignal' ? '最近一筆訊號' : '歷史訊號';
+    if (list.length === 0) {
+      return sendTg(cid, `📊 <b>${title}</b>\n\n目前沒有符合您訂閱品種的資料。`, {
+        inline_keyboard: [[{ text: '修改訂閱', callback_data: 'u_subscribe' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+      });
+    }
+
+    let m = `📊 <b>${title}</b>\n\n`;
+    for (const sig of list) {
+      const action = sig.action === 'LONG' ? '做多' : '做空';
+      const status = sig.status === 'active' ? '進行中' : sig.result === 'win' ? '獲利' : sig.result === 'loss' ? '止損' : sig.status;
+      const pnl = sig.pnl_points != null ? ` · ${sig.pnl_points >= 0 ? '+' : ''}${fmtPrice(sig.pnl_points)}點` : '';
+      m += `<b>${escHtml(sig.ticker)} ${action}</b> · ${status}${pnl}\n`;
+      m += `進場 <code>${fmtPrice(sig.entry_price)}</code> / 止損 <code>${fmtPrice(sig.stop_loss)}</code>\n`;
+      if (sig.tp1 || sig.tp2 || sig.tp3) {
+        m += `TP ${[sig.tp1, sig.tp2, sig.tp3].filter(Boolean).map(fmtPrice).join(' / ')}\n`;
+      }
+      m += `<code>#${escHtml(sig.signal_uid)}</code>\n\n`;
+    }
+    return sendTg(cid, m.trim(), {
+      inline_keyboard: [
+        [{ text: '進行中', callback_data: 'u_active' }, { text: '歷史', callback_data: 'u_history' }],
+        [{ text: '修改訂閱', callback_data: 'u_subscribe' }],
+        [{ text: '« 返回', callback_data: 'u_menu' }]
+      ]
+    });
+  }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 我的績效 /mystats
@@ -1072,6 +1201,75 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     };
     
     return sendTg(cid, m, kb);
+  }
+
+  if (cmd === '/perfbysymbol' || cmd === '/mymonth' || cmd === '/myweek' || cmd === '/mytoday') {
+    if (user.tier === 'free') {
+      return sendTg(cid, `此功能需要訂閱會員`, {
+        inline_keyboard: [[{ text: '查看方案', callback_data: 'u_plans' }]]
+      });
+    }
+    const days = cmd === '/mytoday' ? 1 : cmd === '/myweek' ? 7 : 30;
+    if (cmd === '/perfbysymbol') {
+      const stats = await db.prepare(`
+        SELECT s.ticker,
+               COUNT(*) as total,
+               SUM(CASE WHEN s.result = 'win' THEN 1 ELSE 0 END) as wins,
+               SUM(COALESCE(s.pnl_points, 0)) as pnl
+        FROM user_executions ue
+        JOIN signals s ON ue.signal_uid = s.signal_uid
+        WHERE ue.user_id = ? AND ue.status = 'executed'
+          AND ue.created_at > datetime('now', '-30 days')
+        GROUP BY s.ticker
+        ORDER BY total DESC
+      `).bind(uid).all();
+      let m = `📊 <b>按品種分析</b>\n近30天\n\n`;
+      if (!stats.results || stats.results.length === 0) m += `目前沒有已執行紀錄。`;
+      for (const row of stats.results || []) {
+        const winRate = row.total > 0 ? ((row.wins / row.total) * 100).toFixed(0) : 0;
+        m += `<b>${escHtml(row.ticker)}</b> ${row.total}筆 · 勝率 ${winRate}% · ${row.pnl >= 0 ? '+' : ''}${fmtPrice(row.pnl || 0)}點\n`;
+      }
+      return sendTg(cid, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_mystats' }]] });
+    }
+
+    const executions = await db.prepare(`
+      SELECT s.ticker, s.action, s.result, s.pnl_points, ue.created_at
+      FROM user_executions ue
+      JOIN signals s ON ue.signal_uid = s.signal_uid
+      WHERE ue.user_id = ? AND ue.status = 'executed'
+        AND ue.created_at > datetime('now', '-${days} days')
+      ORDER BY ue.created_at DESC
+    `).bind(uid).all();
+    const rows = executions.results || [];
+    const wins = rows.filter((r) => r.result === 'win').length;
+    const pnl = rows.reduce((sum, r) => sum + Number(r.pnl_points || 0), 0);
+    const winRate = rows.length ? ((wins / rows.length) * 100).toFixed(1) : '0.0';
+    const title = cmd === '/mytoday' ? '今日績效' : cmd === '/myweek' ? '本週績效' : '本月績效';
+    let m = `📈 <b>${title}</b>\n\n`;
+    m += `已執行 ${rows.length} 筆\n`;
+    m += `勝率 <code>${winRate}%</code>\n`;
+    m += `總點數 <code>${pnl >= 0 ? '+' : ''}${fmtPrice(pnl)}</code>\n\n`;
+    for (const row of rows.slice(0, 8)) {
+      m += `${escHtml(row.ticker)} ${row.action === 'LONG' ? '做多' : '做空'} · ${row.result || '未結算'} · ${row.pnl_points >= 0 ? '+' : ''}${fmtPrice(row.pnl_points || 0)}點\n`;
+    }
+    return sendTg(cid, m.trim(), { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_mystats' }]] });
+  }
+
+  if (cmd === '/executed' || cmd === '/skipped') {
+    const status = cmd === '/executed' ? 'executed' : 'skipped';
+    const rows = await db.prepare(`
+      SELECT ue.*, s.ticker, s.action, s.entry_price
+      FROM user_executions ue
+      JOIN signals s ON ue.signal_uid = s.signal_uid
+      WHERE ue.user_id = ? AND ue.status = ?
+      ORDER BY ue.created_at DESC LIMIT 15
+    `).bind(uid, status).all();
+    let m = `${status === 'executed' ? '✅ 已執行' : '⏭️ 已跳過'} <b>訊號</b>\n\n`;
+    if (!rows.results || rows.results.length === 0) m += `目前沒有紀錄。`;
+    for (const row of rows.results || []) {
+      m += `${escHtml(row.ticker)} ${row.action} @ ${fmtPrice(row.entry_price)}\n<code>#${escHtml(row.signal_uid)}</code>\n\n`;
+    }
+    return sendTg(cid, m.trim(), { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1160,6 +1358,28 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     return sendTg(cid, m, kb);
   }
+
+  if (cmd === '/redeem') {
+    const pointsPerDay = parseInt(await getConfig(db, 'points_per_day') || '100');
+    const redeemableDays = Math.floor((user.points || 0) / pointsPerDay);
+    if (redeemableDays <= 0) {
+      return sendTg(cid, `🎁 <b>兌換會員</b>\n\n目前積分：${user.points || 0}\n每 ${pointsPerDay} 點可兌換 1 天會員。\n\n您的積分尚不足。`, {
+        inline_keyboard: [[{ text: '每日簽到', callback_data: 'u_checkin' }], [{ text: '« 返回', callback_data: 'u_points' }]]
+      });
+    }
+    const days = Math.min(redeemableDays, 30);
+    const cost = days * pointsPerDay;
+    const base = user.tier !== 'free' && user.tier_expires_at && new Date(user.tier_expires_at) > new Date()
+      ? new Date(user.tier_expires_at)
+      : new Date();
+    const expires = new Date(base.getTime() + days * 86400000).toISOString();
+    const tier = user.tier === 'vip' ? 'vip' : 'pro';
+    await updateUser(db, uid, { tier, tier_expires_at: expires });
+    await addPoints(db, uid, -cost, `兌換${days}天會員`);
+    return sendTg(cid, `✅ <b>兌換成功</b>\n\n使用 ${cost} 點兌換 ${days} 天 ${tierName(tier)}。\n到期日：${fmtDate(expires)}`, {
+      inline_keyboard: [[{ text: '會員狀態', callback_data: 'u_status' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+    });
+  }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 聯繫客服 /contact
@@ -1231,10 +1451,12 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
 // 用戶 Callback 處理
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function handleUserCallback(cid, uid, msgId, data, env) {
+async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   const db = env.DB;
   const user = await getUser(db, uid);
   const settings = await getUserSettings(db, uid);
+  data = normalizeUserCallback(data);
+  await answerCb(cbId);
   
   // 返回主選單
   if (data === 'u_menu') {
@@ -1440,7 +1662,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
     const newPaused = settings.paused ? 0 : 1;
     await updateUserSettings(db, uid, { paused: newPaused });
     
-    await answerCb(null, newPaused ? '已暫停接收訊號' : '已恢復接收訊號');
+    await answerCb(cbId, newPaused ? '已暫停接收訊號' : '已恢復接收訊號');
     
     // 返回設定頁
     let m = `┌─────────────────────────────┐\n`;
@@ -1565,7 +1787,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data === 'toggle_quiet') {
     const newValue = settings.quiet_enabled ? 0 : 1;
     await updateUserSettings(db, uid, { quiet_enabled: newValue });
-    await answerCb(null, newValue ? '安靜時段已啟用' : '安靜時段已關閉');
+      await answerCb(cbId, newValue ? '安靜時段已啟用' : '安靜時段已關閉');
     
     // 重新顯示
     const newSettings = await getUserSettings(db, uid);
@@ -1599,15 +1821,26 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data.startsWith('quiet_s_')) {
     const hour = data.replace('quiet_s_', '');
     await updateUserSettings(db, uid, { quiet_start: `${hour}:00` });
-    await answerCb(null, `開始時間設為 ${hour}:00`);
-    return;
+    await answerCb(cbId, `開始時間設為 ${hour}:00`);
+    const newSettings = await getUserSettings(db, uid);
+    return editTg(cid, msgId, renderQuietText(newSettings), renderQuietKeyboard(newSettings));
   }
   
   if (data.startsWith('quiet_e_')) {
     const hour = data.replace('quiet_e_', '');
     await updateUserSettings(db, uid, { quiet_end: `${hour}:00` });
-    await answerCb(null, `結束時間設為 ${hour}:00`);
-    return;
+    await answerCb(cbId, `結束時間設為 ${hour}:00`);
+    const newSettings = await getUserSettings(db, uid);
+    return editTg(cid, msgId, renderQuietText(newSettings), renderQuietKeyboard(newSettings));
+  }
+
+  if (data.startsWith('tz_')) {
+    const timezone = data.replace('tz_', '');
+    await updateUserSettings(db, uid, { timezone });
+    await answerCb(cbId, `時區已設為 ${timezone}`);
+    let m = `🌍 <b>時區設定</b>\n\n`;
+    m += `目前時區：<code>${escHtml(timezone)}</code>`;
+    return editTg(cid, msgId, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_settings' }]] });
   }
   
   // 資金設定
@@ -1648,7 +1881,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data.startsWith('cap_')) {
     const value = parseInt(data.replace('cap_', ''));
     await updateUserSettings(db, uid, { capital: value });
-    await answerCb(null, `交易資金設為 $${fmtNum(value)}`);
+    await answerCb(cbId, `交易資金設為 $${fmtNum(value)}`);
     
     const newSettings = await getUserSettings(db, uid);
     const riskAmount = newSettings.capital * (newSettings.risk_percent / 100);
@@ -1686,8 +1919,9 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data.startsWith('risk_')) {
     const value = parseFloat(data.replace('risk_', ''));
     await updateUserSettings(db, uid, { risk_percent: value });
-    await answerCb(null, `風險比例設為 ${value}%`);
-    return;
+    await answerCb(cbId, `風險比例設為 ${value}%`);
+    const newSettings = await getUserSettings(db, uid);
+    return editTg(cid, msgId, renderCapitalText(newSettings), renderCapitalKeyboard());
   }
   
   // 訊號執行記錄
@@ -1699,7 +1933,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
       VALUES (?, ?, 'executed', datetime('now'))
     `).bind(uid, signalUid).run();
     
-    await answerCb(null, '✅ 已記錄為已執行');
+    await answerCb(cbId, '已記錄為已執行');
     return;
   }
   
@@ -1711,14 +1945,16 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
       VALUES (?, ?, 'skipped', datetime('now'))
     `).bind(uid, signalUid).run();
     
-    await answerCb(null, '⏭️ 已記錄為跳過');
+    await answerCb(cbId, '已記錄為跳過');
     return;
   }
   
   // 其他頁面跳轉
   if (data === 'u_signals') return handleUserCommand(cid, uid, '/signals', [], env);
+  if (data === 'u_active') return handleUserCommand(cid, uid, '/active', [], env);
   if (data === 'u_mystats') return handleUserCommand(cid, uid, '/mystats', [], env);
   if (data === 'u_plans') return handleUserCommand(cid, uid, '/plans', [], env);
+  if (data === 'u_status') return handleUserCommand(cid, uid, '/status', [], env);
   if (data === 'u_invite') return handleUserCommand(cid, uid, '/invite', [], env);
   if (data === 'u_contact') return handleUserCommand(cid, uid, '/contact', [], env);
   if (data === 'u_help') return handleUserCommand(cid, uid, '/help', [], env);
@@ -1726,6 +1962,17 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data === 'u_trial') return handleUserCommand(cid, uid, '/trial', [], env);
   if (data === 'u_points') return handleUserCommand(cid, uid, '/points', [], env);
   if (data === 'u_history') return handleUserCommand(cid, uid, '/history', [], env);
+  if (data === 'u_renew') return handleUserCommand(cid, uid, '/renew', [], env);
+  if (data === 'u_upgrade') return renderOrderPicker(cid, msgId, db, 'vip');
+  if (data === 'u_redeem') return handleUserCommand(cid, uid, '/redeem', [], env);
+  if (data === 'u_timezone') return handleUserCommand(cid, uid, '/timezone', [], env);
+  if (data === 'copy_ref') {
+    const refLink = `https://t.me/${CONFIG.BOT_USERNAME}?start=ref_${user.referral_code}`;
+    await answerCb(cbId, '邀請連結已顯示在新訊息');
+    return sendTg(cid, `🎁 <b>您的邀請連結</b>\n\n<code>${escHtml(refLink)}</code>`);
+  }
+  if (data === 'mystats_symbol') return handleUserCommand(cid, uid, '/perfbysymbol', [], env);
+  if (data === 'mystats_month') return handleUserCommand(cid, uid, '/mymonth', [], env);
   
   // 訂閱方案
   if (data === 'order_pro' || data === 'order_vip') {
@@ -1809,7 +2056,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
       await sendTg(adminId, `💰 用戶已付款通知！\n\n訂單：<code>${orderId}</code>\n用戶：<code>${uid}</code>\n\n請確認後使用 /confirm ${orderId}`);
     }
     
-    await answerCb(null, '已通知客服，請稍候', true);
+    await answerCb(cbId, '已通知客服，請稍候', true);
     
     let m = `✅ <b>付款通知已送出</b>\n\n`;
     m += `訂單編號：<code>${orderId}</code>\n\n`;
@@ -1823,7 +2070,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   if (data.startsWith('cancel_')) {
     const orderId = data.replace('cancel_', '');
     await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE order_id = ?`).bind(orderId).run();
-    await answerCb(null, '訂單已取消');
+    await answerCb(cbId, '訂單已取消');
     return editTg(cid, msgId, `❌ 訂單已取消\n\n如需重新訂閱，請使用 /plans`, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
   }
   
@@ -2532,27 +2779,28 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
 // 管理員 Callback 處理
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function handleAdminCallback(cid, uid, msgId, data, env) {
+async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
   const db = env.DB;
+  await answerCb(cbId);
   
   // 幫助提示
   if (data === 'a_help_long') {
-    await answerCb(null, '');
+    await answerCb(cbId, '');
     return sendTg(cid, `🟢 <b>做多訊號</b>\n\n<code>/long NQ 21500 21480 21520 21540</code>\n\n參數：品種 進場 止損 TP1 [TP2] [TP3] [@群組]`);
   }
   
   if (data === 'a_help_short') {
-    await answerCb(null, '');
+    await answerCb(cbId, '');
     return sendTg(cid, `🔴 <b>做空訊號</b>\n\n<code>/short ES 5820 5835 5810 5800</code>\n\n參數：品種 進場 止損 TP1 [TP2] [TP3] [@群組]`);
   }
   
   if (data === 'a_help_bc') {
-    await answerCb(null, '');
+    await answerCb(cbId, '');
     return sendTg(cid, `📢 <b>廣播</b>\n\n<code>/bc 訊息內容</code>\n<code>/bc @vip VIP專屬訊息</code>\n<code>/announce 重要公告</code>`);
   }
   
   if (data === 'a_help_alert') {
-    await answerCb(null, '');
+    await answerCb(cbId, '');
     return sendTg(cid, `⚠️ <b>警報</b>\n\n<code>/alert 今晚20:30 CPI數據</code>\n<code>/update 移動止損到21510</code>`);
   }
   
@@ -2569,7 +2817,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
     await updateUser(db, userId, { tier: 'pro', tier_expires_at: expires });
     await logAction(db, uid, 'set_pro', userId, '30 days');
     await sendTg(userId, `🎉 恭喜！您已升級為 ⭐ Pro會員\n天數：30天\n到期：${fmtDate(expires)}`);
-    await answerCb(null, '已設為Pro 30天');
+    await answerCb(cbId, '已設為Pro 30天');
     return;
   }
   
@@ -2579,7 +2827,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
     await updateUser(db, userId, { tier: 'vip', tier_expires_at: expires });
     await logAction(db, uid, 'set_vip', userId, '30 days');
     await sendTg(userId, `🎉 恭喜！您已升級為 👑 VIP會員\n天數：30天\n到期：${fmtDate(expires)}`);
-    await answerCb(null, '已設為VIP 30天');
+    await answerCb(cbId, '已設為VIP 30天');
     return;
   }
   
@@ -2595,7 +2843,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '7 days');
     await sendTg(userId, `🎉 您的會員已延長 7 天！\n新到期日：${fmtDate(newExpiry)}`);
-    await answerCb(null, '已延長7天');
+    await answerCb(cbId, '已延長7天');
     return;
   }
   
@@ -2611,7 +2859,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '30 days');
     await sendTg(userId, `🎉 您的會員已延長 30 天！\n新到期日：${fmtDate(newExpiry)}`);
-    await answerCb(null, '已延長30天');
+    await answerCb(cbId, '已延長30天');
     return;
   }
   
@@ -2619,13 +2867,13 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
     const userId = data.replace('adm_ban_', '');
     await updateUser(db, userId, { is_banned: 1 });
     await logAction(db, uid, 'ban', userId, '');
-    await answerCb(null, '已封禁');
+    await answerCb(cbId, '已封禁');
     return;
   }
   
   if (data.startsWith('adm_msg_')) {
     const userId = data.replace('adm_msg_', '');
-    await answerCb(null, '');
+    await answerCb(cbId, '');
     return sendTg(cid, `💬 發送私訊\n\n<code>/msg ${userId} 您的訊息內容</code>`);
   }
   
@@ -2877,7 +3125,7 @@ async function getAdminBootstrap(db) {
 }
 
 async function createAdminSignal(db, adminId, payload) {
-  const ticker = String(payload.ticker || '').trim().toUpperCase();
+  const ticker = String(payload.ticker || payload.symbol || payload.instrument || '').trim().toUpperCase();
   const action = String(payload.action || '').toUpperCase();
   const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
   const entry = asNumber(payload.entry_price ?? payload.entry);
@@ -2890,6 +3138,8 @@ async function createAdminSignal(db, adminId, payload) {
   if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
   if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
   if (entry === null || stopLoss === null || tp1 === null) throw new Error('進場、止損、TP1 為必填數字');
+  const symbol = await db.prepare('SELECT symbol FROM symbols WHERE symbol = ? AND is_active = 1').bind(ticker).first();
+  if (!symbol) throw new Error(`${ticker} 尚未啟用，請先到品種管理新增或啟用`);
 
   const sendNow = payload.send !== false;
   const targetGroup = String(payload.target_group || payload.targetGroup || (payload.is_vip_only ? 'vip' : 'all')).trim().toLowerCase() || 'all';
@@ -3807,8 +4057,9 @@ function renderAdminPage() {
       .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .table-wrap table { min-width: 680px; }
       th, td { padding: 10px; }
-      .mobile-dock { position: fixed; left: 10px; right: 10px; bottom: 10px; display:grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 8px; border:1px solid rgba(255,255,255,.45); border-radius: 16px; background: rgba(13,24,36,.94); backdrop-filter: blur(18px); z-index: 30; box-shadow: 0 18px 40px rgba(0,0,0,.25); }
-	      .mobile-dock button { border:0; background: transparent; color:#a9bdc9; display:grid; place-items:center; gap: 3px; min-height: 48px; border-radius: 10px; font-size: 11px; font-weight: 800; }
+      .mobile-dock { position: fixed; left: 10px; right: 10px; bottom: 10px; display:flex; gap: 4px; padding: 8px; border:1px solid rgba(255,255,255,.45); border-radius: 16px; background: rgba(13,24,36,.94); backdrop-filter: blur(18px); z-index: 30; box-shadow: 0 18px 40px rgba(0,0,0,.25); overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+      .mobile-dock::-webkit-scrollbar { display: none; }
+	      .mobile-dock button { border:0; background: transparent; color:#a9bdc9; display:grid; place-items:center; gap: 3px; min-height: 48px; min-width: 62px; border-radius: 10px; font-size: 11px; font-weight: 800; }
 	      .mobile-dock button::before { content: attr(data-icon); display:block; color:#7af5ff; font-size: 13px; font-weight: 900; line-height: 1; }
 	      .mobile-dock button.active { background: rgba(18,198,208,.18); color: #7af5ff; }
 	    }
@@ -3879,7 +4130,10 @@ function renderAdminPage() {
 	    <button data-view-target="signals" data-icon="↗">訊號</button>
 	    <button data-view-target="strategies" data-icon="◇">策略</button>
 	    <button data-view-target="tradingview" data-icon="▣">TV</button>
+	    <button data-view-target="symbols" data-icon="▦">品種</button>
 	    <button data-view-target="users" data-icon="◎">會員</button>
+	    <button data-view-target="orders" data-icon="$">訂單</button>
+	    <button data-view-target="billing" data-icon="⚙">收費</button>
 	  </nav>
   <script>${renderAdminScript()}</script>
 </body>
@@ -4043,7 +4297,10 @@ function showView(view) {
 async function api(path, options) {
   var res = await fetch(path, Object.assign({ credentials: 'same-origin', headers: { 'Content-Type': 'application/json' } }, options || {}));
   if (res.status === 401) { location.reload(); return; }
-  var data = await res.json();
+  var text = await res.text();
+  var data;
+  try { data = text ? JSON.parse(text) : {}; } catch (e) { throw new Error(text || ('HTTP ' + res.status)); }
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   if (!data.ok) throw new Error(data.error || '操作失敗');
   return data.data;
 }
@@ -4404,12 +4661,16 @@ document.body.addEventListener('click', async function (event) {
     showError(err);
   }
 });
+function setSignalAction(action) {
+  state.action = action === 'SHORT' ? 'SHORT' : 'LONG';
+  var actionInput = document.querySelector('#signalForm [name="action"]');
+  if (actionInput) actionInput.value = state.action;
+  Array.prototype.slice.call(document.querySelectorAll('#signalForm [data-action]')).forEach(function (el) { el.classList.toggle('active', el.dataset.action === state.action); });
+}
 document.querySelector('.seg').addEventListener('click', function (event) {
   var btn = event.target.closest('[data-action]');
   if (!btn) return;
-  state.action = btn.dataset.action;
-  document.querySelector('[name="action"]').value = state.action;
-  Array.prototype.slice.call(document.querySelectorAll('[data-action]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
+  setSignalAction(btn.dataset.action);
 });
 document.getElementById('refreshBtn').addEventListener('click', function () { load().catch(showError); });
 document.getElementById('commandSearch').addEventListener('input', function (event) { state.query = event.target.value; renderSignals(); });
@@ -4426,9 +4687,11 @@ document.getElementById('signalForm').addEventListener('submit', async function 
     setMessage('建立訊號中...');
     await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(signalPayload(event.target)) });
     event.target.reset();
+    setSignalAction('LONG');
     await load();
   } catch (err) { showError(err, '建立訊號失敗'); }
 });
+document.getElementById('signalForm').addEventListener('reset', function () { setTimeout(function () { setSignalAction('LONG'); }, 0); });
 document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); } catch (err) { showError(err, '儲存設定失敗'); } });
 document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存品種失敗'); } });
 document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存策略失敗'); } });
@@ -4556,15 +4819,13 @@ async function handleWebhook(request, env) {
       const msgId = cb.message?.message_id;
       const data = cb.data;
       
-      await answerCb(cb.id);
-      
       // 管理員 Callback
       if (isAdmin(uid) && (data.startsWith('a_') || data.startsWith('adm_'))) {
-        return webhookResponse(await handleAdminCallback(cid, uid, msgId, data, env));
+        return webhookResponse(await handleAdminCallback(cid, uid, msgId, data, env, cb.id));
       }
       
       // 用戶 Callback
-      return webhookResponse(await handleUserCallback(cid, uid, msgId, data, env));
+      return webhookResponse(await handleUserCallback(cid, uid, msgId, data, env, cb.id));
     }
     
     // 處理訊息
