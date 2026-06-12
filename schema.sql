@@ -362,6 +362,7 @@ CREATE TABLE queued_signals (
   user_id TEXT NOT NULL,
   signal_uid TEXT NOT NULL,
   message TEXT NOT NULL,
+  photo_url TEXT,
   scheduled_at TEXT NOT NULL,
   sent INTEGER DEFAULT 0,
   created_at TEXT DEFAULT (datetime('now')),

@@ -79,6 +79,12 @@ const daysLeft = (d) => d ? Math.max(0, Math.ceil((new Date(d) - new Date()) / 8
 const parseJSON = (s, def = []) => { try { return JSON.parse(s) || def; } catch { return def; } };
 const escHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const firstUrl = (value) => String(value || '').match(/https?:\/\/[^\s<>"']+/)?.[0] || '';
+const stripHtml = (value) => String(value || '').replace(/<[^>]+>/g, '');
+const photoCaption = (value) => {
+  const text = String(value || '');
+  if (text.length <= 1000) return text;
+  return stripHtml(text).slice(0, 1000);
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Telegram API
@@ -88,6 +94,24 @@ async function sendTg(chatId, text, kb = null, options = {}) {
   if (kb) body.reply_markup = kb;
   try {
     const res = await fetch(`${tgApi()}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return res.json();
+  } catch (e) { return { ok: false }; }
+}
+
+async function sendTgPhoto(chatId, photoUrl, caption = '', kb = null) {
+  const body = {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption: photoCaption(caption),
+    parse_mode: 'HTML'
+  };
+  if (kb) body.reply_markup = kb;
+  try {
+    const res = await fetch(`${tgApi()}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -318,6 +342,19 @@ function signalMediaUrl(signal) {
   return firstUrl(signal?.snapshot_url) || firstUrl(signal?.chart_url) || firstUrl(signal?.note);
 }
 
+function signalPhotoUrl(signal) {
+  return firstUrl(signal?.snapshot_url);
+}
+
+async function sendSignalTg(chatId, signal, message, kb = null) {
+  const photoUrl = signalPhotoUrl(signal);
+  if (photoUrl) {
+    const photoResult = await sendTgPhoto(chatId, photoUrl, message, kb);
+    if (photoResult?.ok) return photoResult;
+  }
+  return sendTg(chatId, message, kb, signalPreviewOptions(signal));
+}
+
 function formatExitCard(type, ticker, price, pnl, note = '') {
   const icons = {
     TP1: { emoji: '🎯', title: '止盈1達成！', color: '✅' },
@@ -453,6 +490,7 @@ async function isInQuietHours(settings) {
 }
 
 async function broadcastSignal(db, signal) {
+  await addColumnIfMissing(db, 'queued_signals', 'photo_url', 'TEXT');
   // 取得所有付費會員
   const users = await db.prepare(`
     SELECT u.user_id, u.tier, us.*
@@ -487,9 +525,9 @@ async function broadcastSignal(db, signal) {
       // 加入待發佇列
       const quietEnd = user.quiet_end;
       await db.prepare(`
-        INSERT INTO queued_signals (user_id, signal_uid, message, scheduled_at)
-        VALUES (?, ?, ?, datetime('now', '+8 hours'))
-      `).bind(user.user_id, signal.signal_uid, msg).run();
+        INSERT INTO queued_signals (user_id, signal_uid, message, photo_url, scheduled_at)
+        VALUES (?, ?, ?, ?, datetime('now', '+8 hours'))
+      `).bind(user.user_id, signal.signal_uid, msg, signalPhotoUrl(signal) || null).run();
       queued++;
       continue;
     }
@@ -502,7 +540,7 @@ async function broadcastSignal(db, signal) {
       ]]
     };
     
-	    const r = await sendTg(user.user_id, msg, kb, signalPreviewOptions(signal));
+	    const r = await sendSignalTg(user.user_id, signal, msg, kb);
     if (r?.ok) sent++; else skipped++;
     
     // 避免頻率限制
@@ -3917,7 +3955,7 @@ function renderSignalFormHtml() {
       <div><label>TP3</label><input name="tp3" inputmode="decimal"></div>
       <div><label>發送模式</label><select name="send"><option value="true">立即發送</option><option value="false">只存草稿</option></select></div>
       <div class="full"><label>TradingView 圖表 URL</label><input name="chart_url" inputmode="url" placeholder="https://www.tradingview.com/chart/..."></div>
-      <div class="full"><label>截圖 / 快照 URL</label><input name="snapshot_url" inputmode="url" placeholder="https://..."></div>
+      <div class="full"><label>Telegram 截圖 / 快照 URL</label><input name="snapshot_url" inputmode="url" placeholder="https://... 可公開讀取的圖片 URL"></div>
       <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
     </div>
 	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
@@ -4527,6 +4565,7 @@ async function handleExpireReminder(env) {
 
 async function handleQueuedSignals(env) {
   const db = env.DB;
+  await addColumnIfMissing(db, 'queued_signals', 'photo_url', 'TEXT');
   
   // 發送待發訊號
   const queued = await db.prepare(`
@@ -4536,7 +4575,11 @@ async function handleQueuedSignals(env) {
   
   let count = 0;
   for (const q of queued.results || []) {
-    const result = await sendTg(q.user_id, q.message);
+    let result = null;
+    if (q.photo_url) {
+      result = await sendTgPhoto(q.user_id, q.photo_url, q.message);
+    }
+    if (!result?.ok) result = await sendTg(q.user_id, q.message);
     if (result?.ok) {
       await db.prepare(`UPDATE queued_signals SET sent = 1 WHERE id = ?`).bind(q.id).run();
       count++;
