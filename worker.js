@@ -3514,7 +3514,8 @@ function renderAdminPage() {
     .form-grid .full { grid-column: 1 / -1; }
     .seg { display:grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
     .seg button, .btn { border:1px solid var(--line); border-radius: 6px; min-height: 38px; padding: 8px 11px; background:#fff; color: var(--ink); cursor:pointer; font-weight: 750; font-size: 13px; }
-    .seg button.active { background: var(--accent); border-color: var(--accent); color:#fff; }
+	    .seg button.active { background: var(--accent); border-color: var(--accent); color:#fff; }
+	    .seg button:disabled, .btn:disabled { opacity: .55; cursor: not-allowed; }
     .btn.primary { background: var(--accent); border-color: var(--accent); color:#fff; }
     .btn.primary:hover { background: var(--accent-2); }
     .btn.ghost { background:#fff; }
@@ -3706,7 +3707,7 @@ function renderAdminPage() {
 function renderSignalFormHtml() {
   return `<form id="signalForm" class="stack">
     <div class="form-grid">
-      <div><label>品種</label><select name="ticker" id="signalTicker"></select></div>
+	      <div><label>品種</label><select name="ticker" id="signalTicker" disabled><option value="">載入品種中...</option></select></div>
       <div><label>方向</label><div class="seg"><button type="button" class="active" data-action="LONG">做多</button><button type="button" data-action="SHORT">做空</button></div><input type="hidden" name="action" value="LONG"></div>
       <div><label>訊號類型</label><select name="signal_type"><option value="scalp">短線</option><option value="swing">波段</option><option value="daytrade">日內</option></select></div>
       <div><label>目標</label><select name="target_group"><option value="all">全部付費會員</option><option value="pro">Pro 以上</option><option value="vip">VIP 專屬</option></select></div>
@@ -3718,8 +3719,8 @@ function renderSignalFormHtml() {
       <div><label>發送模式</label><select name="send"><option value="true">立即發送</option><option value="false">只存草稿</option></select></div>
       <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
     </div>
-    <div class="actions"><button class="btn primary" type="submit">建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
-  </form>`;
+	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
+	  </form>`;
 }
 
 function renderStrategyFormHtml() {
@@ -3869,6 +3870,7 @@ async function load() {
   setMessage('已同步 ' + state.data.serverTime, 'ok');
 }
 function renderAll() {
+  renderSignalSymbolOptions();
   renderOpsSummary();
   renderKpis();
   renderConfigSummary();
@@ -3883,7 +3885,6 @@ function renderAll() {
   renderTvGateway();
   renderRevenueSummary();
   renderOverviewTvLogs();
-  renderSignalSymbolOptions();
   document.getElementById('serverTime').textContent = '最後同步 ' + state.data.serverTime;
   document.getElementById('dbPill').textContent = 'D1 dc-signals-v91-db';
 }
@@ -3938,9 +3939,20 @@ function renderConfigForm() {
 }
 function renderSignalSymbolOptions() {
   var select = document.getElementById('signalTicker');
-  select.innerHTML = state.data.symbols.filter(function (s) { return s.is_active; }).map(function (s) {
-    return '<option value="' + esc(s.symbol) + '">' + esc(s.symbol + ' - ' + (s.name_zh || s.name)) + '</option>';
+  var submit = document.getElementById('createSignalBtn');
+  var activeSymbols = (state.data.symbols || []).filter(function (s) { return s.is_active; });
+  if (!activeSymbols.length) {
+    select.innerHTML = '<option value="">請先啟用品種</option>';
+    select.disabled = true;
+    if (submit) submit.disabled = true;
+    return;
+  }
+  select.innerHTML = activeSymbols.map(function (s, index) {
+    var selected = index === 0 ? ' selected' : '';
+    return '<option value="' + esc(s.symbol) + '"' + selected + '>' + esc(s.symbol + ' - ' + (s.name_zh || s.name)) + '</option>';
   }).join('');
+  select.disabled = false;
+  if (submit) submit.disabled = false;
 }
 function signalRow(sig, compact) {
   var statusTone = sig.status === 'active' ? 'green' : sig.status === 'closed' ? '' : sig.status === 'cancelled' ? 'red' : 'amber';
@@ -4138,45 +4150,59 @@ function formPayload(form) {
   ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
   return data;
 }
+function signalPayload(form) {
+  var data = formPayload(form);
+  var select = document.getElementById('signalTicker');
+  if (!data.ticker && select && select.value) data.ticker = select.value;
+  if (!data.ticker) throw new Error('請先選擇品種');
+  return data;
+}
+function showError(err, fallback) {
+  setMessage((err && err.message) || fallback || '操作失敗', 'error');
+}
 document.getElementById('nav').addEventListener('click', function (event) { var btn = event.target.closest('[data-view]'); if (btn) showView(btn.dataset.view); });
 document.body.addEventListener('click', async function (event) {
-  var targetView = event.target.closest('[data-view-target]');
-  if (targetView) showView(targetView.dataset.viewTarget);
-  var copyBtn = event.target.closest('[data-copy], [data-copy-value]');
-  if (copyBtn) {
-    var value = copyBtn.dataset.copyValue || '';
-    if (copyBtn.dataset.copy === 'tv-current') value = document.getElementById('tvWebhookUrl').value;
-    if (value && navigator.clipboard) {
-      await navigator.clipboard.writeText(value);
-      setMessage('已複製到剪貼簿', 'ok');
+  try {
+    var targetView = event.target.closest('[data-view-target]');
+    if (targetView) showView(targetView.dataset.viewTarget);
+    var copyBtn = event.target.closest('[data-copy], [data-copy-value]');
+    if (copyBtn) {
+      var value = copyBtn.dataset.copyValue || '';
+      if (copyBtn.dataset.copy === 'tv-current') value = document.getElementById('tvWebhookUrl').value;
+      if (value && navigator.clipboard) {
+        await navigator.clipboard.writeText(value);
+        setMessage('已複製到剪貼簿', 'ok');
+      }
     }
+    var closeBtn = event.target.closest('[data-close]');
+    if (closeBtn) {
+      var price = prompt('輸入結案價格');
+      if (!price) return;
+      var type = prompt('結案類型：CLOSE / TP1 / TP2 / TP3 / SL', 'CLOSE') || 'CLOSE';
+      await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(price), type: type, notify: true }) });
+      await load();
+    }
+    var sendBtn = event.target.closest('[data-send]');
+    if (sendBtn && confirm('確認發送此草稿訊號給符合條件的會員？')) {
+      await api('/api/admin/signals/' + encodeURIComponent(sendBtn.dataset.send) + '/send', { method: 'POST', body: '{}' });
+      await load();
+    }
+    var cancelBtn = event.target.closest('[data-cancel]');
+    if (cancelBtn && confirm('確定取消此草稿訊號？')) {
+      await api('/api/admin/signals/' + encodeURIComponent(cancelBtn.dataset.cancel) + '/cancel', { method: 'POST', body: '{}' });
+      await load();
+    }
+    var confirmOrder = event.target.closest('[data-confirm-order]');
+    if (confirmOrder) { await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
+    var rejectOrder = event.target.closest('[data-reject-order]');
+    if (rejectOrder) { var reason = prompt('拒絕原因', '付款未確認') || '付款未確認'; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) }); await load(); }
+    var userTier = event.target.closest('[data-user-tier]');
+    if (userTier) { var parts = userTier.dataset.userTier.split('|'); await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
+    var userBan = event.target.closest('[data-user-ban]');
+    if (userBan) { var banParts = userBan.dataset.userBan.split('|'); await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
+  } catch (err) {
+    showError(err);
   }
-  var closeBtn = event.target.closest('[data-close]');
-  if (closeBtn) {
-    var price = prompt('輸入結案價格');
-    if (!price) return;
-    var type = prompt('結案類型：CLOSE / TP1 / TP2 / TP3 / SL', 'CLOSE') || 'CLOSE';
-    await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(price), type: type, notify: true }) });
-    await load();
-  }
-  var sendBtn = event.target.closest('[data-send]');
-  if (sendBtn && confirm('確認發送此草稿訊號給符合條件的會員？')) {
-    await api('/api/admin/signals/' + encodeURIComponent(sendBtn.dataset.send) + '/send', { method: 'POST', body: '{}' });
-    await load();
-  }
-  var cancelBtn = event.target.closest('[data-cancel]');
-  if (cancelBtn && confirm('確定取消此草稿訊號？')) {
-    await api('/api/admin/signals/' + encodeURIComponent(cancelBtn.dataset.cancel) + '/cancel', { method: 'POST', body: '{}' });
-    await load();
-  }
-  var confirmOrder = event.target.closest('[data-confirm-order]');
-  if (confirmOrder) { await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
-  var rejectOrder = event.target.closest('[data-reject-order]');
-  if (rejectOrder) { var reason = prompt('拒絕原因', '付款未確認') || '付款未確認'; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) }); await load(); }
-  var userTier = event.target.closest('[data-user-tier]');
-  if (userTier) { var parts = userTier.dataset.userTier.split('|'); await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
-  var userBan = event.target.closest('[data-user-ban]');
-  if (userBan) { var banParts = userBan.dataset.userBan.split('|'); await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
 });
 document.querySelector('.seg').addEventListener('click', function (event) {
   var btn = event.target.closest('[data-action]');
@@ -4185,7 +4211,7 @@ document.querySelector('.seg').addEventListener('click', function (event) {
   document.querySelector('[name="action"]').value = state.action;
   Array.prototype.slice.call(document.querySelectorAll('[data-action]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
 });
-document.getElementById('refreshBtn').addEventListener('click', load);
+document.getElementById('refreshBtn').addEventListener('click', function () { load().catch(showError); });
 document.getElementById('commandSearch').addEventListener('input', function (event) { state.query = event.target.value; renderSignals(); });
 document.getElementById('signalFilters').addEventListener('click', function (event) {
   var btn = event.target.closest('[data-filter]');
@@ -4194,32 +4220,44 @@ document.getElementById('signalFilters').addEventListener('click', function (eve
   Array.prototype.slice.call(document.querySelectorAll('#signalFilters [data-filter]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
   renderSignals();
 });
-document.getElementById('signalForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
-document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); });
-document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
-document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
-document.getElementById('tvSourceForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/tradingview/sources', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
+document.getElementById('signalForm').addEventListener('submit', async function (event) {
+  event.preventDefault();
+  try {
+    setMessage('建立訊號中...');
+    await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(signalPayload(event.target)) });
+    event.target.reset();
+    await load();
+  } catch (err) { showError(err, '建立訊號失敗'); }
+});
+document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); } catch (err) { showError(err, '儲存設定失敗'); } });
+document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存品種失敗'); } });
+document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存策略失敗'); } });
+document.getElementById('tvSourceForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/tradingview/sources', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存 TradingView 來源失敗'); } });
 ['tvGenSource','tvGenStrategy','tvGenTicker','tvGenAction','tvGenInterval','tvGenPrice'].forEach(function (id) {
   document.getElementById(id).addEventListener('change', updateTradingViewGenerator);
   document.getElementById(id).addEventListener('input', updateTradingViewGenerator);
 });
 document.getElementById('tvGenerateBtn').addEventListener('click', updateTradingViewGenerator);
 document.getElementById('tvPreviewBtn').addEventListener('click', async function () {
-  var action = document.getElementById('tvGenAction').value;
-  var payload = {
-    source_id: document.getElementById('tvGenSource').value,
-    strategy: document.getElementById('tvGenStrategy').value,
-    ticker: document.getElementById('tvGenTicker').value,
-    action: action === 'AUTO' ? 'LONG' : action,
-    price: Number(document.getElementById('tvGenPrice').value || 0),
-    interval: document.getElementById('tvGenInterval').value
-  };
-  var result = await api('/api/admin/tradingview/preview', { method: 'POST', body: JSON.stringify(payload) });
-  var s = result.signal;
-  document.getElementById('tvPreview').innerHTML =
-    '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + '</div>' +
-    '<b>' + esc(s.action + ' ' + s.ticker) + '</b>' +
-    '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>';
+  try {
+    var action = document.getElementById('tvGenAction').value;
+    var payload = {
+      source_id: document.getElementById('tvGenSource').value,
+      strategy: document.getElementById('tvGenStrategy').value,
+      ticker: document.getElementById('tvGenTicker').value,
+      action: action === 'AUTO' ? 'LONG' : action,
+      price: Number(document.getElementById('tvGenPrice').value || 0),
+      interval: document.getElementById('tvGenInterval').value
+    };
+    var result = await api('/api/admin/tradingview/preview', { method: 'POST', body: JSON.stringify(payload) });
+    var s = result.signal;
+    document.getElementById('tvPreview').innerHTML =
+      '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + '</div>' +
+      '<b>' + esc(s.action + ' ' + s.ticker) + '</b>' +
+      '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>';
+  } catch (err) {
+    showError(err, '預覽 TradingView 訊號失敗');
+  }
 });
 load().catch(function (err) { setMessage(err.message, 'error'); });
 `;
