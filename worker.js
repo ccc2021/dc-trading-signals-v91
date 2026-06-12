@@ -273,66 +273,46 @@ async function addPoints(db, userId, points, reason) {
 
 function formatSignalCard(signal, userSettings = null, isVip = false) {
   const { ticker, action, entry_price, stop_loss, tp1, tp2, tp3, signal_type } = signal;
-  const actionInfo = CONFIG.ACTIONS[action] || { emoji: '📊', name: action };
-  const typeInfo = CONFIG.SIGNAL_TYPES[signal_type] || { emoji: '📊', name: '' };
+  const typeInfo = CONFIG.SIGNAL_TYPES[signal_type] || { name: '' };
   
   const risk = Math.abs(entry_price - stop_loss);
   const reward1 = tp1 ? Math.abs(tp1 - entry_price) : 0;
   const rr = risk > 0 ? (reward1 / risk).toFixed(1) : '0';
-  
-  let msg = '';
-  
-  // VIP 標籤
-  if (signal.is_vip_only) {
-    msg += `╔═══════════════════════════╗\n`;
-    msg += `║  👑 VIP 專屬訊號          ║\n`;
-    msg += `╠═══════════════════════════╣\n`;
-  } else {
-    msg += `┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n`;
-  }
-  
-  msg += `┃  ${actionInfo.emoji} <b>${action}</b>  ${ticker}\n`;
-  if (typeInfo.name) msg += `┃  ${typeInfo.emoji} ${typeInfo.name}\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃\n`;
-  msg += `┃  💰 進場  │ <code>${fmtPrice(entry_price)}</code>\n`;
-  msg += `┃  🛑 止損  │ <code>${fmtPrice(stop_loss)}</code>\n`;
-  msg += `┃  ─────────────────────\n`;
-  if (tp1) msg += `┃  🎯 TP1   │ <code>${fmtPrice(tp1)}</code>\n`;
-  if (tp2) msg += `┃  🎯 TP2   │ <code>${fmtPrice(tp2)}</code>\n`;
-  if (tp3 && isVip) msg += `┃  🎯 TP3   │ <code>${fmtPrice(tp3)}</code>  👑\n`;
-  msg += `┃\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃  📊 風險 ${fmtPrice(risk)} 點\n`;
-  msg += `┃  🎯 報酬 1:${rr}\n`;
-  
-  // 個人化交易建議
+
+  const sideLabel = action === 'LONG' ? 'LONG 做多' : action === 'SHORT' ? 'SHORT 做空' : action;
+  const sideIcon = action === 'LONG' ? '🟢' : action === 'SHORT' ? '🔴' : '📊';
+  const tierLine = signal.is_vip_only ? 'VIP 專屬' : (signal.target_group === 'vip' ? 'VIP' : signal.target_group === 'pro' ? 'Pro 以上' : '付費會員');
+  const chartUrl = signalMediaUrl(signal);
+  const origin = signal.strategy_id || signal.source || 'TradingView';
+
+  let msg = `${sideIcon} <b>${escHtml(sideLabel)} ${escHtml(ticker)}</b>\n`;
+  msg += `${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
+
+  msg += `<b>進出場</b>\n`;
+  msg += `進場 <code>${fmtPrice(entry_price)}</code>\n`;
+  msg += `止損 <code>${fmtPrice(stop_loss)}</code>\n\n`;
+
+  msg += `<b>目標價</b>\n`;
+  if (tp1) msg += `TP1 <code>${fmtPrice(tp1)}</code>\n`;
+  if (tp2) msg += `TP2 <code>${fmtPrice(tp2)}</code>\n`;
+  if (tp3 && isVip) msg += `TP3 <code>${fmtPrice(tp3)}</code>  VIP\n`;
+  msg += `\n<b>風控</b>\n`;
+  msg += `風險 <code>${fmtPrice(risk)}</code> 點 · RR <code>1:${rr}</code>\n`;
+
   if (userSettings && userSettings.capital > 0) {
     const riskAmount = userSettings.capital * (userSettings.risk_percent / 100);
     const tickValue = 5; // 預設 NQ tick value
     const contracts = risk > 0 ? (riskAmount / (risk * tickValue)).toFixed(2) : 0;
-    
-    msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-    msg += `┃  📊 您的交易參考\n`;
-    msg += `┃  ─────────────────────\n`;
-    msg += `┃  風險金額  │ $${fmtNum(riskAmount.toFixed(0))} (${userSettings.risk_percent}%)\n`;
-    msg += `┃  建議口數  │ ${contracts} 口\n`;
+    msg += `倉位參考 $${fmtNum(riskAmount.toFixed(0))} (${userSettings.risk_percent}%) · ${contracts} 口\n`;
   }
-  
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃  ⏰ ${fmtTime()}\n`;
-  msg += `┃  🔖 #${signal.signal_uid}\n`;
-  const chartUrl = signalMediaUrl(signal);
-  if (chartUrl) msg += `┃  📸 <a href="${escHtml(chartUrl)}">圖表快照 / TV 圖表</a>\n`;
 
-  if (signal.is_vip_only) {
-    msg += `╚═══════════════════════════╝`;
-  } else {
-    msg += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛`;
-  }
-  
-	  return msg;
-	}
+  msg += `\n<b>來源</b>\n`;
+  msg += `${escHtml(origin)} · ${fmtTime()}\n`;
+  msg += `<code>#${escHtml(signal.signal_uid)}</code>`;
+  if (chartUrl) msg += `\n<a href="${escHtml(chartUrl)}">查看圖表</a>`;
+
+  return msg;
+}
 
 function signalPreviewOptions(signal) {
   return signalMediaUrl(signal) ? { disablePreview: false } : {};
@@ -357,83 +337,48 @@ async function sendSignalTg(chatId, signal, message, kb = null) {
 
 function formatExitCard(type, ticker, price, pnl, note = '') {
   const icons = {
-    TP1: { emoji: '🎯', title: '止盈1達成！', color: '✅' },
-    TP2: { emoji: '🎯', title: '止盈2達成！', color: '✅' },
-    TP3: { emoji: '🎯', title: '止盈3達成！', color: '✅' },
-    SL: { emoji: '🛑', title: '止損觸發', color: '❌' },
-    CLOSE: { emoji: '⬜', title: '手動平倉', color: pnl >= 0 ? '✅' : '❌' },
-    BE: { emoji: '🔄', title: '移至成本', color: '⚪' }
+    TP1: { icon: '✅', title: 'TP1 達成' },
+    TP2: { icon: '✅', title: 'TP2 達成' },
+    TP3: { icon: '✅', title: 'TP3 達成' },
+    SL: { icon: '🔴', title: '止損觸發' },
+    CLOSE: { icon: pnl >= 0 ? '✅' : '🔴', title: '手動平倉' },
+    BE: { icon: '⚪', title: '移至成本' }
   };
   
-  const info = icons[type] || { emoji: '📊', title: type, color: '⚪' };
+  const info = icons[type] || { icon: '📊', title: type };
   const pnlSign = pnl >= 0 ? '+' : '';
   
-  let msg = `┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n`;
-  msg += `┃  ${info.emoji} <b>${info.title}</b>\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃\n`;
-  msg += `┃  ${ticker}  │  ${type}\n`;
-  msg += `┃  ─────────────────────\n`;
-  msg += `┃  📍 成交  │ <code>${fmtPrice(price)}</code>\n`;
+  let msg = `${info.icon} <b>${escHtml(info.title)}</b>\n`;
+  msg += `${escHtml(ticker)} · ${escHtml(type)}\n\n`;
+  msg += `<b>成交</b>\n`;
+  msg += `價格 <code>${fmtPrice(price)}</code>\n`;
   if (pnl !== null) {
-    msg += `┃  ${info.color} ${pnl >= 0 ? '獲利' : '虧損'}  │ ${pnlSign}${fmtPrice(pnl)} 點\n`;
+    msg += `${pnl >= 0 ? '獲利' : '虧損'} <code>${pnlSign}${fmtPrice(pnl)}</code> 點\n`;
   }
-  if (note) msg += `┃  📝 ${note}\n`;
-  msg += `┃\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃  ⏰ ${fmtTime()}\n`;
-  msg += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛`;
+  if (note) msg += `\n<b>備註</b>\n${escHtml(note)}\n`;
+  msg += `\n${fmtTime()}`;
   
   return msg;
 }
 
 function formatUpdateCard(message) {
-  let msg = `┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n`;
-  msg += `┃  📝 <b>訊號更新</b>\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃\n`;
-  msg += `┃  ${message}\n`;
-  msg += `┃\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃  ⏰ ${fmtTime()}\n`;
-  msg += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛`;
-  return msg;
+  return `📝 <b>訊號更新</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
 }
 
 function formatAlertCard(message) {
-  let msg = `┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n`;
-  msg += `┃  ⚠️ <b>交易警報</b>\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃\n`;
-  msg += `┃  ${message}\n`;
-  msg += `┃\n`;
-  msg += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
-  msg += `┃  ⏰ ${fmtTime()}\n`;
-  msg += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛`;
-  return msg;
+  return `⚠️ <b>交易警報</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
 }
 
 function formatDailyReport(stats) {
-  let msg = `╔═══════════════════════════╗\n`;
-  msg += `║  📊 <b>每日績效報告</b>\n`;
-  msg += `║  ${new Date().toLocaleDateString('zh-TW')}\n`;
-  msg += `╠═══════════════════════════╣\n`;
-  msg += `║\n`;
-  msg += `║  📈 今日戰績\n`;
-  msg += `║  ─────────────────────\n`;
-  msg += `║  總交易  │ ${stats.total || 0} 筆\n`;
-  msg += `║  獲利    │ ${stats.wins || 0} 筆  ✅\n`;
-  msg += `║  虧損    │ ${stats.losses || 0} 筆  ❌\n`;
+  let msg = `📊 <b>每日績效報告</b>\n`;
+  msg += `${new Date().toLocaleDateString('zh-TW')}\n\n`;
+  msg += `<b>今日戰績</b>\n`;
+  msg += `總交易 ${stats.total || 0} 筆\n`;
+  msg += `獲利 ${stats.wins || 0} 筆 · 虧損 ${stats.losses || 0} 筆\n`;
   const winRate = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(1) : 0;
-  msg += `║  勝率    │ ${winRate}%  ${winRate >= 60 ? '🔥' : ''}\n`;
-  msg += `║\n`;
-  msg += `╠═══════════════════════════╣\n`;
-  msg += `║\n`;
-  msg += `║  💰 盈虧統計\n`;
-  msg += `║  ─────────────────────\n`;
-  msg += `║  淨盈虧  │ ${stats.pnl >= 0 ? '+' : ''}${fmtPrice(stats.pnl || 0)} 點\n`;
-  msg += `║\n`;
-  msg += `╚═══════════════════════════╝`;
+  msg += `勝率 <code>${winRate}%</code>\n\n`;
+  msg += `<b>盈虧統計</b>\n`;
+  msg += `淨盈虧 <code>${stats.pnl >= 0 ? '+' : ''}${fmtPrice(stats.pnl || 0)}</code> 點`;
   return msg;
 }
 
