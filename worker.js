@@ -154,7 +154,7 @@ async function getUserSettings(db, id) {
       user_id: String(id),
       capital: 10000,
       risk_percent: 1.0,
-      subscribed_symbols: '["NQ","ES","GC"]',
+      subscribed_symbols: '["NQ","ES","GC","USTEC"]',
       signal_types: '["scalp","swing"]',
       notify_entry: 1,
       notify_tp: 1,
@@ -2769,9 +2769,9 @@ async function ensureAdminSchema(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}')
+    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}')
   `).run();
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS tradingview_sources (
@@ -2814,7 +2814,7 @@ async function ensureAdminSchema(db) {
     await db.prepare(`
       INSERT INTO tradingview_sources (source_id, name, webhook_secret, default_strategy_id, allowed_symbols, default_signal_type, target_group, auto_send, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
+    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
   }
 }
 
@@ -3112,8 +3112,23 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
 
 function normalizeTvTicker(value) {
   const raw = String(value || '').trim().toUpperCase().split(':').pop().replace(/[^A-Z0-9]/g, '');
-  const roots = ['RTY', 'NQ', 'ES', 'YM', 'GC', 'SI', 'CL', 'NG', '6E', '6J'];
-  return roots.find((root) => raw.startsWith(root)) || raw;
+  const aliases = [
+    ['USTEC', 'USTEC'],
+    ['US100', 'USTEC'],
+    ['NAS100', 'USTEC'],
+    ['RTY', 'RTY'],
+    ['NQ', 'NQ'],
+    ['ES', 'ES'],
+    ['YM', 'YM'],
+    ['GC', 'GC'],
+    ['SI', 'SI'],
+    ['CL', 'CL'],
+    ['NG', 'NG'],
+    ['6E', '6E'],
+    ['6J', '6J']
+  ];
+  const match = aliases.find(([prefix]) => raw.startsWith(prefix));
+  return match ? match[1] : raw;
 }
 
 function firstTvValue(...values) {
