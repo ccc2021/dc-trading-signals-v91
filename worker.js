@@ -3173,6 +3173,21 @@ function tvChartUrl(payload, ticker) {
   return symbol ? `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}` : '';
 }
 
+const TRADINGVIEW_WEBHOOK_IPS = new Set([
+  '52.89.214.238',
+  '34.212.75.30',
+  '54.218.53.128',
+  '52.32.178.7'
+]);
+
+function getRequestClientIps(request) {
+  return [String(request.headers.get('cf-connecting-ip') || '').trim()].filter(Boolean);
+}
+
+function isTrustedTradingViewWebhook(request) {
+  return getRequestClientIps(request).some((ip) => TRADINGVIEW_WEBHOOK_IPS.has(ip));
+}
+
 function inferTvEventKind(payload) {
   const text = [payload.event, payload.event_type, payload.type, tvOrderId(payload), tvOrderComment(payload), payload.market_position, payload.marketPosition]
     .map((value) => String(value || '').toLowerCase())
@@ -3475,7 +3490,11 @@ async function handleTradingViewWebhook(request, env, sourceId, url) {
     payload = { message: rawText };
   }
   const providedSecret = String(payload.secret || request.headers.get('X-TradingView-Secret') || url.searchParams.get('secret') || '');
-  if (providedSecret !== source.webhook_secret) {
+  if (providedSecret) {
+    if (providedSecret !== source.webhook_secret) {
+      return json({ ok: false, error: 'Invalid TradingView secret' }, 401);
+    }
+  } else if (!isTrustedTradingViewWebhook(request)) {
     return json({ ok: false, error: 'Invalid TradingView secret' }, 401);
   }
 
