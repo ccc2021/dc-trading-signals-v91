@@ -194,7 +194,68 @@ CREATE TABLE symbols (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 7. 自訂群組表 (groups)
+-- 7. 策略表 (strategies)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS strategies;
+CREATE TABLE strategies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_id TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  signal_types TEXT DEFAULT '["scalp"]',
+  symbols TEXT DEFAULT '[]',
+  tier TEXT DEFAULT 'pro' CHECK(tier IN ('free', 'pro', 'vip')),
+  is_active INTEGER DEFAULT 1,
+  sort_order INTEGER DEFAULT 0,
+  rules_json TEXT DEFAULT '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close"}',
+  tv_alert_template TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 7A. TradingView 來源綁定 (tradingview_sources)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS tradingview_sources;
+CREATE TABLE tradingview_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  webhook_secret TEXT NOT NULL,
+  default_strategy_id TEXT,
+  allowed_symbols TEXT DEFAULT '[]',
+  default_signal_type TEXT DEFAULT 'auto',
+  target_group TEXT DEFAULT 'pro',
+  auto_send INTEGER DEFAULT 0,
+  is_active INTEGER DEFAULT 1,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (default_strategy_id) REFERENCES strategies(strategy_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 7B. TradingView Alert 日誌 (tv_alert_logs)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS tv_alert_logs;
+CREATE TABLE tv_alert_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  alert_uid TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  strategy_id TEXT,
+  ticker TEXT,
+  action TEXT,
+  payload TEXT,
+  signal_uid TEXT,
+  status TEXT DEFAULT 'received',
+  error TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(source_id, alert_uid)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 8. 自訂群組表 (groups)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS groups;
 CREATE TABLE groups (
@@ -206,7 +267,7 @@ CREATE TABLE groups (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 8. 群組成員表 (group_members)
+-- 9. 群組成員表 (group_members)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS group_members;
 CREATE TABLE group_members (
@@ -220,7 +281,7 @@ CREATE TABLE group_members (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 9. 訂單表 (orders)
+-- 10. 訂單表 (orders)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS orders;
 CREATE TABLE orders (
@@ -241,7 +302,7 @@ CREATE TABLE orders (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 10. 積分歷史 (point_history)
+-- 11. 積分歷史 (point_history)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS point_history;
 CREATE TABLE point_history (
@@ -254,7 +315,7 @@ CREATE TABLE point_history (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 11. 管理日誌 (admin_logs)
+-- 12. 管理日誌 (admin_logs)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS admin_logs;
 CREATE TABLE admin_logs (
@@ -267,7 +328,7 @@ CREATE TABLE admin_logs (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 12. 系統設定 (system_config)
+-- 13. 系統設定 (system_config)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS system_config;
 CREATE TABLE system_config (
@@ -278,7 +339,7 @@ CREATE TABLE system_config (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 13. 廣播記錄 (broadcasts)
+-- 14. 廣播記錄 (broadcasts)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS broadcasts;
 CREATE TABLE broadcasts (
@@ -291,7 +352,7 @@ CREATE TABLE broadcasts (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 14. 安靜時段待發訊號 (queued_signals) ★新增
+-- 15. 安靜時段待發訊號 (queued_signals) ★新增
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS queued_signals;
 CREATE TABLE queued_signals (
@@ -327,6 +388,13 @@ CREATE INDEX idx_perf_ticker ON performance(ticker);
 CREATE INDEX idx_perf_result ON performance(result);
 CREATE INDEX idx_perf_created ON performance(created_at);
 
+CREATE INDEX idx_strategies_active ON strategies(is_active);
+CREATE INDEX idx_strategies_tier ON strategies(tier);
+
+CREATE INDEX idx_tv_sources_active ON tradingview_sources(is_active);
+CREATE INDEX idx_tv_logs_source ON tv_alert_logs(source_id);
+CREATE INDEX idx_tv_logs_created ON tv_alert_logs(created_at);
+
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
 
@@ -355,6 +423,12 @@ INSERT INTO groups (group_name, description) VALUES
 ('test', '測試用戶組'),
 ('beta', 'Beta測試組'),
 ('vvip', '超級VIP');
+
+-- 預設策略
+INSERT INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
+('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}');
 
 -- 系統設定
 INSERT INTO system_config (key, value) VALUES

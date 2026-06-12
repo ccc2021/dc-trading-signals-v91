@@ -14,6 +14,8 @@
 - **🌙 安靜時段** - 設定不接收通知的時間
 - **📊 個人績效** - 追蹤自己的執行績效
 - **📝 執行記錄** - 記錄已執行/跳過的訊號
+- **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
+- **🔗 TradingView 綁定** - 多來源 webhook、策略自動選擇與點位推算
 
 ## 💎 會員等級
 
@@ -74,6 +76,47 @@
 /announce 重要公告
 ```
 
+### 線上後台
+
+後台入口：
+
+```text
+https://your-worker.workers.dev/admin
+```
+
+後台使用 Basic Auth，部署前需設定：
+
+```bash
+wrangler secret put ADMIN_WEB_PASSWORD
+```
+
+預設帳號由 `wrangler.toml` 的 `ADMIN_WEB_USER` 設定，預設為 `admin`。
+
+### TradingView Alert
+
+每個來源都有自己的 webhook URL：
+
+```text
+https://your-worker.workers.dev/tv/default-tv
+```
+
+TradingView Alert Message 範例：
+
+```json
+{
+  "secret": "來源 secret",
+  "strategy": "auto",
+  "ticker": "{{ticker}}",
+  "action": "{{strategy.order.action}}",
+  "price": "{{close}}",
+  "time": "{{time}}",
+  "interval": "{{interval}}",
+  "alert_id": "{{ticker}}-{{time}}-auto"
+}
+```
+
+Worker 會依來源、品種、週期與策略規則推算 entry、stop loss、TP1/TP2/TP3。來源可設定為自動發送或先存草稿。
+
 ## 🛠️ 部署
 
 ### 1. 建立 D1 資料庫
@@ -86,9 +129,10 @@ wrangler d1 create dc-signals-v91-db
 wrangler d1 execute dc-signals-v91-db --remote --file=schema.sql
 ```
 
-### 3. 設定 Bot Token
+### 3. 設定 Bot Token 與後台密碼
 ```bash
 wrangler secret put BOT_TOKEN
+wrangler secret put ADMIN_WEB_PASSWORD
 ```
 
 `ADMIN_IDS` 與 `BOT_USERNAME` 由 `wrangler.toml` 的 `[vars]` 設定。
@@ -103,7 +147,7 @@ wrangler deploy
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.workers.dev/webhook"
 ```
 
-## 🗄️ 資料庫 (14表)
+## 🗄️ 主要資料表
 
 | 表名 | 用途 |
 |------|------|
@@ -112,6 +156,9 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `user_executions` | 執行記錄 |
 | `symbols` | 品種資訊 |
 | `signals` | 訊號記錄 |
+| `strategies` | 策略與風控規則 |
+| `tradingview_sources` | TradingView webhook 來源 |
+| `tv_alert_logs` | TradingView alert 接收日誌 |
 | `performance` | 績效統計 |
 | `orders` | 訂單記錄 |
 | `queued_signals` | 待發訊號 |

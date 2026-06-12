@@ -228,8 +228,9 @@ Published dc-signals-v91 (0.45 sec)
 1. 執行：
    ```bash
    wrangler secret put BOT_TOKEN
+   wrangler secret put ADMIN_WEB_PASSWORD
    ```
-2. 貼上 BotFather 給你的 Token
+2. 先貼上 BotFather 給你的 Token，再設定後台登入密碼
 3. 重新部署：
    ```bash
    wrangler deploy
@@ -273,7 +274,48 @@ https://api.telegram.org/bot1234567890:ABCDefGHI/setWebhook?url=https://dc-signa
 ```
 應該會看到管理儀表板。
 
-### 步驟 7.3：測試發訊號
+### 步驟 7.3：測試線上後台
+
+開啟：
+```
+https://你的Worker網址/admin
+```
+
+登入帳號預設為 `admin`，密碼是 `ADMIN_WEB_PASSWORD`。
+
+後台可維護：
+- 訊號與結案
+- 策略與風控規則
+- TradingView webhook 來源
+- 會員等級與到期日
+- 訂單確認與收費設定
+
+### 步驟 7.4：綁定 TradingView
+
+後台會自動建立 `default-tv` 來源。進入 TradingView 分頁後複製：
+
+```text
+Webhook URL: https://你的Worker網址/tv/default-tv
+```
+
+Alert Message 範例：
+
+```json
+{
+  "secret": "來源 secret",
+  "strategy": "auto",
+  "ticker": "{{ticker}}",
+  "action": "{{strategy.order.action}}",
+  "price": "{{close}}",
+  "time": "{{time}}",
+  "interval": "{{interval}}",
+  "alert_id": "{{ticker}}-{{time}}-auto"
+}
+```
+
+如果 TradingView alert 不是 strategy alert，請在後台產生器把方向改成 `LONG` 或 `SHORT`，避免 `{{strategy.order.action}}` 沒有值。
+
+### 步驟 7.5：測試發訊號
 
 發送：
 ```

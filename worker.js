@@ -637,7 +637,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/subscribe' || cmd === '/symbols') {
     if (user.tier === 'free') {
-      return sendTg(cid, `❌ 此功能需要訂閱會員\n\n使用 /plans 查看方案`);
+      return handleUserCommand(cid, uid, '/plans', [], env);
     }
     
     const symbols = await getSymbols(db);
@@ -1277,7 +1277,7 @@ async function handleUserCallback(cid, uid, msgId, data, env) {
   // 訂閱設定
   if (data === 'u_subscribe') {
     if (user.tier === 'free') {
-      return answerCb(null, '此功能需要訂閱會員', true);
+      return handleUserCommand(cid, uid, '/plans', [], env);
     }
     
     const symbols = await getSymbols(db);
@@ -2638,6 +2638,1347 @@ async function handleAdminCallback(cid, uid, msgId, data, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Web Admin
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const ADMIN_CONFIG_KEYS = [
+  'pro_price_1m', 'pro_price_3m', 'pro_price_12m',
+  'vip_price_1m', 'vip_price_3m', 'vip_price_12m',
+  'trial_days', 'trial_tier', 'signals_paused',
+  'contact_telegram', 'contact_line',
+  'payment_bank', 'payment_account', 'payment_name',
+  'welcome_message'
+];
+
+const adminHtmlResponse = (body, status = 200, headers = {}) => new Response(body, {
+  status,
+  headers: { 'Content-Type': 'text/html; charset=utf-8', ...headers }
+});
+
+function unauthorizedAdminResponse(message = '需要後台登入') {
+  return adminHtmlResponse(message, 401, {
+    'WWW-Authenticate': 'Basic realm="DC Signals Admin", charset="UTF-8"',
+    'Cache-Control': 'no-store'
+  });
+}
+
+function isAdminHttpRequest(request, env) {
+  const password = env.ADMIN_WEB_PASSWORD;
+  if (!password) return false;
+
+  const header = request.headers.get('Authorization') || '';
+  if (!header.startsWith('Basic ')) return false;
+
+  try {
+    const decoded = atob(header.slice(6));
+    const separator = decoded.indexOf(':');
+    if (separator === -1) return false;
+
+    const username = decoded.slice(0, separator);
+    const provided = decoded.slice(separator + 1);
+    const expectedUser = env.ADMIN_WEB_USER || 'admin';
+    return username === expectedUser && provided === password;
+  } catch {
+    return false;
+  }
+}
+
+function requireAdminHttp(request, env, wantsJson = false) {
+  if (!env.ADMIN_WEB_PASSWORD) {
+    return json({ ok: false, error: 'ADMIN_WEB_PASSWORD secret is not configured' }, 503);
+  }
+  if (!isAdminHttpRequest(request, env)) {
+    if (wantsJson) return json({ ok: false, error: 'Unauthorized' }, 401);
+    return unauthorizedAdminResponse();
+  }
+  return null;
+}
+
+async function readJsonBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    return {};
+  }
+}
+
+function cleanListValue(value) {
+  if (Array.isArray(value)) {
+    return JSON.stringify(value.map(String).map((v) => v.trim()).filter(Boolean));
+  }
+  if (!value) return '[]';
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return JSON.stringify(parsed.map(String).map((v) => v.trim()).filter(Boolean));
+  } catch {}
+  return JSON.stringify(String(value).split(',').map((v) => v.trim()).filter(Boolean));
+}
+
+function asNumber(value, fallback = null) {
+  if (value === '' || value === null || value === undefined) return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function slugify(value, fallback = 'strategy') {
+  const slug = String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug || `${fallback}-${Date.now().toString(36)}`;
+}
+
+async function addColumnIfMissing(db, table, column, definition) {
+  const tableExists = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").bind(table).first();
+  if (!tableExists) return;
+  const info = await db.prepare(`PRAGMA table_info(${table})`).all();
+  const exists = (info.results || []).some((row) => row.name === column);
+  if (!exists) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+}
+
+async function ensureAdminSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS strategies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      strategy_id TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      signal_types TEXT DEFAULT '["scalp"]',
+      symbols TEXT DEFAULT '[]',
+      tier TEXT DEFAULT 'pro' CHECK(tier IN ('free', 'pro', 'vip')),
+      is_active INTEGER DEFAULT 1,
+      sort_order INTEGER DEFAULT 0,
+      rules_json TEXT DEFAULT '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close"}',
+      tv_alert_template TEXT,
+      note TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await addColumnIfMissing(db, 'strategies', 'rules_json', `TEXT DEFAULT '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close"}'`);
+  await addColumnIfMissing(db, 'strategies', 'tv_alert_template', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'source', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'strategy_id', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'tv_alert_uid', 'TEXT');
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_active ON strategies(is_active)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
+  await db.prepare(`
+    INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
+    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"secret":"{{secret}}","strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"secret":"{{secret}}","strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}')
+  `).run();
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS tradingview_sources (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      webhook_secret TEXT NOT NULL,
+      default_strategy_id TEXT,
+      allowed_symbols TEXT DEFAULT '[]',
+      default_signal_type TEXT DEFAULT 'auto',
+      target_group TEXT DEFAULT 'pro',
+      auto_send INTEGER DEFAULT 0,
+      is_active INTEGER DEFAULT 1,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS tv_alert_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_uid TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      strategy_id TEXT,
+      ticker TEXT,
+      action TEXT,
+      payload TEXT,
+      signal_uid TEXT,
+      status TEXT DEFAULT 'received',
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(source_id, alert_uid)
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_tv_sources_active ON tradingview_sources(is_active)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_tv_logs_source ON tv_alert_logs(source_id)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_tv_logs_created ON tv_alert_logs(created_at)').run();
+  const sourceCount = await db.prepare('SELECT COUNT(*) as c FROM tradingview_sources').first();
+  if (!sourceCount?.c) {
+    await db.prepare(`
+      INSERT INTO tradingview_sources (source_id, name, webhook_secret, default_strategy_id, allowed_symbols, default_signal_type, target_group, auto_send, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
+  }
+}
+
+async function getAdminBootstrap(db) {
+  await ensureAdminSchema(db);
+
+  const [
+    totalUsers, proUsers, vipUsers, todaySignals, activeSignals, pendingOrders,
+    todayPerf, configRows, symbols, strategies, signals, orders, users, tvSources, tvLogs
+  ] = await Promise.all([
+    db.prepare('SELECT COUNT(*) as c FROM users').first(),
+    db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro' AND is_active = 1").first(),
+    db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'vip' AND is_active = 1").first(),
+    db.prepare("SELECT COUNT(*) as c FROM signals WHERE DATE(created_at) = DATE('now')").first(),
+    db.prepare("SELECT COUNT(*) as c FROM signals WHERE status = 'active'").first(),
+    db.prepare("SELECT COUNT(*) as c FROM orders WHERE status IN ('pending', 'paid')").first(),
+    db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
+             SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
+             SUM(pnl_points) as pnl
+      FROM performance
+      WHERE DATE(created_at) = DATE('now')
+    `).first(),
+    db.prepare(`SELECT key, value FROM system_config WHERE key IN (${ADMIN_CONFIG_KEYS.map(() => '?').join(',')}) ORDER BY key`).bind(...ADMIN_CONFIG_KEYS).all(),
+    db.prepare('SELECT * FROM symbols ORDER BY sort_order, symbol').all(),
+    db.prepare('SELECT * FROM strategies ORDER BY sort_order, strategy_id').all(),
+    db.prepare('SELECT * FROM signals ORDER BY created_at DESC LIMIT 30').all(),
+    db.prepare(`
+      SELECT o.*, u.username, u.first_name FROM orders o
+      LEFT JOIN users u ON o.user_id = u.user_id
+      ORDER BY o.created_at DESC LIMIT 30
+    `).all(),
+    db.prepare(`
+      SELECT user_id, username, first_name, tier, tier_expires_at, points, total_spent,
+             is_active, is_banned, last_active_at, admin_note, created_at
+      FROM users ORDER BY created_at DESC LIMIT 50
+    `).all(),
+    db.prepare('SELECT * FROM tradingview_sources ORDER BY created_at DESC').all(),
+    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 30').all()
+  ]);
+
+  const config = {};
+  for (const row of configRows.results || []) config[row.key] = row.value;
+  const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
+
+  return {
+    stats: {
+      totalUsers: totalUsers?.c || 0,
+      proUsers: proUsers?.c || 0,
+      vipUsers: vipUsers?.c || 0,
+      todaySignals: todaySignals?.c || 0,
+      activeSignals: activeSignals?.c || 0,
+      pendingOrders: pendingOrders?.c || 0,
+      todayWins: todayPerf?.wins || 0,
+      todayLosses: todayPerf?.losses || 0,
+      todayPnl: todayPerf?.pnl || 0,
+      winRate,
+      paused: config.signals_paused === '1'
+    },
+    config,
+    symbols: symbols.results || [],
+    strategies: strategies.results || [],
+    signals: signals.results || [],
+    orders: orders.results || [],
+    users: users.results || [],
+    tvSources: tvSources.results || [],
+    tvLogs: tvLogs.results || [],
+    serverTime: fmtTime()
+  };
+}
+
+async function createAdminSignal(db, adminId, payload) {
+  const ticker = String(payload.ticker || '').trim().toUpperCase();
+  const action = String(payload.action || '').toUpperCase();
+  const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
+  const entry = asNumber(payload.entry_price ?? payload.entry);
+  const stopLoss = asNumber(payload.stop_loss ?? payload.stop);
+  const tp1 = asNumber(payload.tp1);
+  const tp2 = asNumber(payload.tp2);
+  const tp3 = asNumber(payload.tp3);
+
+  if (!ticker) throw new Error('請輸入品種');
+  if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
+  if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
+  if (entry === null || stopLoss === null || tp1 === null) throw new Error('進場、止損、TP1 為必填數字');
+
+  const sendNow = payload.send !== false;
+  const targetGroup = String(payload.target_group || payload.targetGroup || (payload.is_vip_only ? 'vip' : 'all')).trim().toLowerCase() || 'all';
+  const isVipOnly = payload.is_vip_only === true || payload.isVipOnly === true || targetGroup === 'vip';
+  const paused = await getConfig(db, 'signals_paused');
+  if (sendNow && paused === '1') throw new Error('訊號目前已暫停，請先恢復或儲存草稿');
+
+  const signalUid = genUID();
+  await db.prepare(`
+    INSERT INTO signals (
+      signal_uid, ticker, action, signal_type, entry_price, stop_loss,
+      tp1, tp2, tp3, note, target_group, is_vip_only, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(
+    signalUid, ticker, action, signalType, entry, stopLoss,
+    tp1, tp2, tp3, payload.note || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
+  ).run();
+
+  const signal = {
+    signal_uid: signalUid,
+    ticker,
+    action,
+    signal_type: signalType,
+    entry_price: entry,
+    stop_loss: stopLoss,
+    tp1,
+    tp2,
+    tp3,
+    note: payload.note || '',
+    target_group: targetGroup,
+    is_vip_only: isVipOnly ? 1 : 0
+  };
+
+  let delivery = { sent: 0, queued: 0, skipped: 0, total: 0 };
+  if (sendNow) {
+    delivery = await broadcastSignal(db, signal);
+    await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, signalUid).run();
+  }
+  await logAction(db, adminId, sendNow ? 'web_signal_send' : 'web_signal_draft', signalUid, `${action} ${ticker} @${targetGroup}`);
+  return { signalUid, delivery };
+}
+
+async function closeAdminSignal(db, adminId, signalUid, payload) {
+  const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
+  if (!signal) throw new Error('找不到訊號');
+
+  const price = asNumber(payload.price);
+  if (price === null) throw new Error('請輸入結案價格');
+
+  const type = String(payload.type || 'CLOSE').toUpperCase();
+  const reason = String(payload.reason || (type === 'SL' ? '止損觸發' : '手動平倉')).trim();
+  const pnl = signal.action === 'LONG' ? price - signal.entry_price : signal.entry_price - price;
+  const result = type === 'SL' ? 'loss' : pnl > 0.5 ? 'win' : pnl < -0.5 ? 'loss' : 'breakeven';
+
+  await db.prepare(`
+    UPDATE signals
+    SET status = 'closed', exit_price = ?, pnl_points = ?, result = ?, exit_reason = ?, closed_at = datetime('now')
+    WHERE signal_uid = ?
+  `).bind(price, pnl, result, reason || type, signalUid).run();
+
+  await db.prepare(`
+    INSERT INTO performance (signal_uid, ticker, direction, signal_type, entry_price, exit_price, pnl_points, result, exit_reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(signal.signal_uid, signal.ticker, signal.action, signal.signal_type, signal.entry_price, price, pnl, result, type).run();
+
+  let delivery = { sent: 0 };
+  if (payload.notify !== false) {
+    delivery = await broadcastExit(db, type, signal.ticker, price, pnl, reason, signalUid);
+  }
+  await logAction(db, adminId, 'web_signal_close', signalUid, `${type} ${price}`);
+  return { signalUid, pnl, result, delivery };
+}
+
+async function upsertAdminSymbol(db, payload) {
+  const symbol = String(payload.symbol || '').trim().toUpperCase();
+  if (!symbol) throw new Error('請輸入品種代碼');
+  const name = String(payload.name || symbol).trim();
+  const nameZh = String(payload.name_zh || payload.nameZh || '').trim() || null;
+  const category = String(payload.category || 'index').trim();
+  const tickSize = asNumber(payload.tick_size ?? payload.tickSize, 0.25);
+  const tickValue = asNumber(payload.tick_value ?? payload.tickValue, 5);
+  const isActive = payload.is_active === false || payload.isActive === false ? 0 : 1;
+  const sortOrder = asNumber(payload.sort_order ?? payload.sortOrder, 0);
+
+  await db.prepare(`
+    INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(symbol) DO UPDATE SET
+      name = excluded.name,
+      name_zh = excluded.name_zh,
+      category = excluded.category,
+      tick_size = excluded.tick_size,
+      tick_value = excluded.tick_value,
+      is_active = excluded.is_active,
+      sort_order = excluded.sort_order
+  `).bind(symbol, name, nameZh, category, tickSize, tickValue, isActive, sortOrder).run();
+  return { symbol };
+}
+
+async function upsertAdminStrategy(db, payload) {
+  await ensureAdminSchema(db);
+  const name = String(payload.name || '').trim();
+  if (!name) throw new Error('請輸入策略名稱');
+  const strategyId = slugify(payload.strategy_id || payload.strategyId || name, 'strategy');
+  const description = String(payload.description || '').trim();
+  const tier = ['free', 'pro', 'vip'].includes(payload.tier) ? payload.tier : 'pro';
+  const isActive = payload.is_active === false || payload.isActive === false ? 0 : 1;
+  const sortOrder = asNumber(payload.sort_order ?? payload.sortOrder, 0);
+  const signalTypes = cleanListValue(payload.signal_types ?? payload.signalTypes);
+  const symbols = cleanListValue(payload.symbols);
+  const rawRules = payload.rules_json ?? payload.rulesJson;
+  const rules = rawRules === undefined || rawRules === ''
+    ? { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' }
+    : parseObject(rawRules, null);
+  if (!rules) throw new Error('風控規則 JSON 格式不正確');
+  const rulesJson = JSON.stringify(rules);
+  const tvAlertTemplate = String(payload.tv_alert_template || payload.tvAlertTemplate || '').trim();
+  const note = String(payload.note || '').trim();
+
+  await db.prepare(`
+    INSERT INTO strategies (strategy_id, name, description, signal_types, symbols, tier, is_active, sort_order, rules_json, tv_alert_template, note, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT(strategy_id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      signal_types = excluded.signal_types,
+      symbols = excluded.symbols,
+      tier = excluded.tier,
+      is_active = excluded.is_active,
+      sort_order = excluded.sort_order,
+      rules_json = excluded.rules_json,
+      tv_alert_template = excluded.tv_alert_template,
+      note = excluded.note,
+      updated_at = datetime('now')
+  `).bind(strategyId, name, description, signalTypes, symbols, tier, isActive, sortOrder, rulesJson, tvAlertTemplate || null, note).run();
+  return { strategyId };
+}
+
+async function updateAdminUser(db, adminId, userId, payload) {
+  const data = {};
+  if (payload.tier && ['free', 'pro', 'vip'].includes(payload.tier)) data.tier = payload.tier;
+  if (payload.days !== undefined) {
+    const days = asNumber(payload.days, 0);
+    if (days > 0) {
+      const user = await getUser(db, userId);
+      const base = user.tier_expires_at && new Date(user.tier_expires_at) > new Date()
+        ? new Date(user.tier_expires_at)
+        : new Date();
+      data.tier_expires_at = new Date(base.getTime() + days * 86400000).toISOString();
+    }
+  }
+  if (payload.is_banned !== undefined || payload.isBanned !== undefined) data.is_banned = payload.is_banned || payload.isBanned ? 1 : 0;
+  if (payload.admin_note !== undefined || payload.adminNote !== undefined) data.admin_note = String(payload.admin_note ?? payload.adminNote ?? '');
+  if (Object.keys(data).length === 0) throw new Error('沒有可更新的用戶欄位');
+  await updateUser(db, userId, data);
+  await logAction(db, adminId, 'web_user_update', userId, JSON.stringify(data));
+  return { userId };
+}
+
+async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}) {
+  const normalizedOrderId = String(orderId || '').toUpperCase();
+  const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(normalizedOrderId).first();
+  if (!order) throw new Error('找不到訂單');
+
+  if (action === 'confirm') {
+    if (order.status === 'confirmed') return { orderId: normalizedOrderId, status: 'confirmed' };
+    const expires = new Date(Date.now() + order.days * 86400000).toISOString();
+    const user = await getUser(db, order.user_id);
+    let newExpiry = expires;
+    if (user.tier === order.tier && user.tier_expires_at && new Date(user.tier_expires_at) > new Date()) {
+      newExpiry = new Date(new Date(user.tier_expires_at).getTime() + order.days * 86400000).toISOString();
+    }
+    await updateUser(db, order.user_id, { tier: order.tier, tier_expires_at: newExpiry, total_spent: (user.total_spent || 0) + order.amount });
+    await db.prepare("UPDATE orders SET status = 'confirmed', confirmed_by = ?, confirmed_at = datetime('now') WHERE order_id = ?").bind(adminId, normalizedOrderId).run();
+    if (payload.notify !== false) await sendTg(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${normalizedOrderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
+    await logAction(db, adminId, 'web_order_confirm', normalizedOrderId, `${order.tier} ${order.days}d`);
+    return { orderId: normalizedOrderId, status: 'confirmed' };
+  }
+
+  if (action === 'reject') {
+    const reason = String(payload.reason || '未說明');
+    await db.prepare("UPDATE orders SET status = 'rejected' WHERE order_id = ?").bind(normalizedOrderId).run();
+    if (payload.notify !== false) await sendTg(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
+    await logAction(db, adminId, 'web_order_reject', normalizedOrderId, reason);
+    return { orderId: normalizedOrderId, status: 'rejected' };
+  }
+
+  throw new Error('不支援的訂單操作');
+}
+
+function normalizeTvTicker(value) {
+  const raw = String(value || '').trim().toUpperCase().split(':').pop().replace(/[^A-Z0-9]/g, '');
+  const roots = ['RTY', 'NQ', 'ES', 'YM', 'GC', 'SI', 'CL', 'NG', '6E', '6J'];
+  return roots.find((root) => raw.startsWith(root)) || raw;
+}
+
+function normalizeTvAction(payload) {
+  const raw = String(payload.action || payload.side || payload.direction || payload.signal || '').trim().toLowerCase();
+  if (['long', 'buy', 'bull', 'up', '1'].includes(raw) || raw.includes('long') || raw.includes('buy')) return 'LONG';
+  if (['short', 'sell', 'bear', 'down', '-1'].includes(raw) || raw.includes('short') || raw.includes('sell')) return 'SHORT';
+  return null;
+}
+
+function inferTvSignalType(payload, source = null) {
+  const direct = String(payload.signal_type || payload.signalType || payload.type || '').toLowerCase();
+  if (CONFIG.SIGNAL_TYPES[direct]) return direct;
+  if (source?.default_signal_type && CONFIG.SIGNAL_TYPES[source.default_signal_type]) return source.default_signal_type;
+  const interval = String(payload.interval || payload.timeframe || payload.tf || '').toUpperCase();
+  if (['D', '1D', 'W', '1W'].includes(interval)) return 'swing';
+  const minutes = Number(interval.replace(/[^0-9.]/g, ''));
+  if (Number.isFinite(minutes) && minutes >= 240) return 'swing';
+  if (Number.isFinite(minutes) && minutes >= 30) return 'daytrade';
+  return 'scalp';
+}
+
+function parseList(value) {
+  if (Array.isArray(value)) return value.map(String).map((v) => v.trim()).filter(Boolean);
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed.map(String).map((v) => v.trim()).filter(Boolean);
+  } catch {}
+  return String(value).split(',').map((v) => v.trim()).filter(Boolean);
+}
+
+function parseObject(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function roundToTick(value, tickSize = 0.25) {
+  const tick = Number(tickSize) || 0.25;
+  const decimals = String(tick).split('.')[1]?.length || 0;
+  return Number((Math.round(Number(value) / tick) * tick).toFixed(Math.min(decimals + 2, 8)));
+}
+
+async function getTradingViewSource(db, sourceId) {
+  await ensureAdminSchema(db);
+  return db.prepare('SELECT * FROM tradingview_sources WHERE source_id = ?').bind(sourceId).first();
+}
+
+async function selectTvStrategy(db, source, payload, ticker, signalType) {
+  await ensureAdminSchema(db);
+  const requested = String(payload.strategy || payload.strategy_id || payload.strategyId || '').trim();
+  if (requested && requested.toLowerCase() !== 'auto') {
+    const exact = await db.prepare('SELECT * FROM strategies WHERE strategy_id = ? AND is_active = 1').bind(slugify(requested, 'strategy')).first();
+    if (exact) return exact;
+  }
+
+  const rows = await db.prepare('SELECT * FROM strategies WHERE is_active = 1 ORDER BY sort_order, strategy_id').all();
+  const strategies = rows.results || [];
+  if (!strategies.length) throw new Error('尚未建立策略');
+
+  const scored = strategies.map((strategy) => {
+    const symbols = parseList(strategy.symbols).map((s) => s.toUpperCase());
+    const types = parseList(strategy.signal_types);
+    let score = 0;
+    if (!symbols.length || symbols.includes(ticker)) score += 50;
+    if (!types.length || types.includes(signalType)) score += 30;
+    if (source?.default_strategy_id === strategy.strategy_id) score += 20;
+    if (strategy.tier === source?.target_group) score += 5;
+    score -= Number(strategy.sort_order || 0) / 100;
+    return { strategy, score };
+  }).sort((a, b) => b.score - a.score);
+
+  return scored[0].strategy;
+}
+
+async function buildTvSignalDraft(db, source, payload) {
+  const ticker = normalizeTvTicker(payload.ticker || payload.symbol || payload.syminfo || payload.source);
+  const action = normalizeTvAction(payload);
+  const entryRaw = asNumber(payload.entry_price ?? payload.entry ?? payload.price ?? payload.close ?? payload.last);
+  if (!ticker) throw new Error('TradingView alert 缺少 ticker');
+  if (!action) throw new Error('TradingView alert 缺少 action，請傳 LONG/SHORT 或 buy/sell');
+  if (entryRaw === null) throw new Error('TradingView alert 缺少 price/close');
+
+  const allowed = parseList(source.allowed_symbols).map((s) => s.toUpperCase());
+  if (allowed.length && !allowed.includes(ticker)) throw new Error(`${ticker} 不在此來源允許品種內`);
+
+  const symbol = await db.prepare('SELECT * FROM symbols WHERE symbol = ?').bind(ticker).first();
+  const signalType = inferTvSignalType(payload, source);
+  const strategy = await selectTvStrategy(db, source, payload, ticker, signalType);
+  const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' });
+  const tickSize = Number(symbol?.tick_size || 0.25);
+  const entry = roundToTick(entryRaw, tickSize);
+  const explicitStop = asNumber(payload.stop_loss ?? payload.stopLoss ?? payload.stop);
+  const riskPoints = explicitStop !== null
+    ? Math.abs(entry - explicitStop)
+    : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
+  if (!Number.isFinite(riskPoints) || riskPoints <= 0) throw new Error('策略風控 riskPoints 不正確');
+
+  const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
+  const signed = action === 'LONG' ? 1 : -1;
+  const stopLoss = explicitStop !== null ? roundToTick(explicitStop, tickSize) : roundToTick(entry - signed * riskPoints, tickSize);
+  const targets = targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
+  const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
+  const noteParts = [
+    `TradingView: ${source.name}`,
+    `策略: ${strategy.name}`,
+    payload.interval ? `週期: ${payload.interval}` : '',
+    payload.time ? `時間: ${payload.time}` : ''
+  ].filter(Boolean);
+
+  return {
+    signal_uid: genUID(),
+    ticker,
+    action,
+    signal_type: signalType,
+    entry_price: entry,
+    stop_loss: stopLoss,
+    tp1: targets[0] || null,
+    tp2: targets[1] || null,
+    tp3: targets[2] || null,
+    note: noteParts.join(' / '),
+    target_group: targetGroup,
+    is_vip_only: targetGroup === 'vip' ? 1 : 0,
+    strategy_id: strategy.strategy_id,
+    source: source.source_id,
+    strategy,
+    rules
+  };
+}
+
+async function createSignalFromTvDraft(db, draft, alertUid, autoSend) {
+  const paused = await getConfig(db, 'signals_paused');
+  const shouldSend = Boolean(autoSend) && paused !== '1';
+  await db.prepare(`
+    INSERT INTO signals (
+      signal_uid, ticker, action, signal_type, entry_price, stop_loss,
+      tp1, tp2, tp3, note, target_group, is_vip_only, status,
+      source, strategy_id, tv_alert_uid, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(
+    draft.signal_uid, draft.ticker, draft.action, draft.signal_type, draft.entry_price, draft.stop_loss,
+    draft.tp1, draft.tp2, draft.tp3, draft.note, draft.target_group, draft.is_vip_only,
+    shouldSend ? 'active' : 'pending', draft.source, draft.strategy_id, alertUid
+  ).run();
+
+  let delivery = { sent: 0, queued: 0, skipped: 0, total: 0 };
+  if (shouldSend) {
+    delivery = await broadcastSignal(db, draft);
+    await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, draft.signal_uid).run();
+  }
+  return { signalUid: draft.signal_uid, status: shouldSend ? 'active' : 'pending', delivery, paused: paused === '1' };
+}
+
+async function upsertTradingViewSource(db, payload) {
+  await ensureAdminSchema(db);
+  const sourceId = slugify(payload.source_id || payload.sourceId || payload.name, 'tv');
+  const existing = await db.prepare('SELECT * FROM tradingview_sources WHERE source_id = ?').bind(sourceId).first();
+  const name = String(payload.name || existing?.name || sourceId).trim();
+  const secret = String(payload.webhook_secret || payload.webhookSecret || existing?.webhook_secret || genUID()).trim();
+  const defaultStrategyId = String(payload.default_strategy_id || payload.defaultStrategyId || existing?.default_strategy_id || '').trim() || null;
+  const allowedSymbols = cleanListValue(payload.allowed_symbols ?? payload.allowedSymbols ?? existing?.allowed_symbols ?? []);
+  const defaultSignalType = String(payload.default_signal_type || payload.defaultSignalType || existing?.default_signal_type || 'auto').trim() || 'auto';
+  const targetGroup = String(payload.target_group || payload.targetGroup || existing?.target_group || 'pro').trim();
+  const autoSend = payload.auto_send === true || payload.autoSend === true || payload.auto_send === 'true' || payload.autoSend === 'true' ? 1 : 0;
+  const isActive = payload.is_active === false || payload.isActive === false || payload.is_active === 'false' || payload.isActive === 'false' ? 0 : 1;
+  const notes = String(payload.notes || existing?.notes || '').trim();
+
+  await db.prepare(`
+    INSERT INTO tradingview_sources (
+      source_id, name, webhook_secret, default_strategy_id, allowed_symbols,
+      default_signal_type, target_group, auto_send, is_active, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT(source_id) DO UPDATE SET
+      name = excluded.name,
+      webhook_secret = excluded.webhook_secret,
+      default_strategy_id = excluded.default_strategy_id,
+      allowed_symbols = excluded.allowed_symbols,
+      default_signal_type = excluded.default_signal_type,
+      target_group = excluded.target_group,
+      auto_send = excluded.auto_send,
+      is_active = excluded.is_active,
+      notes = excluded.notes,
+      updated_at = datetime('now')
+  `).bind(sourceId, name, secret, defaultStrategyId, allowedSymbols, defaultSignalType, targetGroup, autoSend, isActive, notes).run();
+
+  return { sourceId, secret };
+}
+
+async function previewTradingViewSignal(db, payload) {
+  const sourceId = String(payload.source_id || payload.sourceId || 'default-tv');
+  const source = await getTradingViewSource(db, sourceId);
+  if (!source) throw new Error('找不到 TradingView 來源');
+  const draft = await buildTvSignalDraft(db, source, payload);
+  return {
+    signal: {
+      ticker: draft.ticker,
+      action: draft.action,
+      signal_type: draft.signal_type,
+      entry_price: draft.entry_price,
+      stop_loss: draft.stop_loss,
+      tp1: draft.tp1,
+      tp2: draft.tp2,
+      tp3: draft.tp3,
+      target_group: draft.target_group,
+      strategy_id: draft.strategy_id
+    },
+    strategy: { id: draft.strategy.strategy_id, name: draft.strategy.name, rules: draft.rules }
+  };
+}
+
+async function handleTradingViewWebhook(request, env, sourceId, url) {
+  const db = env.DB;
+  await ensureAdminSchema(db);
+  const source = await getTradingViewSource(db, sourceId);
+  if (!source || !source.is_active) return json({ ok: false, error: 'TradingView source not found or inactive' }, 404);
+
+  let payload = {};
+  const rawText = await request.text();
+  try {
+    payload = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    payload = { message: rawText };
+  }
+  const providedSecret = String(payload.secret || request.headers.get('X-TradingView-Secret') || url.searchParams.get('secret') || '');
+  if (providedSecret !== source.webhook_secret) {
+    return json({ ok: false, error: 'Invalid TradingView secret' }, 401);
+  }
+
+  const alertUid = String(payload.alert_uid || payload.alert_id || payload.id || `${payload.time || Date.now()}-${payload.ticker || payload.symbol || 'alert'}-${payload.action || payload.side || ''}`).slice(0, 180);
+  const existingLog = await db.prepare('SELECT * FROM tv_alert_logs WHERE source_id = ? AND alert_uid = ?').bind(source.source_id, alertUid).first();
+  if (existingLog?.signal_uid) {
+    return json({ ok: true, duplicate: true, signalUid: existingLog.signal_uid, status: existingLog.status });
+  }
+
+  try {
+    const draft = await buildTvSignalDraft(db, source, payload);
+    const result = await createSignalFromTvDraft(db, draft, alertUid, source.auto_send);
+    await db.prepare(`
+      INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
+    `).bind(alertUid, source.source_id, draft.strategy_id, draft.ticker, draft.action, JSON.stringify(payload), result.signalUid, result.status).run();
+    return json({ ok: true, source: source.source_id, ...result, signal: draft });
+  } catch (e) {
+    await db.prepare(`
+      INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, payload, status, error, created_at)
+      VALUES (?, ?, ?, 'error', ?, datetime('now'))
+    `).bind(alertUid, source.source_id, JSON.stringify(payload), e.message).run();
+    return json({ ok: false, error: e.message }, 400);
+  }
+}
+
+async function handleAdminApi(request, env, pathname) {
+  const auth = requireAdminHttp(request, env, true);
+  if (auth) return auth;
+
+  const db = env.DB;
+  const adminId = env.ADMIN_WEB_USER || 'web-admin';
+  const parts = pathname.split('/').filter(Boolean).slice(2);
+
+  try {
+    if (request.method === 'GET' && parts[0] === 'bootstrap') {
+      return json({ ok: true, data: await getAdminBootstrap(db) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'signals' && parts.length === 1) {
+      return json({ ok: true, data: await createAdminSignal(db, adminId, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'close') {
+      return json({ ok: true, data: await closeAdminSignal(db, adminId, parts[1], await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'cancel') {
+      await db.prepare("UPDATE signals SET status = 'cancelled', closed_at = datetime('now') WHERE signal_uid = ?").bind(parts[1]).run();
+      await logAction(db, adminId, 'web_signal_cancel', parts[1], '');
+      return json({ ok: true });
+    }
+
+    if (request.method === 'PUT' && parts[0] === 'config') {
+      const body = await readJsonBody(request);
+      const config = body.config || body;
+      const updated = [];
+      for (const key of ADMIN_CONFIG_KEYS) {
+        if (config[key] !== undefined) {
+          await setConfig(db, key, String(config[key]));
+          updated.push(key);
+        }
+      }
+      await logAction(db, adminId, 'web_config_update', updated.join(','), '');
+      return json({ ok: true, data: { updated } });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'symbols') {
+      return json({ ok: true, data: await upsertAdminSymbol(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'strategies') {
+      return json({ ok: true, data: await upsertAdminStrategy(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'sources') {
+      return json({ ok: true, data: await upsertTradingViewSource(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'preview') {
+      return json({ ok: true, data: await previewTradingViewSignal(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'users' && parts[1]) {
+      return json({ ok: true, data: await updateAdminUser(db, adminId, decodeURIComponent(parts[1]), await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'orders' && parts[1] && parts[2]) {
+      return json({ ok: true, data: await handleAdminOrderAction(db, adminId, parts[1], parts[2], await readJsonBody(request)) });
+    }
+
+    return json({ ok: false, error: 'Not found' }, 404);
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 400);
+  }
+}
+
+function renderAdminPage() {
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DC Signals 後台</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --ink: #202327;
+      --muted: #6b7280;
+      --line: #dfe4ea;
+      --soft: #eef2f5;
+      --nav: #20242a;
+      --nav-2: #2b3038;
+      --accent: #0f9f9a;
+      --accent-2: #0c817d;
+      --amber: #b7791f;
+      --red: #c2413b;
+      --green: #16845a;
+      --shadow: 0 10px 30px rgba(20, 24, 30, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); overflow-x: hidden; }
+    button, input, select, textarea { font: inherit; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 236px minmax(0, 1fr); }
+    .sidebar { background: var(--nav); color: #f8fafc; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 12px; border-bottom: 1px solid rgba(255,255,255,.11); }
+    .mark { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; background: var(--accent); color: white; font-weight: 800; }
+    .brand strong { display:block; font-size: 15px; line-height: 1.2; }
+    .brand span { display:block; color: #aab3bf; font-size: 12px; margin-top: 2px; }
+    .nav { display: grid; gap: 4px; }
+    .nav button { border: 0; width: 100%; color: #d7dee8; background: transparent; display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 10px; border-radius: 6px; cursor: pointer; text-align: left; }
+    .nav button.active, .nav button:hover { background: var(--nav-2); color: #fff; }
+    .nav small { margin-left: auto; color: #93a0ad; }
+    .main { min-width: 0; max-width: 100%; display: flex; flex-direction: column; }
+    .topbar { height: 60px; background: rgba(255,255,255,.86); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; padding: 0 22px; position: sticky; top: 0; z-index: 5; }
+    .topbar h1 { font-size: 18px; line-height: 1.2; margin: 0; }
+    .status { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
+    .pill { display:inline-flex; align-items:center; gap:6px; min-height: 26px; border:1px solid var(--line); border-radius: 999px; padding: 3px 9px; background:#fff; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .dot { width: 8px; height: 8px; border-radius: 99px; background: var(--green); }
+    .content { min-width: 0; max-width: 100%; padding: 20px 22px 32px; display: grid; gap: 16px; }
+    .view { display: none; gap: 16px; }
+    .view.active { display: grid; }
+    .view, .grid { min-width: 0; max-width: 100%; }
+    .grid { display:grid; gap: 16px; }
+    .grid > *, .panel, .table-wrap { min-width: 0; max-width: 100%; }
+    .grid.two { grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.3fr); align-items: start; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .kpis { display:grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 10px; }
+    .kpi, .panel { background: var(--panel); border:1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
+    .kpi { padding: 12px 13px; min-height: 74px; }
+    .kpi span { color: var(--muted); font-size: 12px; }
+    .kpi strong { display:block; margin-top: 8px; font-size: 24px; line-height:1; letter-spacing: 0; }
+    .panel { overflow: hidden; }
+    .panel header { min-height: 48px; padding: 12px 14px; border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap: 12px; }
+    .panel header h2 { margin:0; font-size: 15px; line-height:1.2; }
+    .panel .body { padding: 14px; }
+    label { display:block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+    input, select, textarea { width: 100%; border:1px solid var(--line); border-radius: 5px; min-height: 36px; padding: 7px 9px; background:#fff; color: var(--ink); outline: none; }
+    textarea { min-height: 74px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(15,159,154,.12); }
+    .form-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .form-grid .full { grid-column: 1 / -1; }
+    .seg { display:grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+    .seg button, .btn { border:1px solid var(--line); border-radius: 5px; min-height: 36px; padding: 7px 10px; background:#fff; color: var(--ink); cursor:pointer; }
+    .seg button.active { background: var(--accent); border-color: var(--accent); color:#fff; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color:#fff; }
+    .btn.primary:hover { background: var(--accent-2); }
+    .btn.ghost { background:#fff; }
+    .btn.warn { background:#fff7ed; border-color:#f2c580; color: var(--amber); }
+    .btn.danger { background:#fff1f0; border-color:#efb4b0; color: var(--red); }
+    .actions { display:flex; gap: 8px; flex-wrap: wrap; align-items:center; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom:1px solid var(--line); text-align:left; font-size: 13px; vertical-align: middle; }
+    th { color: var(--muted); font-weight: 650; background: #fbfcfd; font-size: 12px; }
+    tr:last-child td { border-bottom:0; }
+    .table-wrap { overflow:auto; }
+    .chip { display:inline-flex; align-items:center; gap:6px; min-height: 24px; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--soft); color:#475569; white-space:nowrap; }
+    .chip.green { background:#e8f7ef; color: var(--green); }
+    .chip.red { background:#fff0ef; color: var(--red); }
+    .chip.amber { background:#fff7e6; color: var(--amber); }
+    .muted { color: var(--muted); }
+    .stack { display:grid; gap: 10px; }
+    .message { min-height: 24px; font-size: 13px; color: var(--muted); }
+    .message.error { color: var(--red); }
+    .message.ok { color: var(--green); }
+    .copybox { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; min-height: 122px; }
+    .readonly { background: #f8fafc; }
+    .preview { border:1px solid var(--line); border-radius:6px; padding:10px; background:#f8fafc; display:grid; gap:6px; font-size:13px; }
+    .preview b { font-size: 18px; }
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: sticky; top: 0; z-index: 20; padding: 10px; gap: 10px; }
+      .brand { padding-bottom: 8px; }
+      .nav { display: flex; overflow-x: auto; gap: 6px; padding-bottom: 2px; -webkit-overflow-scrolling: touch; }
+      .nav button { min-width: 92px; justify-content: center; min-height: 42px; padding: 0 12px; }
+      .nav small { display: none; }
+      .grid.two, .grid.three, .kpis { grid-template-columns: 1fr; }
+      .topbar { height: auto; min-height: 60px; align-items:flex-start; flex-direction:column; padding: 12px 16px; }
+      .content { padding: 16px; }
+    }
+    @media (max-width: 680px) {
+      .main { width: 100vw; max-width: 100vw; overflow-x: hidden; }
+      .content, .view, .grid, .panel, .table-wrap { width: 100%; max-width: 100%; }
+      .sidebar { padding: 8px; }
+      .brand { display: none; }
+      .content { padding: 12px; gap: 12px; }
+      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .kpi { min-height: 68px; padding: 10px; }
+      .kpi strong { font-size: 21px; }
+      .panel header { align-items:flex-start; flex-direction:column; min-height: unset; }
+      .panel .body { padding: 12px; }
+      .form-grid { grid-template-columns: 1fr; }
+      input, select, textarea, .btn, .seg button { min-height: 44px; }
+      .actions { align-items: stretch; }
+      .actions .btn { flex: 1 1 120px; }
+      .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .table-wrap table { min-width: 680px; }
+      th, td { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="mark">DC</div><div><strong>DC Signals</strong><span>交易訊號後台</span></div></div>
+      <nav class="nav" id="nav">
+        <button data-view="overview" class="active">總覽 <small>⌘1</small></button>
+        <button data-view="signals">訊號</button>
+        <button data-view="strategies">策略</button>
+        <button data-view="tradingview">TradingView</button>
+        <button data-view="symbols">品種</button>
+        <button data-view="users">會員</button>
+        <button data-view="orders">訂單</button>
+        <button data-view="billing">收費設定</button>
+      </nav>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <div><h1>自動交易訊號營運後台</h1><div class="muted" id="serverTime">載入中</div></div>
+        <div class="status">
+          <span class="pill"><span class="dot"></span>Worker 線上</span>
+          <span class="pill" id="dbPill">D1 連線中</span>
+          <button class="btn ghost" id="refreshBtn" type="button">重新整理</button>
+        </div>
+      </div>
+      <section class="content">
+        <div class="kpis" id="kpis"></div>
+        <div class="view active" id="view-overview">
+          <div class="grid two">
+            <section class="panel"><header><h2>快速發訊</h2><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section>
+            <section class="panel"><header><h2>近期訊號</h2><button class="btn ghost" data-view-target="signals" type="button">管理全部</button></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>品種</th><th>方向</th><th>價格</th><th>狀態</th><th></th></tr></thead><tbody id="recentSignals"></tbody></table></div></section>
+          </div>
+          <div class="grid two">
+            <section class="panel"><header><h2>待處理訂單</h2><button class="btn ghost" data-view-target="orders" type="button">查看訂單</button></header><div class="table-wrap"><table><thead><tr><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th></th></tr></thead><tbody id="pendingOrders"></tbody></table></div></section>
+            <section class="panel"><header><h2>收費與系統狀態</h2><button class="btn ghost" data-view-target="billing" type="button">編輯</button></header><div class="body"><div class="stack" id="configSummary"></div></div></section>
+          </div>
+        </div>
+        <div class="view" id="view-signals"><section class="panel"><header><h2>訊號維護</h2><span class="muted">草稿、已發送與結案紀錄</span></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div>
+        <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
+        <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
+        <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
+        <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 50 位用戶</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
+        <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
+        <div class="view" id="view-billing"><section class="panel"><header><h2>收費、付款與系統設定</h2></header><div class="body">${renderConfigFormHtml()}</div></section></div>
+        <div class="message" id="message"></div>
+      </section>
+    </main>
+  </div>
+  <script>${renderAdminScript()}</script>
+</body>
+</html>`;
+}
+
+function renderSignalFormHtml() {
+  return `<form id="signalForm" class="stack">
+    <div class="form-grid">
+      <div><label>品種</label><select name="ticker" id="signalTicker"></select></div>
+      <div><label>方向</label><div class="seg"><button type="button" class="active" data-action="LONG">做多</button><button type="button" data-action="SHORT">做空</button></div><input type="hidden" name="action" value="LONG"></div>
+      <div><label>訊號類型</label><select name="signal_type"><option value="scalp">短線</option><option value="swing">波段</option><option value="daytrade">日內</option></select></div>
+      <div><label>目標</label><select name="target_group"><option value="all">全部付費會員</option><option value="pro">Pro 以上</option><option value="vip">VIP 專屬</option></select></div>
+      <div><label>進場</label><input name="entry_price" inputmode="decimal" required></div>
+      <div><label>止損</label><input name="stop_loss" inputmode="decimal" required></div>
+      <div><label>TP1</label><input name="tp1" inputmode="decimal" required></div>
+      <div><label>TP2</label><input name="tp2" inputmode="decimal"></div>
+      <div><label>TP3</label><input name="tp3" inputmode="decimal"></div>
+      <div><label>發送模式</label><select name="send"><option value="true">立即發送</option><option value="false">只存草稿</option></select></div>
+      <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
+    </div>
+    <div class="actions"><button class="btn primary" type="submit">建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
+  </form>`;
+}
+
+function renderStrategyFormHtml() {
+  return `<form id="strategyForm" class="stack">
+    <div class="form-grid">
+      <div><label>策略 ID</label><input name="strategy_id" placeholder="scalp-core"></div>
+      <div><label>排序</label><input name="sort_order" inputmode="numeric" value="0"></div>
+      <div class="full"><label>策略名稱</label><input name="name" required></div>
+      <div><label>可用等級</label><select name="tier"><option value="pro">Pro</option><option value="vip">VIP</option><option value="free">Free</option></select></div>
+      <div><label>狀態</label><select name="is_active"><option value="true">啟用</option><option value="false">停用</option></select></div>
+      <div><label>訊號類型</label><input name="signal_types" placeholder="scalp,swing"></div>
+      <div><label>品種</label><input name="symbols" placeholder="NQ,ES,GC"></div>
+      <div class="full"><label>描述</label><textarea name="description"></textarea></div>
+      <div class="full"><label>風控規則 JSON</label><textarea class="copybox" name="rules_json" placeholder='{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close"}'></textarea></div>
+      <div class="full"><label>TradingView Alert 範本</label><textarea class="copybox" name="tv_alert_template" placeholder='{"secret":"{{secret}}","strategy":"auto","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'></textarea></div>
+      <div class="full"><label>維護備註</label><textarea name="note"></textarea></div>
+    </div>
+    <button class="btn primary" type="submit">儲存策略</button>
+  </form>`;
+}
+
+function renderTradingViewHtml() {
+  return `<div class="grid two">
+    <section class="panel">
+      <header><h2>TradingView 來源</h2></header>
+      <div class="table-wrap"><table><thead><tr><th>來源</th><th>策略</th><th>品種</th><th>目標</th><th>模式</th></tr></thead><tbody id="tvSourcesTable"></tbody></table></div>
+      <div class="body">${renderTradingViewSourceFormHtml()}</div>
+    </section>
+    <section class="panel">
+      <header><h2>Alert 產生器</h2></header>
+      <div class="body">${renderTradingViewGeneratorHtml()}</div>
+    </section>
+    <section class="panel" style="grid-column:1/-1">
+      <header><h2>Alert 日誌</h2></header>
+      <div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>策略</th><th>品種</th><th>方向</th><th>狀態</th><th>訊號</th></tr></thead><tbody id="tvLogsTable"></tbody></table></div>
+    </section>
+  </div>`;
+}
+
+function renderTradingViewSourceFormHtml() {
+  return `<form id="tvSourceForm" class="stack">
+    <div class="form-grid">
+      <div><label>來源 ID</label><input name="source_id" placeholder="default-tv"></div>
+      <div><label>來源名稱</label><input name="name" placeholder="Main NQ Alerts"></div>
+      <div class="full"><label>Secret</label><input name="webhook_secret" placeholder="留空會自動產生"></div>
+      <div><label>預設策略</label><select name="default_strategy_id" id="tvDefaultStrategy"></select></div>
+      <div><label>訊號類型</label><select name="default_signal_type"><option value="auto">自動</option><option value="scalp">短線</option><option value="daytrade">日內</option><option value="swing">波段</option></select></div>
+      <div><label>發送目標</label><select name="target_group"><option value="pro">Pro 以上</option><option value="vip">VIP 專屬</option><option value="all">全部付費會員</option></select></div>
+      <div><label>接收模式</label><select name="auto_send"><option value="false">先存草稿</option><option value="true">自動發送</option></select></div>
+      <div><label>狀態</label><select name="is_active"><option value="true">啟用</option><option value="false">停用</option></select></div>
+      <div class="full"><label>允許品種</label><input name="allowed_symbols" placeholder="NQ,ES,GC,CL"></div>
+      <div class="full"><label>備註</label><textarea name="notes"></textarea></div>
+    </div>
+    <button class="btn primary" type="submit">儲存來源</button>
+  </form>`;
+}
+
+function renderTradingViewGeneratorHtml() {
+  return `<div class="stack">
+    <div class="form-grid">
+      <div><label>來源</label><select id="tvGenSource"></select></div>
+      <div><label>策略</label><select id="tvGenStrategy"><option value="auto">自動選擇</option></select></div>
+      <div><label>品種</label><select id="tvGenTicker"></select></div>
+      <div><label>方向</label><select id="tvGenAction"><option value="AUTO">TradingView 帶入</option><option value="LONG">做多</option><option value="SHORT">做空</option></select></div>
+      <div><label>週期</label><input id="tvGenInterval" value="15"></div>
+      <div><label>預覽價格</label><input id="tvGenPrice" inputmode="decimal" value="21500"></div>
+      <div class="full"><label>Webhook URL</label><input class="readonly" id="tvWebhookUrl" readonly></div>
+      <div class="full"><label>Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
+    </div>
+    <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
+    <div class="preview" id="tvPreview"></div>
+  </div>`;
+}
+
+function renderSymbolFormHtml() {
+  return `<form id="symbolForm" class="stack">
+    <div class="form-grid">
+      <div><label>代碼</label><input name="symbol" required placeholder="NQ"></div>
+      <div><label>排序</label><input name="sort_order" inputmode="numeric" value="0"></div>
+      <div><label>英文名稱</label><input name="name" required></div>
+      <div><label>中文名稱</label><input name="name_zh"></div>
+      <div><label>分類</label><select name="category"><option value="index">指數</option><option value="metal">貴金屬</option><option value="energy">能源</option><option value="forex">外匯</option></select></div>
+      <div><label>狀態</label><select name="is_active"><option value="true">啟用</option><option value="false">停用</option></select></div>
+      <div><label>Tick Size</label><input name="tick_size" inputmode="decimal" value="0.25"></div>
+      <div><label>Tick Value</label><input name="tick_value" inputmode="decimal" value="5"></div>
+    </div>
+    <button class="btn primary" type="submit">儲存品種</button>
+  </form>`;
+}
+
+function renderConfigFormHtml() {
+  return `<form id="configForm" class="stack">
+    <div class="form-grid">
+      <div><label>Pro 月費</label><input name="pro_price_1m"></div>
+      <div><label>VIP 月費</label><input name="vip_price_1m"></div>
+      <div><label>Pro 季費</label><input name="pro_price_3m"></div>
+      <div><label>VIP 季費</label><input name="vip_price_3m"></div>
+      <div><label>Pro 年費</label><input name="pro_price_12m"></div>
+      <div><label>VIP 年費</label><input name="vip_price_12m"></div>
+      <div><label>試用天數</label><input name="trial_days"></div>
+      <div><label>訊號狀態</label><select name="signals_paused"><option value="0">運行中</option><option value="1">暫停發訊</option></select></div>
+      <div><label>客服 Telegram</label><input name="contact_telegram"></div>
+      <div><label>客服 LINE</label><input name="contact_line"></div>
+      <div><label>付款銀行</label><input name="payment_bank"></div>
+      <div><label>付款帳號</label><input name="payment_account"></div>
+      <div><label>付款戶名</label><input name="payment_name"></div>
+      <div class="full"><label>歡迎訊息</label><textarea name="welcome_message"></textarea></div>
+    </div>
+    <button class="btn primary" type="submit">儲存設定</button>
+  </form>`;
+}
+
+function renderAdminScript() {
+  return `
+var state = { data: null, action: 'LONG' };
+var views = Array.prototype.slice.call(document.querySelectorAll('.view'));
+var navButtons = Array.prototype.slice.call(document.querySelectorAll('[data-view]'));
+var messageEl = document.getElementById('message');
+function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]); }); }
+function money(value) { return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
+function dateText(value) { return value ? new Date(value).toLocaleString('zh-TW', { hour12: false }) : '-'; }
+function chip(text, tone) { return '<span class="chip ' + (tone || '') + '">' + esc(text) + '</span>'; }
+function setMessage(text, tone) { messageEl.textContent = text || ''; messageEl.className = 'message ' + (tone || ''); }
+function showView(view) {
+  views.forEach(function (el) { el.classList.toggle('active', el.id === 'view-' + view); });
+  navButtons.forEach(function (btn) { btn.classList.toggle('active', btn.dataset.view === view); });
+}
+async function api(path, options) {
+  var res = await fetch(path, Object.assign({ credentials: 'same-origin', headers: { 'Content-Type': 'application/json' } }, options || {}));
+  if (res.status === 401) { location.reload(); return; }
+  var data = await res.json();
+  if (!data.ok) throw new Error(data.error || '操作失敗');
+  return data.data;
+}
+async function load() {
+  setMessage('同步後台資料中...');
+  state.data = await api('/api/admin/bootstrap');
+  renderAll();
+  setMessage('已同步 ' + state.data.serverTime, 'ok');
+}
+function renderAll() {
+  renderKpis();
+  renderConfigSummary();
+  renderConfigForm();
+  renderSignals();
+  renderOrders();
+  renderUsers();
+  renderSymbols();
+  renderStrategies();
+  renderTradingView();
+  renderSignalSymbolOptions();
+  document.getElementById('serverTime').textContent = '最後同步 ' + state.data.serverTime;
+  document.getElementById('dbPill').textContent = 'D1 dc-signals-v91-db';
+}
+function renderKpis() {
+  var s = state.data.stats;
+  var items = [
+    ['有效訊號', s.activeSignals],
+    ['今日訊號', s.todaySignals],
+    ['付費會員', s.proUsers + s.vipUsers],
+    ['VIP', s.vipUsers],
+    ['待處理訂單', s.pendingOrders],
+    ['今日勝率', s.winRate + '%']
+  ];
+  document.getElementById('kpis').innerHTML = items.map(function (item) {
+    return '<div class="kpi"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>';
+  }).join('');
+}
+function renderConfigSummary() {
+  var c = state.data.config;
+  document.getElementById('configSummary').innerHTML =
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + '</div>' +
+    '<div class="muted">付款：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
+    '<div class="muted">客服：' + esc(c.contact_telegram || '-') + ' / ' + esc(c.contact_line || '-') + '</div>';
+}
+function renderConfigForm() {
+  var form = document.getElementById('configForm');
+  if (!form) return;
+  Object.keys(state.data.config).forEach(function (key) {
+    if (form.elements[key]) form.elements[key].value = state.data.config[key] == null ? '' : state.data.config[key];
+  });
+}
+function renderSignalSymbolOptions() {
+  var select = document.getElementById('signalTicker');
+  select.innerHTML = state.data.symbols.filter(function (s) { return s.is_active; }).map(function (s) {
+    return '<option value="' + esc(s.symbol) + '">' + esc(s.symbol + ' - ' + (s.name_zh || s.name)) + '</option>';
+  }).join('');
+}
+function signalRow(sig, compact) {
+  var statusTone = sig.status === 'active' ? 'green' : sig.status === 'closed' ? '' : sig.status === 'cancelled' ? 'red' : 'amber';
+  var price = esc(sig.entry_price) + ' / ' + esc(sig.stop_loss) + ' / ' + esc(sig.tp1 || '-');
+  var action = sig.status === 'active' ? '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>' : '';
+  if (compact) {
+    return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + price + '</td><td>' + chip(sig.status, statusTone) + '</td><td>' + action + '</td></tr>';
+  }
+  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + (sig.status === 'pending' ? '<button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>' : '') + '</td></tr>';
+}
+function renderSignals() {
+  var signals = state.data.signals || [];
+  document.getElementById('recentSignals').innerHTML = signals.slice(0, 8).map(function (s) { return signalRow(s, true); }).join('') || '<tr><td colspan="6" class="muted">尚無訊號</td></tr>';
+  document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="9" class="muted">尚無訊號</td></tr>';
+}
+function orderRow(order, compact) {
+  var user = order.username ? '@' + order.username : (order.first_name || order.user_id);
+  var tone = order.status === 'paid' ? 'amber' : order.status === 'confirmed' ? 'green' : order.status === 'rejected' ? 'red' : '';
+  var actions = order.status === 'pending' || order.status === 'paid'
+    ? '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>'
+    : '';
+  if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
+  return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
+}
+function renderOrders() {
+  var orders = state.data.orders || [];
+  var pending = orders.filter(function (o) { return o.status === 'pending' || o.status === 'paid'; });
+  document.getElementById('pendingOrders').innerHTML = pending.slice(0, 8).map(function (o) { return orderRow(o, true); }).join('') || '<tr><td colspan="5" class="muted">沒有待處理訂單</td></tr>';
+  document.getElementById('ordersTable').innerHTML = orders.map(function (o) { return orderRow(o, false); }).join('') || '<tr><td colspan="7" class="muted">尚無訂單</td></tr>';
+}
+function renderUsers() {
+  var users = state.data.users || [];
+  document.getElementById('usersTable').innerHTML = users.map(function (u) {
+    var name = u.username ? '@' + u.username : (u.first_name || u.user_id);
+    var status = u.is_banned ? chip('封禁', 'red') : u.is_active ? chip('啟用', 'green') : chip('停用', 'amber');
+    return '<tr><td><div>' + esc(name) + '</div><div class="muted"><code>' + esc(u.user_id) + '</code></div></td><td>' + chip(u.tier, u.tier === 'vip' ? 'amber' : u.tier === 'pro' ? 'green' : '') + '</td><td>' + esc(u.tier_expires_at ? dateText(u.tier_expires_at) : '-') + '</td><td>' + money(u.total_spent || 0) + '</td><td>' + status + '</td><td class="actions"><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|pro">Pro+30</button><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|vip">VIP+30</button><button class="btn danger" data-user-ban="' + esc(u.user_id) + '|' + (u.is_banned ? '0' : '1') + '">' + (u.is_banned ? '解封' : '封禁') + '</button></td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">尚無會員</td></tr>';
+}
+function renderSymbols() {
+  document.getElementById('symbolsTable').innerHTML = (state.data.symbols || []).map(function (s) {
+    return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">尚無品種</td></tr>';
+}
+function renderStrategies() {
+  document.getElementById('strategiesTable').innerHTML = (state.data.strategies || []).map(function (s) {
+    return '<tr><td>' + esc(s.sort_order) + '</td><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.strategy_id) + '</code></div></td><td>' + chip(s.tier, s.tier === 'vip' ? 'amber' : 'green') + '</td><td>' + esc(parseJsonList(s.symbols).join(', ')) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="muted">尚無策略</td></tr>';
+}
+function renderTradingView() {
+  var strategies = state.data.strategies || [];
+  var sources = state.data.tvSources || [];
+  var symbols = state.data.symbols || [];
+  var strategyOptions = '<option value="">自動選擇</option>' + strategies.map(function (s) {
+    return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name + ' (' + s.strategy_id + ')') + '</option>';
+  }).join('');
+  var genStrategyOptions = '<option value="auto">自動選擇</option>' + strategies.map(function (s) {
+    return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name) + '</option>';
+  }).join('');
+  var sourceOptions = sources.map(function (s) {
+    return '<option value="' + esc(s.source_id) + '">' + esc(s.name + ' (' + s.source_id + ')') + '</option>';
+  }).join('');
+  var symbolOptions = symbols.filter(function (s) { return s.is_active; }).map(function (s) {
+    return '<option value="' + esc(s.symbol) + '">' + esc(s.symbol + ' - ' + (s.name_zh || s.name)) + '</option>';
+  }).join('');
+
+  document.getElementById('tvDefaultStrategy').innerHTML = strategyOptions;
+  document.getElementById('tvGenStrategy').innerHTML = genStrategyOptions;
+  document.getElementById('tvGenSource').innerHTML = sourceOptions;
+  document.getElementById('tvGenTicker').innerHTML = symbolOptions;
+  document.getElementById('tvSourcesTable').innerHTML = sources.map(function (s) {
+    var symbolsText = parseJsonList(s.allowed_symbols).join(', ') || '全部';
+    return '<tr><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.source_id) + '</code></div></td><td>' + esc(s.default_strategy_id || 'auto') + '</td><td>' + esc(symbolsText) + '</td><td>' + chip(s.target_group || 'pro', s.target_group === 'vip' ? 'amber' : 'green') + '</td><td>' + (s.auto_send ? chip('自動發送','green') : chip('草稿','amber')) + ' ' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="muted">尚無來源</td></tr>';
+  document.getElementById('tvLogsTable').innerHTML = (state.data.tvLogs || []).map(function (log) {
+    var tone = log.status === 'error' ? 'red' : log.status === 'active' ? 'green' : 'amber';
+    return '<tr><td>' + esc(dateText(log.created_at)) + '</td><td>' + esc(log.source_id) + '</td><td>' + esc(log.strategy_id || '-') + '</td><td>' + esc(log.ticker || '-') + '</td><td>' + esc(log.action || '-') + '</td><td>' + chip(log.error || log.status, tone) + '</td><td><code>' + esc(log.signal_uid || '-') + '</code></td></tr>';
+  }).join('') || '<tr><td colspan="7" class="muted">尚無 alert</td></tr>';
+  updateTradingViewGenerator();
+}
+function getSelectedTvSource() {
+  var id = document.getElementById('tvGenSource').value;
+  return (state.data.tvSources || []).find(function (s) { return s.source_id === id; }) || (state.data.tvSources || [])[0];
+}
+function getSelectedTvStrategy() {
+  var id = document.getElementById('tvGenStrategy').value;
+  if (!id || id === 'auto') return null;
+  return (state.data.strategies || []).find(function (s) { return s.strategy_id === id; });
+}
+function buildTradingViewAlertMessage() {
+  var source = getSelectedTvSource();
+  if (!source) return '';
+  var strategy = getSelectedTvStrategy();
+  var action = document.getElementById('tvGenAction').value;
+  var message = {
+    secret: source.webhook_secret,
+    strategy: strategy ? strategy.strategy_id : 'auto',
+    ticker: '{{ticker}}',
+    action: action === 'AUTO' ? '{{strategy.order.action}}' : action,
+    price: '{{close}}',
+    time: '{{time}}',
+    interval: '{{interval}}',
+    alert_id: '{{ticker}}-{{time}}-' + (strategy ? strategy.strategy_id : 'auto')
+  };
+  return JSON.stringify(message, null, 2);
+}
+function updateTradingViewGenerator() {
+  var source = getSelectedTvSource();
+  document.getElementById('tvWebhookUrl').value = source ? location.origin + '/tv/' + source.source_id : '';
+  document.getElementById('tvAlertMessage').value = buildTradingViewAlertMessage();
+}
+function parseJsonList(value) { try { var parsed = JSON.parse(value || '[]'); return Array.isArray(parsed) ? parsed : []; } catch (e) { return []; } }
+function formPayload(form) {
+  var data = {};
+  Array.prototype.slice.call(new FormData(form).entries()).forEach(function (pair) { data[pair[0]] = pair[1]; });
+  ['entry_price','stop_loss','tp1','tp2','tp3','tick_size','tick_value','sort_order'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
+  ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
+  return data;
+}
+document.getElementById('nav').addEventListener('click', function (event) { var btn = event.target.closest('[data-view]'); if (btn) showView(btn.dataset.view); });
+document.body.addEventListener('click', async function (event) {
+  var targetView = event.target.closest('[data-view-target]');
+  if (targetView) showView(targetView.dataset.viewTarget);
+  var closeBtn = event.target.closest('[data-close]');
+  if (closeBtn) {
+    var price = prompt('輸入結案價格');
+    if (!price) return;
+    var type = prompt('結案類型：CLOSE / TP1 / TP2 / TP3 / SL', 'CLOSE') || 'CLOSE';
+    await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(price), type: type, notify: true }) });
+    await load();
+  }
+  var cancelBtn = event.target.closest('[data-cancel]');
+  if (cancelBtn && confirm('確定取消此草稿訊號？')) {
+    await api('/api/admin/signals/' + encodeURIComponent(cancelBtn.dataset.cancel) + '/cancel', { method: 'POST', body: '{}' });
+    await load();
+  }
+  var confirmOrder = event.target.closest('[data-confirm-order]');
+  if (confirmOrder) { await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
+  var rejectOrder = event.target.closest('[data-reject-order]');
+  if (rejectOrder) { var reason = prompt('拒絕原因', '付款未確認') || '付款未確認'; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) }); await load(); }
+  var userTier = event.target.closest('[data-user-tier]');
+  if (userTier) { var parts = userTier.dataset.userTier.split('|'); await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
+  var userBan = event.target.closest('[data-user-ban]');
+  if (userBan) { var banParts = userBan.dataset.userBan.split('|'); await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
+});
+document.querySelector('.seg').addEventListener('click', function (event) {
+  var btn = event.target.closest('[data-action]');
+  if (!btn) return;
+  state.action = btn.dataset.action;
+  document.querySelector('[name="action"]').value = state.action;
+  Array.prototype.slice.call(document.querySelectorAll('[data-action]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
+});
+document.getElementById('refreshBtn').addEventListener('click', load);
+document.getElementById('signalForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
+document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); });
+document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
+document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
+document.getElementById('tvSourceForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/tradingview/sources', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
+['tvGenSource','tvGenStrategy','tvGenTicker','tvGenAction','tvGenInterval','tvGenPrice'].forEach(function (id) {
+  document.getElementById(id).addEventListener('change', updateTradingViewGenerator);
+  document.getElementById(id).addEventListener('input', updateTradingViewGenerator);
+});
+document.getElementById('tvGenerateBtn').addEventListener('click', updateTradingViewGenerator);
+document.getElementById('tvPreviewBtn').addEventListener('click', async function () {
+  var action = document.getElementById('tvGenAction').value;
+  var payload = {
+    source_id: document.getElementById('tvGenSource').value,
+    strategy: document.getElementById('tvGenStrategy').value,
+    ticker: document.getElementById('tvGenTicker').value,
+    action: action === 'AUTO' ? 'LONG' : action,
+    price: Number(document.getElementById('tvGenPrice').value || 0),
+    interval: document.getElementById('tvGenInterval').value
+  };
+  var result = await api('/api/admin/tradingview/preview', { method: 'POST', body: JSON.stringify(payload) });
+  var s = result.signal;
+  document.getElementById('tvPreview').innerHTML =
+    '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + '</div>' +
+    '<b>' + esc(s.action + ' ' + s.ticker) + '</b>' +
+    '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>';
+});
+load().catch(function (err) { setMessage(err.message, 'error'); });
+`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Cron Jobs
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2707,6 +4048,10 @@ async function handleQueuedSignals(env) {
 // 主處理器
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function webhookResponse(result) {
+  return result instanceof Response ? result : json(result || { ok: true });
+}
+
 async function handleWebhook(request, env) {
   const db = env.DB;
   
@@ -2724,12 +4069,12 @@ async function handleWebhook(request, env) {
       await answerCb(cb.id);
       
       // 管理員 Callback
-      if (isAdmin(uid) && data.startsWith('a_') || data.startsWith('adm_')) {
-        return await handleAdminCallback(cid, uid, msgId, data, env);
+      if (isAdmin(uid) && (data.startsWith('a_') || data.startsWith('adm_'))) {
+        return webhookResponse(await handleAdminCallback(cid, uid, msgId, data, env));
       }
       
       // 用戶 Callback
-      return await handleUserCallback(cid, uid, msgId, data, env);
+      return webhookResponse(await handleUserCallback(cid, uid, msgId, data, env));
     }
     
     // 處理訊息
@@ -2754,12 +4099,12 @@ async function handleWebhook(request, env) {
       // 管理員指令
       if (isAdmin(uid)) {
         const adminResult = await handleAdminCommand(cid, uid, cmd, args, fullText, env);
-        if (adminResult) return adminResult;
+        if (adminResult) return webhookResponse(adminResult);
       }
       
       // 用戶指令
       const userResult = await handleUserCommand(cid, uid, cmd, args, env);
-      if (userResult) return userResult;
+      if (userResult) return webhookResponse(userResult);
     }
     
     return json({ ok: true });
@@ -2777,6 +4122,25 @@ export default {
   async fetch(request, env, ctx) {
     loadRuntimeConfig(env);
     const url = new URL(request.url);
+
+    if (url.pathname === '/admin/logout') {
+      return unauthorizedAdminResponse('已登出');
+    }
+
+    if (url.pathname === '/admin' || url.pathname === '/admin/') {
+      const auth = requireAdminHttp(request, env);
+      if (auth) return auth;
+      return adminHtmlResponse(renderAdminPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+
+    if (url.pathname.startsWith('/api/admin/')) {
+      return handleAdminApi(request, env, url.pathname);
+    }
+
+    const tvMatch = url.pathname.match(/^\/(?:tv|tradingview|webhook\/tradingview)\/([A-Za-z0-9-]+)$/);
+    if (tvMatch && request.method === 'POST') {
+      return handleTradingViewWebhook(request, env, tvMatch[1], url);
+    }
     
     // 健康檢查
     if (url.pathname === '/' || url.pathname === '/health') {
