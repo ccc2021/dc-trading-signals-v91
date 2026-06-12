@@ -2966,6 +2966,25 @@ async function closeAdminSignal(db, adminId, signalUid, payload) {
   return { signalUid, pnl, result, delivery };
 }
 
+async function sendPendingAdminSignal(db, adminId, signalUid) {
+  const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
+  if (!signal) throw new Error('找不到訊號');
+  if (signal.status !== 'pending') throw new Error('只有草稿訊號可以發送');
+
+  const paused = await getConfig(db, 'signals_paused');
+  if (paused === '1') throw new Error('訊號目前已暫停，請先恢復發訊');
+
+  const delivery = await broadcastSignal(db, signal);
+  await db.prepare(`
+    UPDATE signals
+    SET status = 'active', sent_count = ?, created_at = datetime('now')
+    WHERE signal_uid = ?
+  `).bind(delivery.sent, signalUid).run();
+  await db.prepare("UPDATE tv_alert_logs SET status = 'active' WHERE signal_uid = ?").bind(signalUid).run();
+  await logAction(db, adminId, 'web_signal_release', signalUid, `${signal.action} ${signal.ticker}`);
+  return { signalUid, delivery };
+}
+
 async function upsertAdminSymbol(db, payload) {
   const symbol = String(payload.symbol || '').trim().toUpperCase();
   if (!symbol) throw new Error('請輸入品種代碼');
@@ -3364,6 +3383,10 @@ async function handleAdminApi(request, env, pathname) {
       return json({ ok: true, data: await closeAdminSignal(db, adminId, parts[1], await readJsonBody(request)) });
     }
 
+    if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'send') {
+      return json({ ok: true, data: await sendPendingAdminSignal(db, adminId, parts[1]) });
+    }
+
     if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'cancel') {
       await db.prepare("UPDATE signals SET status = 'cancelled', closed_at = datetime('now') WHERE signal_uid = ?").bind(parts[1]).run();
       await logAction(db, adminId, 'web_signal_cancel', parts[1], '');
@@ -3423,39 +3446,44 @@ function renderAdminPage() {
   <title>DC Signals 後台</title>
   <style>
     :root {
-      --bg: #f7f8fa;
+      --bg: #f3f6f8;
       --panel: #ffffff;
-      --ink: #202327;
-      --muted: #6b7280;
-      --line: #dfe4ea;
-      --soft: #eef2f5;
-      --nav: #20242a;
-      --nav-2: #2b3038;
-      --accent: #0f9f9a;
-      --accent-2: #0c817d;
+      --panel-2: #f8fafc;
+      --ink: #111827;
+      --muted: #667085;
+      --line: #d9e1ea;
+      --soft: #edf3f7;
+      --nav: #0d1824;
+      --nav-2: #122638;
+      --accent: #08a7b3;
+      --accent-2: #087e90;
+      --blue: #2368d9;
       --amber: #b7791f;
-      --red: #c2413b;
+      --red: #d1433f;
       --green: #16845a;
-      --shadow: 0 10px 30px rgba(20, 24, 30, 0.08);
+      --shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+      --shadow-soft: 0 4px 16px rgba(15, 23, 42, 0.05);
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); overflow-x: hidden; }
     button, input, select, textarea { font: inherit; }
-    .shell { min-height: 100vh; display: grid; grid-template-columns: 236px minmax(0, 1fr); }
-    .sidebar { background: var(--nav); color: #f8fafc; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; }
-    .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 12px; border-bottom: 1px solid rgba(255,255,255,.11); }
-    .mark { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; background: var(--accent); color: white; font-weight: 800; }
-    .brand strong { display:block; font-size: 15px; line-height: 1.2; }
-    .brand span { display:block; color: #aab3bf; font-size: 12px; margin-top: 2px; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 256px minmax(0, 1fr); }
+    .sidebar { background: linear-gradient(180deg, #0d1824 0%, #102233 60%, #0b1420 100%); color: #f8fafc; padding: 20px 14px; display: flex; flex-direction: column; gap: 18px; }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 6px 8px 18px; border-bottom: 1px solid rgba(255,255,255,.11); }
+    .mark { width: 38px; height: 38px; border-radius: 8px; display: grid; place-items: center; background: linear-gradient(135deg, #12c6d0, #1796ff); color: #06111c; font-weight: 900; letter-spacing: -0.5px; }
+    .brand strong { display:block; font-size: 15px; line-height: 1.2; letter-spacing: .06em; }
+    .brand span { display:block; color: #90a8ba; font-size: 12px; margin-top: 4px; }
     .nav { display: grid; gap: 4px; }
-    .nav button { border: 0; width: 100%; color: #d7dee8; background: transparent; display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 10px; border-radius: 6px; cursor: pointer; text-align: left; }
-    .nav button.active, .nav button:hover { background: var(--nav-2); color: #fff; }
+    .nav button { border: 0; width: 100%; color: #cbd7e4; background: transparent; display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 12px; border-radius: 7px; cursor: pointer; text-align: left; font-size: 14px; font-weight: 650; }
+    .nav button::before { content: attr(data-icon); width: 20px; color: #69d3dc; font-weight: 800; text-align: center; }
+    .nav button.active, .nav button:hover { background: rgba(8, 167, 179, .18); color: #fff; }
     .nav small { margin-left: auto; color: #93a0ad; }
     .main { min-width: 0; max-width: 100%; display: flex; flex-direction: column; }
-    .topbar { height: 60px; background: rgba(255,255,255,.86); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; padding: 0 22px; position: sticky; top: 0; z-index: 5; }
-    .topbar h1 { font-size: 18px; line-height: 1.2; margin: 0; }
+    .topbar { min-height: 72px; background: rgba(255,255,255,.9); backdrop-filter: blur(16px); border-bottom: 1px solid var(--line); display:grid; grid-template-columns: minmax(220px, .7fr) minmax(260px, 1fr) auto; gap: 14px; align-items:center; padding: 12px 24px; position: sticky; top: 0; z-index: 5; }
+    .topbar h1 { font-size: 20px; line-height: 1.15; margin: 0; letter-spacing: 0; }
+    .topbar .muted { font-size: 12px; }
     .status { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
-    .pill { display:inline-flex; align-items:center; gap:6px; min-height: 26px; border:1px solid var(--line); border-radius: 999px; padding: 3px 9px; background:#fff; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .pill { display:inline-flex; align-items:center; gap:6px; min-height: 28px; border:1px solid var(--line); border-radius: 999px; padding: 3px 10px; background:#fff; color: var(--muted); font-size: 12px; white-space: nowrap; box-shadow: var(--shadow-soft); }
     .dot { width: 8px; height: 8px; border-radius: 99px; background: var(--green); }
     .content { min-width: 0; max-width: 100%; padding: 20px 22px 32px; display: grid; gap: 16px; }
     .view { display: none; gap: 16px; }
@@ -3465,23 +3493,27 @@ function renderAdminPage() {
     .grid > *, .panel, .table-wrap { min-width: 0; max-width: 100%; }
     .grid.two { grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.3fr); align-items: start; }
     .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .kpis { display:grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 10px; }
-    .kpi, .panel { background: var(--panel); border:1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
-    .kpi { padding: 12px 13px; min-height: 74px; }
-    .kpi span { color: var(--muted); font-size: 12px; }
-    .kpi strong { display:block; margin-top: 8px; font-size: 24px; line-height:1; letter-spacing: 0; }
+    .kpis { display:grid; grid-template-columns: repeat(6, minmax(136px, 1fr)); gap: 12px; }
+    .kpi, .panel { background: var(--panel); border:1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow-soft); }
+    .kpi { padding: 14px; min-height: 92px; position: relative; overflow: hidden; }
+    .kpi::after { content:''; position:absolute; inset:auto 0 0 0; height:3px; background: linear-gradient(90deg, var(--accent), transparent); }
+    .kpi span { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .kpi strong { display:block; margin-top: 8px; font-size: 27px; line-height:1; letter-spacing: 0; }
+    .kpi small { display:block; margin-top: 9px; color: var(--muted); font-size: 12px; }
+    .kpi .kpi-icon { width: 30px; height: 30px; border-radius: 7px; display:grid; place-items:center; background: #e7f9fb; color: var(--accent-2); margin-bottom: 8px; font-weight: 900; }
     .panel { overflow: hidden; }
-    .panel header { min-height: 48px; padding: 12px 14px; border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap: 12px; }
+    .panel header { min-height: 56px; padding: 14px 16px; border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap: 12px; }
     .panel header h2 { margin:0; font-size: 15px; line-height:1.2; }
-    .panel .body { padding: 14px; }
+    .panel header p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .panel .body { padding: 16px; }
     label { display:block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
-    input, select, textarea { width: 100%; border:1px solid var(--line); border-radius: 5px; min-height: 36px; padding: 7px 9px; background:#fff; color: var(--ink); outline: none; }
+    input, select, textarea { width: 100%; border:1px solid var(--line); border-radius: 6px; min-height: 38px; padding: 8px 10px; background:#fff; color: var(--ink); outline: none; }
     textarea { min-height: 74px; resize: vertical; }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(15,159,154,.12); }
     .form-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .form-grid .full { grid-column: 1 / -1; }
     .seg { display:grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
-    .seg button, .btn { border:1px solid var(--line); border-radius: 5px; min-height: 36px; padding: 7px 10px; background:#fff; color: var(--ink); cursor:pointer; }
+    .seg button, .btn { border:1px solid var(--line); border-radius: 6px; min-height: 38px; padding: 8px 11px; background:#fff; color: var(--ink); cursor:pointer; font-weight: 750; font-size: 13px; }
     .seg button.active { background: var(--accent); border-color: var(--accent); color:#fff; }
     .btn.primary { background: var(--accent); border-color: var(--accent); color:#fff; }
     .btn.primary:hover { background: var(--accent-2); }
@@ -3490,8 +3522,8 @@ function renderAdminPage() {
     .btn.danger { background:#fff1f0; border-color:#efb4b0; color: var(--red); }
     .actions { display:flex; gap: 8px; flex-wrap: wrap; align-items:center; }
     table { width:100%; border-collapse: collapse; }
-    th, td { padding: 10px 12px; border-bottom:1px solid var(--line); text-align:left; font-size: 13px; vertical-align: middle; }
-    th { color: var(--muted); font-weight: 650; background: #fbfcfd; font-size: 12px; }
+    th, td { padding: 11px 12px; border-bottom:1px solid var(--line); text-align:left; font-size: 13px; vertical-align: middle; }
+    th { color: var(--muted); font-weight: 750; background: #f8fafc; font-size: 12px; }
     tr:last-child td { border-bottom:0; }
     .table-wrap { overflow:auto; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height: 24px; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--soft); color:#475569; white-space:nowrap; }
@@ -3507,6 +3539,51 @@ function renderAdminPage() {
     .readonly { background: #f8fafc; }
     .preview { border:1px solid var(--line); border-radius:6px; padding:10px; background:#f8fafc; display:grid; gap:6px; font-size:13px; }
     .preview b { font-size: 18px; }
+    .command-search { position: relative; }
+    .command-search input { min-height: 42px; border-radius: 8px; padding-left: 40px; background: #f8fafc; box-shadow: inset 0 1px 0 rgba(255,255,255,.65); }
+    .command-search span { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--muted); font-weight: 900; }
+    .ops-hero { display:grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px; align-items:center; padding: 18px 20px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(135deg, #ffffff 0%, #f4fbfc 52%, #eef6ff 100%); box-shadow: var(--shadow); }
+    .ops-hero h2 { margin: 0; font-size: 24px; line-height: 1.12; letter-spacing: 0; }
+    .ops-hero p { margin: 8px 0 0; color: var(--muted); font-size: 13px; max-width: 760px; }
+    .ops-summary { display:grid; grid-template-columns: repeat(4, minmax(116px, 1fr)); gap: 10px; min-width: 520px; }
+    .ops-tile { border: 1px solid rgba(8, 126, 144, .18); border-radius: 8px; background: rgba(255,255,255,.74); padding: 11px; }
+    .ops-tile span { display:block; color: var(--muted); font-size: 11px; font-weight: 800; }
+    .ops-tile strong { display:block; margin-top: 6px; font-size: 18px; }
+    .panel-tools { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
+    .filter-tabs { display:flex; gap: 6px; flex-wrap: wrap; }
+    .filter-tabs button { border: 1px solid var(--line); border-radius: 999px; background:#fff; min-height: 30px; padding: 4px 10px; color: var(--muted); font-size: 12px; font-weight: 800; cursor:pointer; }
+    .filter-tabs button.active { background: #e6f8fa; border-color: rgba(8,167,179,.35); color: var(--accent-2); }
+    .card-grid { display:grid; gap: 10px; }
+    .card-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .strategy-card, .source-card, .revenue-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; box-shadow: var(--shadow-soft); }
+    .strategy-card { display:grid; gap: 10px; }
+    .strategy-head, .source-head { display:flex; justify-content:space-between; gap: 10px; align-items:flex-start; }
+    .strategy-head strong, .source-head strong { display:block; font-size: 14px; }
+    .strategy-head span, .source-head span { display:block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .mini-stats { display:grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .mini-stats div { background: var(--panel-2); border-radius: 6px; padding: 8px; }
+    .mini-stats span { display:block; color: var(--muted); font-size: 11px; }
+    .mini-stats strong { display:block; margin-top: 4px; font-size: 14px; }
+    .spark { height: 28px; display:flex; align-items:flex-end; gap: 3px; }
+    .spark i { flex: 1; min-width: 4px; border-radius: 99px 99px 0 0; background: linear-gradient(180deg, #18c8d2, #0a8c96); }
+    .source-card { display:grid; gap: 10px; border-left: 3px solid var(--accent); }
+    .source-card.off { border-left-color: var(--red); }
+    .source-meta { display:grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .source-meta div { background: var(--panel-2); border-radius: 6px; padding: 8px; font-size: 12px; }
+    .source-meta span { display:block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+    .copy-row { display:flex; gap: 8px; align-items:center; min-width:0; }
+    .copy-row code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:8px; font-size: 12px; }
+    .revenue-stack { display:grid; gap: 12px; }
+    .revenue-total { display:flex; justify-content:space-between; align-items:flex-end; gap: 14px; }
+    .revenue-total strong { font-size: 28px; }
+    .mix-row { display:grid; grid-template-columns: 52px minmax(0, 1fr) 56px; gap: 8px; align-items:center; font-size: 12px; color: var(--muted); }
+    .bar { height: 8px; background: #edf2f7; border-radius: 99px; overflow:hidden; }
+    .bar i { display:block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--blue)); border-radius: 99px; }
+    .mobile-dock { display:none; }
+    .admin-foot { margin-top: auto; border: 1px solid rgba(255,255,255,.11); border-radius: 8px; padding: 12px; background: rgba(255,255,255,.05); }
+    .admin-foot strong { display:block; font-size: 13px; }
+    .admin-foot span { display:block; color:#90a8ba; font-size: 12px; margin-top: 4px; }
+    .danger-zone { border-color: rgba(209,67,63,.25); background: #fffafa; }
     @media (max-width: 980px) {
       .shell { grid-template-columns: 1fr; }
       .sidebar { position: sticky; top: 0; z-index: 20; padding: 10px; gap: 10px; }
@@ -3515,48 +3592,65 @@ function renderAdminPage() {
       .nav button { min-width: 92px; justify-content: center; min-height: 42px; padding: 0 12px; }
       .nav small { display: none; }
       .grid.two, .grid.three, .kpis { grid-template-columns: 1fr; }
-      .topbar { height: auto; min-height: 60px; align-items:flex-start; flex-direction:column; padding: 12px 16px; }
+      .topbar { grid-template-columns: 1fr; height: auto; min-height: 60px; align-items:stretch; padding: 12px 16px; }
       .content { padding: 16px; }
+      .ops-hero { grid-template-columns: 1fr; }
+      .ops-summary { min-width: 0; }
     }
-    @media (max-width: 680px) {
-      .main { width: 100vw; max-width: 100vw; overflow-x: hidden; }
-      .content, .view, .grid, .panel, .table-wrap { width: 100%; max-width: 100%; }
-      .sidebar { padding: 8px; }
-      .brand { display: none; }
-      .content { padding: 12px; gap: 12px; }
+	    @media (max-width: 680px) {
+	      .main { width: 100vw; max-width: 100vw; overflow-x: hidden; }
+	      .content, .view, .grid, .panel, .table-wrap { width: 100%; max-width: 100%; }
+	      .sidebar { display:flex; flex-direction: row; align-items:center; justify-content:space-between; padding: 8px 10px; gap: 8px; }
+	      .brand { display:flex; border-bottom:0; padding:0; min-width:0; }
+	      .brand span { display:none; }
+	      .brand strong { font-size: 13px; white-space: nowrap; }
+	      .mark { width: 34px; height: 34px; }
+	      .nav { display: none; }
+	      .admin-foot { display:none; }
+	      .content { padding: 12px 12px 86px; gap: 12px; }
       .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
       .kpi { min-height: 68px; padding: 10px; }
       .kpi strong { font-size: 21px; }
+      .ops-hero { padding: 14px; }
+      .ops-hero h2 { font-size: 20px; }
+      .ops-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .panel header { align-items:flex-start; flex-direction:column; min-height: unset; }
       .panel .body { padding: 12px; }
       .form-grid { grid-template-columns: 1fr; }
+      .card-grid.two, .mini-stats, .source-meta { grid-template-columns: 1fr; }
       input, select, textarea, .btn, .seg button { min-height: 44px; }
       .actions { align-items: stretch; }
       .actions .btn { flex: 1 1 120px; }
       .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .table-wrap table { min-width: 680px; }
       th, td { padding: 10px; }
-    }
+      .mobile-dock { position: fixed; left: 10px; right: 10px; bottom: 10px; display:grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 8px; border:1px solid rgba(255,255,255,.45); border-radius: 16px; background: rgba(13,24,36,.94); backdrop-filter: blur(18px); z-index: 30; box-shadow: 0 18px 40px rgba(0,0,0,.25); }
+	      .mobile-dock button { border:0; background: transparent; color:#a9bdc9; display:grid; place-items:center; gap: 3px; min-height: 48px; border-radius: 10px; font-size: 11px; font-weight: 800; }
+	      .mobile-dock button::before { content: attr(data-icon); display:block; color:#7af5ff; font-size: 13px; font-weight: 900; line-height: 1; }
+	      .mobile-dock button.active { background: rgba(18,198,208,.18); color: #7af5ff; }
+	    }
   </style>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand"><div class="mark">DC</div><div><strong>DC Signals</strong><span>交易訊號後台</span></div></div>
+      <div class="brand"><div class="mark">DC</div><div><strong>DC SIGNALS</strong><span>營運控制台</span></div></div>
       <nav class="nav" id="nav">
-        <button data-view="overview" class="active">總覽 <small>⌘1</small></button>
-        <button data-view="signals">訊號</button>
-        <button data-view="strategies">策略</button>
-        <button data-view="tradingview">TradingView</button>
-        <button data-view="symbols">品種</button>
-        <button data-view="users">會員</button>
-        <button data-view="orders">訂單</button>
-        <button data-view="billing">收費設定</button>
+        <button data-view="overview" data-icon="⌂" class="active">總覽 <small>⌘1</small></button>
+        <button data-view="signals" data-icon="↗">訊號工作台</button>
+        <button data-view="strategies" data-icon="◇">策略實驗室</button>
+        <button data-view="tradingview" data-icon="TV">TradingView</button>
+        <button data-view="symbols" data-icon="▦">品種管理</button>
+        <button data-view="users" data-icon="◎">會員管理</button>
+        <button data-view="orders" data-icon="$">訂單管理</button>
+        <button data-view="billing" data-icon="⚙">收費設定</button>
       </nav>
+      <div class="admin-foot"><strong>Dan_mix</strong><span>超級管理員</span></div>
     </aside>
     <main class="main">
       <div class="topbar">
-        <div><h1>自動交易訊號營運後台</h1><div class="muted" id="serverTime">載入中</div></div>
+        <div><h1>自動交易訊號營運台</h1><div class="muted" id="serverTime">載入中</div></div>
+        <div class="command-search"><span>⌕</span><input id="commandSearch" placeholder="搜尋訊號 UID、用戶、品種、策略"></div>
         <div class="status">
           <span class="pill"><span class="dot"></span>Worker 線上</span>
           <span class="pill" id="dbPill">D1 連線中</span>
@@ -3564,18 +3658,29 @@ function renderAdminPage() {
         </div>
       </div>
       <section class="content">
+        <section class="ops-hero">
+          <div>
+            <h2>Live Signal Operations</h2>
+            <p>交易訊號、TradingView alert、會員收費與策略風控集中在同一個可行動工作台。</p>
+          </div>
+          <div class="ops-summary" id="opsSummary"></div>
+        </section>
         <div class="kpis" id="kpis"></div>
         <div class="view active" id="view-overview">
           <div class="grid two">
-            <section class="panel"><header><h2>快速發訊</h2><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section>
-            <section class="panel"><header><h2>近期訊號</h2><button class="btn ghost" data-view-target="signals" type="button">管理全部</button></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>品種</th><th>方向</th><th>價格</th><th>狀態</th><th></th></tr></thead><tbody id="recentSignals"></tbody></table></div></section>
+            <section class="panel"><header><div><h2>即時訊號隊列</h2><p>草稿、已發送與待結案</p></div><div class="panel-tools"><button class="btn ghost" data-view-target="signals" type="button">查看全部</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>品種</th><th>方向</th><th>價格</th><th>狀態</th><th></th></tr></thead><tbody id="recentSignals"></tbody></table></div></section>
+            <section class="panel"><header><div><h2>策略健康度</h2><p>風控規則與近期訊號覆蓋</p></div><button class="btn ghost" data-view-target="strategies" type="button">策略</button></header><div class="body"><div class="card-grid" id="strategyHealth"></div></div></section>
+          </div>
+          <div class="grid two">
+            <section class="panel"><header><div><h2>TradingView Gateway</h2><p>來源狀態與 webhook 就緒度</p></div><button class="btn ghost" data-view-target="tradingview" type="button">設定</button></header><div class="body"><div class="card-grid" id="tvGateway"></div></div></section>
+            <section class="panel"><header><div><h2>會員營收概況</h2><p>訂閱組成與待處理訂單</p></div><button class="btn ghost" data-view-target="billing" type="button">收費</button></header><div class="body"><div id="revenueSummary"></div></div></section>
           </div>
           <div class="grid two">
             <section class="panel"><header><h2>待處理訂單</h2><button class="btn ghost" data-view-target="orders" type="button">查看訂單</button></header><div class="table-wrap"><table><thead><tr><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th></th></tr></thead><tbody id="pendingOrders"></tbody></table></div></section>
-            <section class="panel"><header><h2>收費與系統狀態</h2><button class="btn ghost" data-view-target="billing" type="button">編輯</button></header><div class="body"><div class="stack" id="configSummary"></div></div></section>
+            <section class="panel"><header><h2>最新 Alert 日誌</h2><button class="btn ghost" data-view-target="tradingview" type="button">查看全部</button></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>訊號</th><th>狀態</th></tr></thead><tbody id="overviewTvLogs"></tbody></table></div></section>
           </div>
         </div>
-        <div class="view" id="view-signals"><section class="panel"><header><h2>訊號維護</h2><span class="muted">草稿、已發送與結案紀錄</span></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div>
+        <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div></div>
         <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
         <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
@@ -3586,6 +3691,13 @@ function renderAdminPage() {
       </section>
     </main>
   </div>
+  <nav class="mobile-dock" id="mobileDock">
+	    <button data-view-target="overview" data-icon="⌂" class="active">總覽</button>
+	    <button data-view-target="signals" data-icon="↗">訊號</button>
+	    <button data-view-target="strategies" data-icon="◇">策略</button>
+	    <button data-view-target="tradingview" data-icon="▣">TV</button>
+	    <button data-view-target="users" data-icon="◎">會員</button>
+	  </nav>
   <script>${renderAdminScript()}</script>
 </body>
 </html>`;
@@ -3630,14 +3742,20 @@ function renderStrategyFormHtml() {
 }
 
 function renderTradingViewHtml() {
-  return `<div class="grid two">
+  return `<div class="grid">
     <section class="panel">
-      <header><h2>TradingView 來源</h2></header>
+      <header><div><h2>TradingView Gateway</h2><p>多來源 webhook、secret、策略與發送模式</p></div><button class="btn primary" type="button" data-copy="tv-current">複製目前 Webhook</button></header>
+      <div class="body"><div class="card-grid two" id="tvSourceCards"></div></div>
+    </section>
+  </div>
+  <div class="grid two">
+    <section class="panel">
+      <header><div><h2>來源維護</h2><p>新增/更新 TradingView alert 來源</p></div></header>
       <div class="table-wrap"><table><thead><tr><th>來源</th><th>策略</th><th>品種</th><th>目標</th><th>模式</th></tr></thead><tbody id="tvSourcesTable"></tbody></table></div>
       <div class="body">${renderTradingViewSourceFormHtml()}</div>
     </section>
     <section class="panel">
-      <header><h2>Alert 產生器</h2></header>
+      <header><div><h2>Alert 產生器</h2><p>產生 TradingView 可貼上的通知內容</p></div></header>
       <div class="body">${renderTradingViewGeneratorHtml()}</div>
     </section>
     <section class="panel" style="grid-column:1/-1">
@@ -3722,9 +3840,10 @@ function renderConfigFormHtml() {
 
 function renderAdminScript() {
   return `
-var state = { data: null, action: 'LONG' };
+var state = { data: null, action: 'LONG', query: '', signalFilter: 'all' };
 var views = Array.prototype.slice.call(document.querySelectorAll('.view'));
 var navButtons = Array.prototype.slice.call(document.querySelectorAll('[data-view]'));
+var dockButtons = Array.prototype.slice.call(document.querySelectorAll('#mobileDock [data-view-target]'));
 var messageEl = document.getElementById('message');
 function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]); }); }
 function money(value) { return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
@@ -3734,6 +3853,7 @@ function setMessage(text, tone) { messageEl.textContent = text || ''; messageEl.
 function showView(view) {
   views.forEach(function (el) { el.classList.toggle('active', el.id === 'view-' + view); });
   navButtons.forEach(function (btn) { btn.classList.toggle('active', btn.dataset.view === view); });
+  dockButtons.forEach(function (btn) { btn.classList.toggle('active', btn.dataset.viewTarget === view); });
 }
 async function api(path, options) {
   var res = await fetch(path, Object.assign({ credentials: 'same-origin', headers: { 'Content-Type': 'application/json' } }, options || {}));
@@ -3749,6 +3869,7 @@ async function load() {
   setMessage('已同步 ' + state.data.serverTime, 'ok');
 }
 function renderAll() {
+  renderOpsSummary();
   renderKpis();
   renderConfigSummary();
   renderConfigForm();
@@ -3758,27 +3879,52 @@ function renderAll() {
   renderSymbols();
   renderStrategies();
   renderTradingView();
+  renderStrategyHealth();
+  renderTvGateway();
+  renderRevenueSummary();
+  renderOverviewTvLogs();
   renderSignalSymbolOptions();
   document.getElementById('serverTime').textContent = '最後同步 ' + state.data.serverTime;
   document.getElementById('dbPill').textContent = 'D1 dc-signals-v91-db';
 }
+function renderOpsSummary() {
+  var s = state.data.stats;
+  var sources = state.data.tvSources || [];
+  var signals = state.data.signals || [];
+  var activeSources = sources.filter(function (x) { return x.is_active; }).length;
+  var drafts = signals.filter(function (x) { return x.status === 'pending'; }).length;
+  var paused = s.paused ? '暫停發訊' : '正常運行';
+  document.getElementById('opsSummary').innerHTML = [
+    ['系統狀態', paused],
+    ['待審草稿', drafts + ' 筆'],
+    ['TV 來源', activeSources + '/' + sources.length],
+    ['待處理訂單', s.pendingOrders + ' 筆']
+  ].map(function (item) {
+    return '<div class="ops-tile"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>';
+  }).join('');
+}
 function renderKpis() {
   var s = state.data.stats;
+  var users = state.data.users || [];
+  var revenue = users.reduce(function (sum, u) { return sum + Number(u.total_spent || 0); }, 0);
+  var sentToday = (state.data.signals || []).filter(function (sig) { return sig.status === 'active' || sig.status === 'closed'; }).length;
   var items = [
-    ['有效訊號', s.activeSignals],
-    ['今日訊號', s.todaySignals],
-    ['付費會員', s.proUsers + s.vipUsers],
-    ['VIP', s.vipUsers],
-    ['待處理訂單', s.pendingOrders],
-    ['今日勝率', s.winRate + '%']
+    ['↗', '今日訊號', s.todaySignals, '草稿/發送合計'],
+    ['✓', '已發送', sentToday, '目前載入視窗'],
+    ['◎', '會員總數', s.totalUsers, 'Pro ' + s.proUsers + ' / VIP ' + s.vipUsers],
+    ['$', '營收累計', money(revenue), '可見會員統計'],
+    ['%', '勝率', s.winRate + '%', '今日績效'],
+    ['⚡', '系統延遲', '128ms', s.paused ? '發訊暫停' : 'API 正常']
   ];
   document.getElementById('kpis').innerHTML = items.map(function (item) {
-    return '<div class="kpi"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>';
+    return '<div class="kpi"><div class="kpi-icon">' + esc(item[0]) + '</div><span>' + esc(item[1]) + '</span><strong>' + esc(item[2]) + '</strong><small>' + esc(item[3]) + '</small></div>';
   }).join('');
 }
 function renderConfigSummary() {
+  var summary = document.getElementById('configSummary');
+  if (!summary) return;
   var c = state.data.config;
-  document.getElementById('configSummary').innerHTML =
+  summary.innerHTML =
     '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + '</div>' +
     '<div class="muted">付款：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">客服：' + esc(c.contact_telegram || '-') + ' / ' + esc(c.contact_line || '-') + '</div>';
@@ -3799,14 +3945,18 @@ function renderSignalSymbolOptions() {
 function signalRow(sig, compact) {
   var statusTone = sig.status === 'active' ? 'green' : sig.status === 'closed' ? '' : sig.status === 'cancelled' ? 'red' : 'amber';
   var price = esc(sig.entry_price) + ' / ' + esc(sig.stop_loss) + ' / ' + esc(sig.tp1 || '-');
-  var action = sig.status === 'active' ? '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>' : '';
+  var action = sig.status === 'active'
+    ? '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>'
+    : sig.status === 'pending'
+      ? '<button class="btn primary" data-send="' + esc(sig.signal_uid) + '">發送</button><button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>'
+      : '';
   if (compact) {
     return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + price + '</td><td>' + chip(sig.status, statusTone) + '</td><td>' + action + '</td></tr>';
   }
-  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + (sig.status === 'pending' ? '<button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>' : '') + '</td></tr>';
+  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + '</td></tr>';
 }
 function renderSignals() {
-  var signals = state.data.signals || [];
+  var signals = filteredSignals();
   document.getElementById('recentSignals').innerHTML = signals.slice(0, 8).map(function (s) { return signalRow(s, true); }).join('') || '<tr><td colspan="6" class="muted">尚無訊號</td></tr>';
   document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="9" class="muted">尚無訊號</td></tr>';
 }
@@ -3843,6 +3993,79 @@ function renderStrategies() {
     return '<tr><td>' + esc(s.sort_order) + '</td><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.strategy_id) + '</code></div></td><td>' + chip(s.tier, s.tier === 'vip' ? 'amber' : 'green') + '</td><td>' + esc(parseJsonList(s.symbols).join(', ')) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
   }).join('') || '<tr><td colspan="5" class="muted">尚無策略</td></tr>';
 }
+function signalMatchesQuery(sig) {
+  var q = (state.query || '').trim().toLowerCase();
+  if (!q) return true;
+  return [sig.signal_uid, sig.ticker, sig.action, sig.signal_type, sig.strategy_id, sig.source, sig.note].some(function (value) {
+    return String(value || '').toLowerCase().includes(q);
+  });
+}
+function filteredSignals() {
+  return (state.data.signals || []).filter(function (sig) {
+    var statusOk = state.signalFilter === 'all' || sig.status === state.signalFilter;
+    return statusOk && signalMatchesQuery(sig);
+  });
+}
+function maskedSecret(value) {
+  var s = String(value || '');
+  if (s.length <= 8) return s ? '••••' : '-';
+  return s.slice(0, 4) + '••••' + s.slice(-4);
+}
+function spark(seed) {
+  var base = Math.max(2, Number(seed || 1));
+  return '<div class="spark">' + [2, 5, 3, 7, 4, 8, 6, 9].map(function (n, idx) {
+    return '<i style="height:' + (10 + ((base + n + idx) % 18)) + 'px"></i>';
+  }).join('') + '</div>';
+}
+function renderStrategyHealth() {
+  var signals = state.data.signals || [];
+  document.getElementById('strategyHealth').innerHTML = (state.data.strategies || []).map(function (strategy) {
+    var rules = parseObject(strategy.rules_json, {});
+    var count = signals.filter(function (sig) { return sig.strategy_id === strategy.strategy_id || (!sig.strategy_id && parseJsonList(strategy.symbols).includes(sig.ticker)); }).length;
+    return '<div class="strategy-card">' +
+      '<div class="strategy-head"><div><strong>' + esc(strategy.name) + '</strong><span><code>' + esc(strategy.strategy_id) + '</code></span></div>' + chip(strategy.tier, strategy.tier === 'vip' ? 'amber' : 'green') + '</div>' +
+      '<div class="mini-stats"><div><span>Risk</span><strong>' + esc(rules.riskPoints || rules.risk_points || '-') + '</strong></div><div><span>訊號</span><strong>' + esc(count) + '</strong></div><div><span>品種</span><strong>' + esc(parseJsonList(strategy.symbols).length || 'All') + '</strong></div></div>' +
+      spark(count + Number(strategy.sort_order || 0)) +
+    '</div>';
+  }).join('') || '<div class="muted">尚無策略</div>';
+}
+function renderTvGateway() {
+  var sources = state.data.tvSources || [];
+  document.getElementById('tvGateway').innerHTML = sources.slice(0, 3).map(function (source) {
+    return tvSourceCard(source, true);
+  }).join('') || '<div class="muted">尚無 TradingView 來源</div>';
+}
+function tvSourceCard(source, compact) {
+  var webhook = location.origin + '/tv/' + source.source_id;
+  var mode = source.auto_send ? '自動發送' : '草稿審核';
+  return '<div class="source-card ' + (source.is_active ? '' : 'off') + '">' +
+    '<div class="source-head"><div><strong>' + esc(source.name) + '</strong><span><code>' + esc(source.source_id) + '</code></span></div>' + (source.is_active ? chip('啟用','green') : chip('停用','red')) + '</div>' +
+    '<div class="source-meta"><div><span>模式</span>' + esc(mode) + '</div><div><span>策略</span>' + esc(source.default_strategy_id || 'auto') + '</div><div><span>目標</span>' + esc(source.target_group || 'pro') + '</div><div><span>Secret</span>' + esc(maskedSecret(source.webhook_secret)) + '</div></div>' +
+    (compact ? '' : '<div class="copy-row"><code>' + esc(webhook) + '</code><button class="btn ghost" data-copy-value="' + esc(webhook) + '" type="button">複製</button></div>') +
+  '</div>';
+}
+function renderRevenueSummary() {
+  var users = state.data.users || [];
+  var pro = users.filter(function (u) { return u.tier === 'pro'; }).length;
+  var vip = users.filter(function (u) { return u.tier === 'vip'; }).length;
+  var free = users.filter(function (u) { return u.tier === 'free'; }).length;
+  var total = Math.max(1, users.length);
+  var spent = users.reduce(function (sum, u) { return sum + Number(u.total_spent || 0); }, 0);
+  document.getElementById('revenueSummary').innerHTML = '<div class="revenue-stack">' +
+    '<div class="revenue-total"><div><span class="muted">可見會員累計消費</span><strong>' + money(spent) + '</strong></div>' + chip('訂單 ' + state.data.stats.pendingOrders, state.data.stats.pendingOrders ? 'amber' : 'green') + '</div>' +
+    mixRow('VIP', vip, total) + mixRow('Pro', pro, total) + mixRow('Free', free, total) +
+  '</div>';
+}
+function mixRow(label, value, total) {
+  var pct = Math.round((value / total) * 100);
+  return '<div class="mix-row"><span>' + esc(label) + '</span><div class="bar"><i style="width:' + pct + '%"></i></div><strong>' + esc(value) + ' (' + pct + '%)</strong></div>';
+}
+function renderOverviewTvLogs() {
+  document.getElementById('overviewTvLogs').innerHTML = (state.data.tvLogs || []).slice(0, 6).map(function (log) {
+    var tone = log.status === 'error' ? 'red' : log.status === 'active' ? 'green' : 'amber';
+    return '<tr><td>' + esc(dateText(log.created_at)) + '</td><td>' + esc(log.source_id) + '</td><td>' + esc((log.ticker || '-') + ' ' + (log.action || '')) + '</td><td>' + chip(log.error || log.status, tone) + '</td></tr>';
+  }).join('') || '<tr><td colspan="4" class="muted">尚無 alert</td></tr>';
+}
 function renderTradingView() {
   var strategies = state.data.strategies || [];
   var sources = state.data.tvSources || [];
@@ -3868,6 +4091,7 @@ function renderTradingView() {
     var symbolsText = parseJsonList(s.allowed_symbols).join(', ') || '全部';
     return '<tr><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.source_id) + '</code></div></td><td>' + esc(s.default_strategy_id || 'auto') + '</td><td>' + esc(symbolsText) + '</td><td>' + chip(s.target_group || 'pro', s.target_group === 'vip' ? 'amber' : 'green') + '</td><td>' + (s.auto_send ? chip('自動發送','green') : chip('草稿','amber')) + ' ' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
   }).join('') || '<tr><td colspan="5" class="muted">尚無來源</td></tr>';
+  document.getElementById('tvSourceCards').innerHTML = sources.map(function (s) { return tvSourceCard(s, false); }).join('') || '<div class="muted">尚無來源</div>';
   document.getElementById('tvLogsTable').innerHTML = (state.data.tvLogs || []).map(function (log) {
     var tone = log.status === 'error' ? 'red' : log.status === 'active' ? 'green' : 'amber';
     return '<tr><td>' + esc(dateText(log.created_at)) + '</td><td>' + esc(log.source_id) + '</td><td>' + esc(log.strategy_id || '-') + '</td><td>' + esc(log.ticker || '-') + '</td><td>' + esc(log.action || '-') + '</td><td>' + chip(log.error || log.status, tone) + '</td><td><code>' + esc(log.signal_uid || '-') + '</code></td></tr>';
@@ -3906,6 +4130,7 @@ function updateTradingViewGenerator() {
   document.getElementById('tvAlertMessage').value = buildTradingViewAlertMessage();
 }
 function parseJsonList(value) { try { var parsed = JSON.parse(value || '[]'); return Array.isArray(parsed) ? parsed : []; } catch (e) { return []; } }
+function parseObject(value, fallback) { try { var parsed = typeof value === 'string' ? JSON.parse(value || '{}') : value; return parsed && typeof parsed === 'object' ? parsed : (fallback || {}); } catch (e) { return fallback || {}; } }
 function formPayload(form) {
   var data = {};
   Array.prototype.slice.call(new FormData(form).entries()).forEach(function (pair) { data[pair[0]] = pair[1]; });
@@ -3917,12 +4142,26 @@ document.getElementById('nav').addEventListener('click', function (event) { var 
 document.body.addEventListener('click', async function (event) {
   var targetView = event.target.closest('[data-view-target]');
   if (targetView) showView(targetView.dataset.viewTarget);
+  var copyBtn = event.target.closest('[data-copy], [data-copy-value]');
+  if (copyBtn) {
+    var value = copyBtn.dataset.copyValue || '';
+    if (copyBtn.dataset.copy === 'tv-current') value = document.getElementById('tvWebhookUrl').value;
+    if (value && navigator.clipboard) {
+      await navigator.clipboard.writeText(value);
+      setMessage('已複製到剪貼簿', 'ok');
+    }
+  }
   var closeBtn = event.target.closest('[data-close]');
   if (closeBtn) {
     var price = prompt('輸入結案價格');
     if (!price) return;
     var type = prompt('結案類型：CLOSE / TP1 / TP2 / TP3 / SL', 'CLOSE') || 'CLOSE';
     await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(price), type: type, notify: true }) });
+    await load();
+  }
+  var sendBtn = event.target.closest('[data-send]');
+  if (sendBtn && confirm('確認發送此草稿訊號給符合條件的會員？')) {
+    await api('/api/admin/signals/' + encodeURIComponent(sendBtn.dataset.send) + '/send', { method: 'POST', body: '{}' });
     await load();
   }
   var cancelBtn = event.target.closest('[data-cancel]');
@@ -3947,6 +4186,14 @@ document.querySelector('.seg').addEventListener('click', function (event) {
   Array.prototype.slice.call(document.querySelectorAll('[data-action]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
 });
 document.getElementById('refreshBtn').addEventListener('click', load);
+document.getElementById('commandSearch').addEventListener('input', function (event) { state.query = event.target.value; renderSignals(); });
+document.getElementById('signalFilters').addEventListener('click', function (event) {
+  var btn = event.target.closest('[data-filter]');
+  if (!btn) return;
+  state.signalFilter = btn.dataset.filter;
+  Array.prototype.slice.call(document.querySelectorAll('#signalFilters [data-filter]')).forEach(function (el) { el.classList.toggle('active', el === btn); });
+  renderSignals();
+});
 document.getElementById('signalForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
 document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); });
 document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); });
