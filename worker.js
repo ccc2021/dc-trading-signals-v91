@@ -281,12 +281,11 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   const rr = risk > 0 ? (reward1 / risk).toFixed(1) : '0';
 
   const sideLabel = action === 'LONG' ? 'LONG 做多' : action === 'SHORT' ? 'SHORT 做空' : action;
-  const sideIcon = action === 'LONG' ? '🟢' : action === 'SHORT' ? '🔴' : '📊';
   const tierLine = signal.is_vip_only ? 'VIP 專屬' : (signal.target_group === 'vip' ? 'VIP' : signal.target_group === 'pro' ? 'Pro 以上' : '付費會員');
   const chartUrl = signalMediaUrl(signal);
   const origin = signal.strategy_id || signal.source || 'TradingView';
 
-  let msg = `${sideIcon} <b>${escHtml(sideLabel)} ${escHtml(ticker)}</b>\n`;
+  let msg = `<b>${escHtml(ticker)} ${escHtml(sideLabel)}</b>\n`;
   msg += `${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
 
   msg += `<b>進出場</b>\n`;
@@ -338,18 +337,18 @@ async function sendSignalTg(chatId, signal, message, kb = null) {
 
 function formatExitCard(type, ticker, price, pnl, note = '') {
   const icons = {
-    TP1: { icon: '✅', title: 'TP1 達成' },
-    TP2: { icon: '✅', title: 'TP2 達成' },
-    TP3: { icon: '✅', title: 'TP3 達成' },
-    SL: { icon: '🔴', title: '止損觸發' },
-    CLOSE: { icon: pnl >= 0 ? '✅' : '🔴', title: '手動平倉' },
-    BE: { icon: '⚪', title: '移至成本' }
+    TP1: { title: 'TP1 達成' },
+    TP2: { title: 'TP2 達成' },
+    TP3: { title: 'TP3 達成' },
+    SL: { title: '止損觸發' },
+    CLOSE: { title: '手動平倉' },
+    BE: { title: '移至成本' }
   };
   
-  const info = icons[type] || { icon: '📊', title: type };
+  const info = icons[type] || { title: type };
   const pnlSign = pnl >= 0 ? '+' : '';
   
-  let msg = `${info.icon} <b>${escHtml(info.title)}</b>\n`;
+  let msg = `<b>${escHtml(info.title)}</b>\n`;
   msg += `${escHtml(ticker)} · ${escHtml(type)}\n\n`;
   msg += `<b>成交</b>\n`;
   msg += `價格 <code>${fmtPrice(price)}</code>\n`;
@@ -363,15 +362,15 @@ function formatExitCard(type, ticker, price, pnl, note = '') {
 }
 
 function formatUpdateCard(message) {
-  return `📝 <b>訊號更新</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
+  return `<b>訊號更新</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
 }
 
 function formatAlertCard(message) {
-  return `⚠️ <b>交易警報</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
+  return `<b>交易警報</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
 }
 
 function formatDailyReport(stats) {
-  let msg = `📊 <b>每日績效報告</b>\n`;
+  let msg = `<b>每日績效報告</b>\n`;
   msg += `${new Date().toLocaleDateString('zh-TW')}\n\n`;
   msg += `<b>今日戰績</b>\n`;
   msg += `總交易 ${stats.total || 0} 筆\n`;
@@ -401,7 +400,7 @@ function normalizeUserCallback(data) {
 }
 
 function renderQuietText(settings) {
-  let m = `🌙 <b>安靜時段</b>\n\n`;
+  let m = `<b>安靜時段</b>\n\n`;
   m += `狀態：${settings.quiet_enabled ? '已啟用' : '未啟用'}\n`;
   m += `開始：<code>${escHtml(settings.quiet_start || '23:00')}</code>\n`;
   m += `結束：<code>${escHtml(settings.quiet_end || '07:00')}</code>\n\n`;
@@ -432,7 +431,7 @@ function renderCapitalText(settings) {
   const capital = Number(settings.capital || 0);
   const riskPercent = Number(settings.risk_percent || 0);
   const riskAmount = capital * (riskPercent / 100);
-  let m = `💰 <b>資金設定</b>\n\n`;
+  let m = `<b>資金設定</b>\n\n`;
   m += `交易資金：<b>$${fmtNum(capital)}</b>\n`;
   m += `風險比例：<b>${riskPercent}%</b>\n`;
   m += `單筆風險：<b>$${fmtNum(riskAmount.toFixed(0))}</b>\n\n`;
@@ -469,7 +468,7 @@ async function renderOrderPicker(cid, msgId, db, tier) {
     3: await getConfig(db, `${tier}_price_3m`) || (tier === 'vip' ? '1617' : '807'),
     12: await getConfig(db, `${tier}_price_12m`) || (tier === 'vip' ? '5748' : '2868')
   };
-  let m = `💳 <b>訂閱 ${tierName(tier)}</b>\n\n`;
+  let m = `<b>訂閱 ${tierName(tier)}</b>\n\n`;
   m += `選擇訂閱時長，系統會建立付款訂單。`;
   const buttons = [
     [{ text: `1個月 NT$${prices[1]}`, callback_data: `buy_${tier}_1` }],
@@ -478,6 +477,131 @@ async function renderOrderPicker(cid, msgId, db, tier) {
     [{ text: '« 返回', callback_data: 'u_plans' }]
   ];
   return editTg(cid, msgId, m, { inline_keyboard: buttons });
+}
+
+function renderUserMenuText(user) {
+  const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
+  let m = `<b>DC Trading Signals</b>\n\n`;
+  m += `${escHtml(user.first_name || '用戶')} · ${tierName(user.tier)}\n`;
+  if (user.tier !== 'free') m += `剩餘 <b>${dl}</b> 天\n`;
+  m += `\n選擇要操作的功能。`;
+  return m;
+}
+
+function renderUserMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '最新訊號', callback_data: 'u_signals' },
+        { text: '我的績效', callback_data: 'u_mystats' }
+      ],
+      [
+        { text: '訂閱設定', callback_data: 'u_subscribe' },
+        { text: '個人設定', callback_data: 'u_settings' }
+      ],
+      [
+        { text: '升級會員', callback_data: 'u_plans' },
+        { text: '邀請好友', callback_data: 'u_invite' }
+      ],
+      [
+        { text: '聯繫客服', callback_data: 'u_contact' },
+        { text: '幫助說明', callback_data: 'u_help' }
+      ]
+    ]
+  };
+}
+
+function renderSubscribeText(categories, subscribedSymbols) {
+  let m = `<b>訂閱設定</b>\n\n`;
+  m += `選擇要接收訊號的品種。\n\n`;
+  for (const [cat, catSymbols] of Object.entries(categories)) {
+    const catInfo = CONFIG.SYMBOL_CATEGORIES[cat] || { name: cat };
+    const names = catSymbols.map((s) => subscribedSymbols.includes(s.symbol) ? `${s.symbol} 已選` : s.symbol).join(' · ');
+    m += `<b>${escHtml(catInfo.name)}</b>\n${escHtml(names)}\n\n`;
+  }
+  m += `已選擇 <b>${subscribedSymbols.length}</b> 個品種`;
+  return m;
+}
+
+function renderSubscribeKeyboard(categories, subscribedSymbols) {
+  const buttons = [];
+  for (const catSymbols of Object.values(categories)) {
+    const row = [];
+    for (const s of catSymbols) {
+      const icon = subscribedSymbols.includes(s.symbol) ? '✅' : '⬜';
+      row.push({ text: `${icon} ${s.symbol}`, callback_data: `sym_${s.symbol}` });
+      if (row.length === 2) {
+        buttons.push([...row]);
+        row.length = 0;
+      }
+    }
+    if (row.length > 0) buttons.push([...row]);
+  }
+  buttons.push([{ text: '訊號類型', callback_data: 'u_signaltype' }]);
+  buttons.push([{ text: '« 返回', callback_data: 'u_menu' }]);
+  return { inline_keyboard: buttons };
+}
+
+function renderSignalTypeText(signalTypes) {
+  let m = `<b>訊號類型偏好</b>\n\n`;
+  m += `選擇想接收的訊號型態。\n\n`;
+  for (const [type, info] of Object.entries(CONFIG.SIGNAL_TYPES)) {
+    const mark = signalTypes.includes(type) ? '已開啟' : '未開啟';
+    m += `<b>${escHtml(info.name)}</b> · ${mark}\n${escHtml(info.desc)}\n\n`;
+  }
+  return m.trim();
+}
+
+function renderSignalTypeKeyboard(signalTypes) {
+  const buttons = [];
+  for (const [type, info] of Object.entries(CONFIG.SIGNAL_TYPES)) {
+    const icon = signalTypes.includes(type) ? '✅' : '⬜';
+    buttons.push([{ text: `${icon} ${info.name}`, callback_data: `type_${type}` }]);
+  }
+  buttons.push([{ text: '« 返回', callback_data: 'u_subscribe' }]);
+  return { inline_keyboard: buttons };
+}
+
+function renderSettingsText(settings) {
+  return `<b>個人設定</b>\n\n接收狀態：${settings.paused ? '已暫停' : '正常接收'}\n時區：<code>${escHtml(settings.timezone || 'Asia/Taipei')}</code>`;
+}
+
+function renderSettingsKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [{ text: '通知設定', callback_data: 'u_notify' }],
+      [{ text: '安靜時段', callback_data: 'u_quiet' }],
+      [{ text: '資金設定', callback_data: 'u_capital' }],
+      [{ text: '時區設定', callback_data: 'u_timezone' }],
+      [{ text: settings.paused ? '恢復接收訊號' : '暫停接收訊號', callback_data: 'toggle_pause' }],
+      [{ text: '« 返回', callback_data: 'u_menu' }]
+    ]
+  };
+}
+
+function renderNotifyText() {
+  return `<b>通知設定</b>\n\n點擊按鈕切換要接收的通知。`;
+}
+
+function renderNotifyKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [
+        { text: (settings.notify_entry ? '✅' : '⬜') + ' 進場訊號', callback_data: 'ntf_entry' },
+        { text: (settings.notify_tp ? '✅' : '⬜') + ' 止盈通知', callback_data: 'ntf_tp' }
+      ],
+      [
+        { text: (settings.notify_sl ? '✅' : '⬜') + ' 止損通知', callback_data: 'ntf_sl' },
+        { text: (settings.notify_update ? '✅' : '⬜') + ' 訊號更新', callback_data: 'ntf_update' }
+      ],
+      [
+        { text: (settings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'ntf_daily' },
+        { text: (settings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' }
+      ],
+      [{ text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }],
+      [{ text: '« 返回', callback_data: 'u_settings' }]
+    ]
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -578,8 +702,8 @@ async function broadcastSignal(db, signal) {
     // 發送訊號
     const kb = {
       inline_keyboard: [[
-        { text: '✅ 已執行', callback_data: `exec_${signal.signal_uid}` },
-        { text: '⏭️ 跳過', callback_data: `skip_${signal.signal_uid}` }
+        { text: '已執行', callback_data: `exec_${signal.signal_uid}` },
+        { text: '跳過', callback_data: `skip_${signal.signal_uid}` }
       ]]
     };
     
@@ -690,39 +814,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       }
     }
     
-    const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📱 <b>DC Trading Signals</b>\n`;
-    m += `│  ────────────────────────\n`;
-    m += `│  ${user.first_name || '用戶'}  │  ${tierName(user.tier)}\n`;
-    if (user.tier !== 'free') {
-      m += `│  📅 剩餘 ${dl} 天\n`;
-    }
-    m += `└─────────────────────────────┘`;
-    
-    const kb = {
-      inline_keyboard: [
-        [
-          { text: '📊 最新訊號', callback_data: 'u_signals' },
-          { text: '📈 我的績效', callback_data: 'u_mystats' }
-        ],
-        [
-          { text: '🎯 訂閱設定', callback_data: 'u_subscribe' },
-          { text: '⚙️ 個人設定', callback_data: 'u_settings' }
-        ],
-        [
-          { text: '💎 升級會員', callback_data: 'u_plans' },
-          { text: '🎁 邀請好友', callback_data: 'u_invite' }
-        ],
-        [
-          { text: '📞 聯繫客服', callback_data: 'u_contact' },
-          { text: '❓ 幫助說明', callback_data: 'u_help' }
-        ]
-      ]
-    };
-    
-    return sendTg(cid, m, kb);
+    return sendTg(cid, renderUserMenuText(user), renderUserMenuKeyboard());
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -733,42 +825,9 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       return handleUserCommand(cid, uid, '/plans', [], env);
     }
     
-    const symbols = await getSymbols(db);
     const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
     const categories = await getSymbolsByCategory(db);
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🎯 <b>訂閱設定</b>\n`;
-    m += `│  選擇您想接收的訊號品種\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    
-    // 建立按鈕
-    const buttons = [];
-    
-    for (const [cat, catSymbols] of Object.entries(categories)) {
-      const catInfo = CONFIG.SYMBOL_CATEGORIES[cat] || { emoji: '📊', name: cat };
-      m += `${catInfo.emoji} <b>${catInfo.name}</b>\n`;
-      
-      const row = [];
-      for (const s of catSymbols) {
-        const isSubbed = subscribedSymbols.includes(s.symbol);
-        const icon = isSubbed ? '✅' : '⬜';
-        row.push({ text: `${icon} ${s.symbol}`, callback_data: `toggle_sym_${s.symbol}` });
-        if (row.length === 2) {
-          buttons.push([...row]);
-          row.length = 0;
-        }
-      }
-      if (row.length > 0) buttons.push([...row]);
-      m += '\n';
-    }
-    
-    m += `\n已選擇: ${subscribedSymbols.length} 個品種`;
-    
-    buttons.push([{ text: '💾 儲存設定', callback_data: 'save_symbols' }]);
-    buttons.push([{ text: '« 返回', callback_data: 'u_menu' }]);
-    
-    return sendTg(cid, m, { inline_keyboard: buttons });
+    return sendTg(cid, renderSubscribeText(categories, subscribedSymbols), renderSubscribeKeyboard(categories, subscribedSymbols));
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -781,48 +840,18 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     const signalTypes = parseJSON(settings.signal_types, []);
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📊 <b>訊號類型偏好</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `選擇您想接收的訊號類型：\n\n`;
-    
-    const buttons = [];
-    for (const [type, info] of Object.entries(CONFIG.SIGNAL_TYPES)) {
-      const isSelected = signalTypes.includes(type);
-      const icon = isSelected ? '✅' : '⬜';
-      buttons.push([{ text: `${icon} ${info.emoji} ${info.name}`, callback_data: `toggle_type_${type}` }]);
-      m += `${info.emoji} <b>${info.name}</b>\n`;
-      m += `   ${info.desc}\n\n`;
-    }
-    
-    buttons.push([{ text: '💾 儲存設定', callback_data: 'save_types' }]);
-    buttons.push([{ text: '« 返回', callback_data: 'u_subscribe' }]);
-    
-    return sendTg(cid, m, { inline_keyboard: buttons });
+    return sendTg(cid, renderSignalTypeText(signalTypes), renderSignalTypeKeyboard(signalTypes));
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 個人設定 /settings
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/settings') {
-    let m = `⚙️ <b>個人設定</b>\n\n`;
-    m += `管理通知、安靜時段、資金風控與時區。`;
-    
-    const kb = {
-      inline_keyboard: [
-        [{ text: '🔔 通知設定', callback_data: 'u_notify' }],
-        [{ text: '🌙 安靜時段', callback_data: 'u_quiet' }],
-        [{ text: '💰 資金設定', callback_data: 'u_capital' }],
-        [{ text: '🌍 時區設定', callback_data: 'u_timezone' }],
-        [{ text: '« 返回', callback_data: 'u_menu' }]
-      ]
-    };
-    
-    return sendTg(cid, m, kb);
+    return sendTg(cid, renderSettingsText(settings), renderSettingsKeyboard(settings));
   }
 
   if (cmd === '/timezone') {
-    let m = `🌍 <b>時區設定</b>\n\n`;
+    let m = `<b>時區設定</b>\n\n`;
     m += `目前時區：<code>${escHtml(settings.timezone || 'Asia/Taipei')}</code>\n\n`;
     m += `選擇您希望報表與通知顯示的時間基準。`;
     const kb = {
@@ -841,34 +870,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // 通知設定 /notify
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/notify') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🔔 <b>通知設定</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    
-    m += `<b>訊號通知</b>\n`;
-    const buttons = [
-      [
-        { text: (settings.notify_entry ? '✅' : '⬜') + ' 進場訊號', callback_data: 'toggle_notify_entry' },
-        { text: (settings.notify_tp ? '✅' : '⬜') + ' 止盈通知', callback_data: 'toggle_notify_tp' }
-      ],
-      [
-        { text: (settings.notify_sl ? '✅' : '⬜') + ' 止損通知', callback_data: 'toggle_notify_sl' },
-        { text: (settings.notify_update ? '✅' : '⬜') + ' 訊號更新', callback_data: 'toggle_notify_update' }
-      ]
-    ];
-    
-    m += `\n<b>系統通知</b>\n`;
-    buttons.push([
-      { text: (settings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'toggle_notify_daily' },
-      { text: (settings.notify_announcement ? '✅' : '⬜') + ' 重要公告', callback_data: 'toggle_notify_announce' }
-    ]);
-    buttons.push([
-      { text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'toggle_notify_alert' }
-    ]);
-    
-    buttons.push([{ text: '« 返回', callback_data: 'u_settings' }]);
-    
-    return sendTg(cid, m, { inline_keyboard: buttons });
+    return sendTg(cid, renderNotifyText(), renderNotifyKeyboard(settings));
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -907,9 +909,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
     const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  👤 <b>會員狀態</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>會員狀態</b>\n\n`;
     m += `${tierName(user.tier)}\n`;
     
     if (user.tier !== 'free') {
@@ -919,17 +919,20 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       m += `\n`;
     }
     
-    m += `📊 訂閱品種：${subscribedSymbols.join(', ') || '未設定'}\n`;
-    m += `💰 交易資金：$${fmtNum(settings.capital)}\n`;
-    m += `📈 風險比例：${settings.risk_percent}%\n\n`;
-    m += `🎁 積分：${user.points || 0}\n`;
-    m += `👥 推薦：${user.referral_count || 0} 人\n`;
-    m += `📋 推薦碼：<code>${user.referral_code}</code>\n`;
+    m += `<b>訂閱</b>\n`;
+    m += `品種：${escHtml(subscribedSymbols.join(', ') || '未設定')}\n\n`;
+    m += `<b>風控</b>\n`;
+    m += `資金：$${fmtNum(settings.capital)}\n`;
+    m += `風險：${settings.risk_percent}%\n\n`;
+    m += `<b>積分邀請</b>\n`;
+    m += `積分：${user.points || 0}\n`;
+    m += `推薦：${user.referral_count || 0} 人\n`;
+    m += `推薦碼：<code>${escHtml(user.referral_code)}</code>\n`;
     
     const buttons = [
       [
-        { text: '🔄 續費', callback_data: 'u_renew' },
-        { text: '👑 升級VIP', callback_data: 'u_upgrade' }
+        { text: '續費', callback_data: 'u_renew' },
+        { text: '升級 VIP', callback_data: 'u_upgrade' }
       ],
       [{ text: '« 返回', callback_data: 'u_menu' }]
     ];
@@ -952,12 +955,9 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       12: await getConfig(db, 'vip_price_12m') || '5748'
     };
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  💎 <b>會員方案</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>會員方案</b>\n\n`;
     
-    m += `⭐ <b>Pro 會員</b>\n`;
-    m += `─────────────────────\n`;
+    m += `<b>Pro 會員</b>\n`;
     m += `• 即時接收所有訊號\n`;
     m += `• 2個止盈目標\n`;
     m += `• 自選訂閱品種\n`;
@@ -967,8 +967,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     m += `NT$ ${proPrices[3]}/季 (省10%)\n`;
     m += `NT$ ${proPrices[12]}/年 (省20%)\n\n`;
     
-    m += `👑 <b>VIP 會員</b>\n`;
-    m += `─────────────────────\n`;
+    m += `<b>VIP 會員</b>\n`;
     m += `• Pro全部功能\n`;
     m += `• 3個止盈目標\n`;
     m += `• VIP專屬訊號\n`;
@@ -979,12 +978,12 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     m += `NT$ ${vipPrices[12]}/年 (省20%)\n`;
     
     const buttons = [
-      [{ text: '🎁 申請7天試用', callback_data: 'u_trial' }],
+      [{ text: '申請 7 天試用', callback_data: 'u_trial' }],
       [
-        { text: '⭐ 訂閱Pro', callback_data: 'order_pro' },
-        { text: '👑 訂閱VIP', callback_data: 'order_vip' }
+        { text: '訂閱 Pro', callback_data: 'order_pro' },
+        { text: '訂閱 VIP', callback_data: 'order_vip' }
       ],
-      [{ text: '📞 聯繫客服', callback_data: 'u_contact' }],
+      [{ text: '聯繫客服', callback_data: 'u_contact' }],
       [{ text: '« 返回', callback_data: 'u_menu' }]
     ];
     
@@ -993,7 +992,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
 
   if (cmd === '/renew' || cmd === '/upgrade') {
     const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
-    let m = `🔄 <b>續費 / 升級</b>\n\n`;
+    let m = `<b>續費 / 升級</b>\n\n`;
     m += `目前方案：${tierName(user.tier)}\n`;
     if (user.tier !== 'free') {
       m += `到期日：${fmtDate(user.tier_expires_at)}\n`;
@@ -1001,9 +1000,9 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     }
     m += `\n選擇方案後會建立付款訂單。`;
     const buttons = [
-      [{ text: '⭐ Pro 續費', callback_data: 'order_pro' }],
-      [{ text: '👑 VIP 升級 / 續費', callback_data: 'order_vip' }],
-      [{ text: '📞 聯繫客服', callback_data: 'u_contact' }],
+      [{ text: 'Pro 續費', callback_data: 'order_pro' }],
+      [{ text: 'VIP 升級 / 續費', callback_data: 'order_vip' }],
+      [{ text: '聯繫客服', callback_data: 'u_contact' }],
       [{ text: '« 返回', callback_data: 'u_menu' }]
     ];
     return sendTg(cid, m, { inline_keyboard: buttons });
@@ -1026,17 +1025,17 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     await updateUser(db, uid, { tier: 'pro', tier_expires_at: expires });
     
-    let m = `🎉 <b>試用已開通！</b>\n\n`;
-    m += `等級：⭐ Pro會員\n`;
+    let m = `<b>試用已開通</b>\n\n`;
+    m += `等級：Pro 會員\n`;
     m += `天數：${trialDays} 天\n`;
     m += `到期：${fmtDate(expires)}\n\n`;
     m += `現在請先設定您的訂閱偏好：\n`;
     
     const kb = {
       inline_keyboard: [
-        [{ text: '🎯 設定訂閱品種', callback_data: 'u_subscribe' }],
-        [{ text: '💰 設定交易資金', callback_data: 'u_capital' }],
-        [{ text: '📊 查看訊號', callback_data: 'u_signals' }]
+        [{ text: '設定訂閱品種', callback_data: 'u_subscribe' }],
+        [{ text: '設定交易資金', callback_data: 'u_capital' }],
+        [{ text: '查看訊號', callback_data: 'u_signals' }]
       ]
     };
     
@@ -1069,20 +1068,19 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       return sendTg(cid, `📊 目前沒有符合您訂閱的訊號\n\n使用 /subscribe 調整訂閱品種`);
     }
     
-    let m = `📊 <b>最新訊號</b>\n\n`;
+    let m = `<b>最新訊號</b>\n\n`;
     
     for (const sig of signals.results) {
-      const emoji = CONFIG.ACTIONS[sig.action]?.emoji || '📊';
-      const status = sig.status === 'active' ? '🟢' : sig.result === 'win' ? '✅' : sig.result === 'loss' ? '❌' : '⚪';
-      m += `${status}${emoji} ${sig.ticker} ${sig.action} @ ${fmtPrice(sig.entry_price)}\n`;
+      const status = sig.status === 'active' ? '進行中' : sig.result === 'win' ? '獲利' : sig.result === 'loss' ? '止損' : sig.status;
+      m += `${escHtml(sig.ticker)} ${escHtml(sig.action)} ${fmtPrice(sig.entry_price)} · ${status}\n`;
     }
     
-    m += `\n已訂閱：${subscribedSymbols.join(', ')}`;
+    m += `\n已訂閱：${escHtml(subscribedSymbols.join(', ') || '未設定')}`;
     
     const kb = {
       inline_keyboard: [
-        [{ text: '📜 歷史訊號', callback_data: 'u_history' }],
-        [{ text: '🎯 修改訂閱', callback_data: 'u_subscribe' }],
+        [{ text: '歷史訊號', callback_data: 'u_history' }],
+        [{ text: '修改訂閱', callback_data: 'u_subscribe' }],
         [{ text: '« 返回', callback_data: 'u_menu' }]
       ]
     };
@@ -1111,12 +1109,12 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
 
     const title = cmd === '/active' ? '進行中訊號' : cmd === '/lastsignal' ? '最近一筆訊號' : '歷史訊號';
     if (list.length === 0) {
-      return sendTg(cid, `📊 <b>${title}</b>\n\n目前沒有符合您訂閱品種的資料。`, {
+      return sendTg(cid, `<b>${title}</b>\n\n目前沒有符合您訂閱品種的資料。`, {
         inline_keyboard: [[{ text: '修改訂閱', callback_data: 'u_subscribe' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
       });
     }
 
-    let m = `📊 <b>${title}</b>\n\n`;
+    let m = `<b>${title}</b>\n\n`;
     for (const sig of list) {
       const action = sig.action === 'LONG' ? '做多' : '做空';
       const status = sig.status === 'active' ? '進行中' : sig.result === 'win' ? '獲利' : sig.result === 'loss' ? '止損' : sig.status;
@@ -1177,25 +1175,19 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     const winRate = total > 0 ? ((wins / total) * 100).toFixed(1) : 0;
     const estimatedPnl = totalPnl * settings.capital * (settings.risk_percent / 100) / 100;
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📊 <b>我的績效</b>\n`;
-    m += `│  近30天\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `📈 執行統計\n`;
-    m += `─────────────────────\n`;
-    m += `已執行    │ ${total} 筆\n`;
-    m += `獲利      │ ${wins} 筆  ✅\n`;
-    m += `虧損      │ ${total - wins} 筆  ❌\n`;
-    m += `勝率      │ ${winRate}%\n\n`;
-    m += `💰 模擬盈虧\n`;
-    m += `─────────────────────\n`;
-    m += `總點數    │ ${totalPnl >= 0 ? '+' : ''}${fmtPrice(totalPnl)} 點\n`;
-    m += `預估盈虧  │ $${fmtNum(estimatedPnl.toFixed(0))}\n`;
+    let m = `<b>我的績效</b>\n近30天\n\n`;
+    m += `<b>執行統計</b>\n`;
+    m += `已執行 ${total} 筆\n`;
+    m += `獲利 ${wins} 筆 · 虧損 ${total - wins} 筆\n`;
+    m += `勝率 <code>${winRate}%</code>\n\n`;
+    m += `<b>模擬盈虧</b>\n`;
+    m += `總點數 <code>${totalPnl >= 0 ? '+' : ''}${fmtPrice(totalPnl)}</code> 點\n`;
+    m += `預估盈虧 <code>$${fmtNum(estimatedPnl.toFixed(0))}</code>\n`;
     
     const kb = {
       inline_keyboard: [
-        [{ text: '📊 按品種分析', callback_data: 'mystats_symbol' }],
-        [{ text: '📅 選擇月份', callback_data: 'mystats_month' }],
+        [{ text: '按品種分析', callback_data: 'mystats_symbol' }],
+        [{ text: '選擇月份', callback_data: 'mystats_month' }],
         [{ text: '« 返回', callback_data: 'u_menu' }]
       ]
     };
@@ -1288,7 +1280,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     const newPoints = (user.points || 0) + checkinPoints;
     
-    return sendTg(cid, `✅ <b>簽到成功！</b>\n\n獲得 <b>+${checkinPoints}</b> 積分\n目前積分：<b>${newPoints}</b>`);
+    return sendTg(cid, `<b>簽到成功</b>\n\n獲得 <b>+${checkinPoints}</b> 積分\n目前積分：<b>${newPoints}</b>`);
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1299,22 +1291,18 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     const refPoints = await getConfig(db, 'referral_points') || '50';
     const refPaidPoints = await getConfig(db, 'referral_paid_points') || '100';
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🎁 <b>邀請好友</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>邀請好友</b>\n\n`;
     m += `您的專屬邀請連結：\n`;
     m += `<code>${refLink}</code>\n\n`;
-    m += `📊 邀請統計\n`;
-    m += `─────────────────────\n`;
-    m += `已邀請    │ ${user.referral_count || 0} 人\n\n`;
-    m += `🎁 邀請獎勵\n`;
-    m += `─────────────────────\n`;
-    m += `好友註冊  │ +${refPoints}點\n`;
-    m += `好友付費  │ +${refPaidPoints}點\n`;
+    m += `<b>邀請統計</b>\n`;
+    m += `已邀請 ${user.referral_count || 0} 人\n\n`;
+    m += `<b>邀請獎勵</b>\n`;
+    m += `好友註冊 +${refPoints} 點\n`;
+    m += `好友付費 +${refPaidPoints} 點\n`;
     
     const kb = {
       inline_keyboard: [
-        [{ text: '📋 複製連結', callback_data: 'copy_ref' }],
+        [{ text: '複製連結', callback_data: 'copy_ref' }],
         [{ text: '« 返回', callback_data: 'u_menu' }]
       ]
     };
@@ -1333,15 +1321,12 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     const pointsPerDay = parseInt(await getConfig(db, 'points_per_day') || '100');
     const redeemableDays = Math.floor((user.points || 0) / pointsPerDay);
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🎁 <b>積分中心</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>積分中心</b>\n\n`;
     m += `目前積分：<b>${user.points || 0}</b>\n`;
     m += `可兌換：${redeemableDays} 天會員\n\n`;
     
     if (history.results && history.results.length > 0) {
-      m += `📜 最近記錄\n`;
-      m += `─────────────────────\n`;
+      m += `<b>最近記錄</b>\n`;
       for (const h of history.results.slice(0, 5)) {
         const sign = h.points > 0 ? '+' : '';
         m += `${sign}${h.points} - ${h.reason}\n`;
@@ -1350,8 +1335,8 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     const kb = {
       inline_keyboard: [
-        [{ text: '✅ 立即簽到', callback_data: 'u_checkin' }],
-        [{ text: '🎁 兌換會員', callback_data: 'u_redeem' }],
+        [{ text: '立即簽到', callback_data: 'u_checkin' }],
+        [{ text: '兌換會員', callback_data: 'u_redeem' }],
         [{ text: '« 返回', callback_data: 'u_menu' }]
       ]
     };
@@ -1388,9 +1373,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     const tg = await getConfig(db, 'contact_telegram') || '@Admin';
     const line = await getConfig(db, 'contact_line');
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📞 <b>聯繫客服</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>聯繫客服</b>\n\n`;
     m += `Telegram：${tg}\n`;
     if (line) m += `LINE：${line}\n`;
     m += `\n我們會盡快回覆您！`;
@@ -1460,35 +1443,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   
   // 返回主選單
   if (data === 'u_menu') {
-    const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📱 <b>DC Trading Signals</b>\n`;
-    m += `│  ────────────────────────\n`;
-    m += `│  ${user.first_name || '用戶'}  │  ${tierName(user.tier)}\n`;
-    if (user.tier !== 'free') m += `│  📅 剩餘 ${dl} 天\n`;
-    m += `└─────────────────────────────┘`;
-    
-    const kb = {
-      inline_keyboard: [
-        [
-          { text: '📊 最新訊號', callback_data: 'u_signals' },
-          { text: '📈 我的績效', callback_data: 'u_mystats' }
-        ],
-        [
-          { text: '🎯 訂閱設定', callback_data: 'u_subscribe' },
-          { text: '⚙️ 個人設定', callback_data: 'u_settings' }
-        ],
-        [
-          { text: '💎 升級會員', callback_data: 'u_plans' },
-          { text: '🎁 邀請好友', callback_data: 'u_invite' }
-        ],
-        [
-          { text: '📞 聯繫客服', callback_data: 'u_contact' },
-          { text: '❓ 幫助說明', callback_data: 'u_help' }
-        ]
-      ]
-    };
-    return editTg(cid, msgId, m, kb);
+    return editTg(cid, msgId, renderUserMenuText(user), renderUserMenuKeyboard());
   }
   
   // 訂閱設定
@@ -1497,40 +1452,9 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
       return handleUserCommand(cid, uid, '/plans', [], env);
     }
     
-    const symbols = await getSymbols(db);
     const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
     const categories = await getSymbolsByCategory(db);
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🎯 <b>訂閱設定</b>\n`;
-    m += `│  選擇您想接收的訊號品種\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    
-    const buttons = [];
-    for (const [cat, catSymbols] of Object.entries(categories)) {
-      const catInfo = CONFIG.SYMBOL_CATEGORIES[cat] || { emoji: '📊', name: cat };
-      m += `${catInfo.emoji} <b>${catInfo.name}</b>\n`;
-      
-      const row = [];
-      for (const s of catSymbols) {
-        const isSubbed = subscribedSymbols.includes(s.symbol);
-        const icon = isSubbed ? '✅' : '⬜';
-        row.push({ text: `${icon} ${s.symbol}`, callback_data: `sym_${s.symbol}` });
-        if (row.length === 2) {
-          buttons.push([...row]);
-          row.length = 0;
-        }
-      }
-      if (row.length > 0) buttons.push([...row]);
-      m += '\n';
-    }
-    
-    m += `已選擇: ${subscribedSymbols.length} 個品種`;
-    
-    buttons.push([{ text: '📊 訊號類型', callback_data: 'u_signaltype' }]);
-    buttons.push([{ text: '« 返回', callback_data: 'u_menu' }]);
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderSubscribeText(categories, subscribedSymbols), renderSubscribeKeyboard(categories, subscribedSymbols));
   }
   
   // 切換品種訂閱
@@ -1546,63 +1470,15 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     await updateUserSettings(db, uid, { subscribed_symbols: JSON.stringify(subscribedSymbols) });
     
-    // 重新顯示訂閱設定
-    const symbols = await getSymbols(db);
     const categories = await getSymbolsByCategory(db);
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🎯 <b>訂閱設定</b>\n`;
-    m += `│  選擇您想接收的訊號品種\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    
-    const buttons = [];
-    for (const [cat, catSymbols] of Object.entries(categories)) {
-      const catInfo = CONFIG.SYMBOL_CATEGORIES[cat] || { emoji: '📊', name: cat };
-      m += `${catInfo.emoji} <b>${catInfo.name}</b>\n`;
-      
-      const row = [];
-      for (const s of catSymbols) {
-        const isSubbed = subscribedSymbols.includes(s.symbol);
-        const icon = isSubbed ? '✅' : '⬜';
-        row.push({ text: `${icon} ${s.symbol}`, callback_data: `sym_${s.symbol}` });
-        if (row.length === 2) {
-          buttons.push([...row]);
-          row.length = 0;
-        }
-      }
-      if (row.length > 0) buttons.push([...row]);
-      m += '\n';
-    }
-    
-    m += `已選擇: ${subscribedSymbols.length} 個品種`;
-    
-    buttons.push([{ text: '📊 訊號類型', callback_data: 'u_signaltype' }]);
-    buttons.push([{ text: '« 返回', callback_data: 'u_menu' }]);
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderSubscribeText(categories, subscribedSymbols), renderSubscribeKeyboard(categories, subscribedSymbols));
   }
   
   // 訊號類型設定
   if (data === 'u_signaltype') {
     const signalTypes = parseJSON(settings.signal_types, []);
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📊 <b>訊號類型偏好</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `選擇您想接收的訊號類型：\n\n`;
-    
-    const buttons = [];
-    for (const [type, info] of Object.entries(CONFIG.SIGNAL_TYPES)) {
-      const isSelected = signalTypes.includes(type);
-      const icon = isSelected ? '✅' : '⬜';
-      buttons.push([{ text: `${icon} ${info.emoji} ${info.name}`, callback_data: `type_${type}` }]);
-      m += `${info.emoji} <b>${info.name}</b>\n`;
-      m += `   ${info.desc}\n\n`;
-    }
-    
-    buttons.push([{ text: '« 返回', callback_data: 'u_subscribe' }]);
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderSignalTypeText(signalTypes), renderSignalTypeKeyboard(signalTypes));
   }
   
   // 切換訊號類型
@@ -1618,43 +1494,12 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     await updateUserSettings(db, uid, { signal_types: JSON.stringify(signalTypes) });
     
-    // 重新顯示
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📊 <b>訊號類型偏好</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `選擇您想接收的訊號類型：\n\n`;
-    
-    const buttons = [];
-    for (const [t, info] of Object.entries(CONFIG.SIGNAL_TYPES)) {
-      const isSelected = signalTypes.includes(t);
-      const icon = isSelected ? '✅' : '⬜';
-      buttons.push([{ text: `${icon} ${info.emoji} ${info.name}`, callback_data: `type_${t}` }]);
-      m += `${info.emoji} <b>${info.name}</b>\n`;
-      m += `   ${info.desc}\n\n`;
-    }
-    
-    buttons.push([{ text: '« 返回', callback_data: 'u_subscribe' }]);
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderSignalTypeText(signalTypes), renderSignalTypeKeyboard(signalTypes));
   }
   
   // 個人設定
   if (data === 'u_settings') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  ⚙️ <b>個人設定</b>\n`;
-    m += `└─────────────────────────────┘\n`;
-    
-    const kb = {
-      inline_keyboard: [
-        [{ text: '🔔 通知設定', callback_data: 'u_notify' }],
-        [{ text: '🌙 安靜時段', callback_data: 'u_quiet' }],
-        [{ text: '💰 資金設定', callback_data: 'u_capital' }],
-        [{ text: settings.paused ? '▶️ 恢復接收訊號' : '⏸️ 暫停接收訊號', callback_data: 'toggle_pause' }],
-        [{ text: '« 返回', callback_data: 'u_menu' }]
-      ]
-    };
-    
-    return editTg(cid, msgId, m, kb);
+    return editTg(cid, msgId, renderSettingsText(settings), renderSettingsKeyboard(settings));
   }
   
   // 暫停/恢復
@@ -1664,49 +1509,13 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     await answerCb(cbId, newPaused ? '已暫停接收訊號' : '已恢復接收訊號');
     
-    // 返回設定頁
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  ⚙️ <b>個人設定</b>\n`;
-    m += `└─────────────────────────────┘\n`;
-    
-    const kb = {
-      inline_keyboard: [
-        [{ text: '🔔 通知設定', callback_data: 'u_notify' }],
-        [{ text: '🌙 安靜時段', callback_data: 'u_quiet' }],
-        [{ text: '💰 資金設定', callback_data: 'u_capital' }],
-        [{ text: newPaused ? '▶️ 恢復接收訊號' : '⏸️ 暫停接收訊號', callback_data: 'toggle_pause' }],
-        [{ text: '« 返回', callback_data: 'u_menu' }]
-      ]
-    };
-    
-    return editTg(cid, msgId, m, kb);
+    const newSettings = await getUserSettings(db, uid);
+    return editTg(cid, msgId, renderSettingsText(newSettings), renderSettingsKeyboard(newSettings));
   }
   
   // 通知設定
   if (data === 'u_notify') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🔔 <b>通知設定</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `點擊切換開關：\n`;
-    
-    const buttons = [
-      [
-        { text: (settings.notify_entry ? '✅' : '⬜') + ' 進場訊號', callback_data: 'ntf_entry' },
-        { text: (settings.notify_tp ? '✅' : '⬜') + ' 止盈通知', callback_data: 'ntf_tp' }
-      ],
-      [
-        { text: (settings.notify_sl ? '✅' : '⬜') + ' 止損通知', callback_data: 'ntf_sl' },
-        { text: (settings.notify_update ? '✅' : '⬜') + ' 訊號更新', callback_data: 'ntf_update' }
-      ],
-      [
-        { text: (settings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'ntf_daily' },
-        { text: (settings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' }
-      ],
-      [{ text: (settings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderNotifyText(), renderNotifyKeyboard(settings));
   }
   
   // 切換通知設定
@@ -1727,60 +1536,13 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
       
       // 重新取得設定
       const newSettings = await getUserSettings(db, uid);
-      
-      let m = `┌─────────────────────────────┐\n`;
-      m += `│  🔔 <b>通知設定</b>\n`;
-      m += `└─────────────────────────────┘\n\n`;
-      m += `點擊切換開關：\n`;
-      
-      const buttons = [
-        [
-          { text: (newSettings.notify_entry ? '✅' : '⬜') + ' 進場訊號', callback_data: 'ntf_entry' },
-          { text: (newSettings.notify_tp ? '✅' : '⬜') + ' 止盈通知', callback_data: 'ntf_tp' }
-        ],
-        [
-          { text: (newSettings.notify_sl ? '✅' : '⬜') + ' 止損通知', callback_data: 'ntf_sl' },
-          { text: (newSettings.notify_update ? '✅' : '⬜') + ' 訊號更新', callback_data: 'ntf_update' }
-        ],
-        [
-          { text: (newSettings.notify_daily_report ? '✅' : '⬜') + ' 每日報告', callback_data: 'ntf_daily' },
-          { text: (newSettings.notify_announcement ? '✅' : '⬜') + ' 公告', callback_data: 'ntf_announce' }
-        ],
-        [{ text: (newSettings.notify_alert ? '✅' : '⬜') + ' 行情警報', callback_data: 'ntf_alert' }],
-        [{ text: '« 返回', callback_data: 'u_settings' }]
-      ];
-      
-      return editTg(cid, msgId, m, { inline_keyboard: buttons });
+      return editTg(cid, msgId, renderNotifyText(), renderNotifyKeyboard(newSettings));
     }
   }
   
   // 安靜時段
   if (data === 'u_quiet') {
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🌙 <b>安靜時段</b>\n`;
-    m += `│  此時段內不會收到通知\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `狀態：${settings.quiet_enabled ? '✅ 已啟用' : '⬜ 未啟用'}\n\n`;
-    m += `開始時間：${settings.quiet_start}\n`;
-    m += `結束時間：${settings.quiet_end}\n\n`;
-    m += `📝 安靜時段的訊號會在結束後推送`;
-    
-    const buttons = [
-      [{ text: settings.quiet_enabled ? '🔕 關閉' : '🔔 啟用', callback_data: 'toggle_quiet' }],
-      [
-        { text: '開始 22:00', callback_data: 'quiet_s_22' },
-        { text: '開始 23:00', callback_data: 'quiet_s_23' },
-        { text: '開始 00:00', callback_data: 'quiet_s_00' }
-      ],
-      [
-        { text: '結束 06:00', callback_data: 'quiet_e_06' },
-        { text: '結束 07:00', callback_data: 'quiet_e_07' },
-        { text: '結束 08:00', callback_data: 'quiet_e_08' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderQuietText(settings), renderQuietKeyboard(settings));
   }
   
   // 切換安靜時段
@@ -1789,32 +1551,8 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     await updateUserSettings(db, uid, { quiet_enabled: newValue });
       await answerCb(cbId, newValue ? '安靜時段已啟用' : '安靜時段已關閉');
     
-    // 重新顯示
     const newSettings = await getUserSettings(db, uid);
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  🌙 <b>安靜時段</b>\n`;
-    m += `│  此時段內不會收到通知\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `狀態：${newSettings.quiet_enabled ? '✅ 已啟用' : '⬜ 未啟用'}\n\n`;
-    m += `開始時間：${newSettings.quiet_start}\n`;
-    m += `結束時間：${newSettings.quiet_end}\n`;
-    
-    const buttons = [
-      [{ text: newSettings.quiet_enabled ? '🔕 關閉' : '🔔 啟用', callback_data: 'toggle_quiet' }],
-      [
-        { text: '開始 22:00', callback_data: 'quiet_s_22' },
-        { text: '開始 23:00', callback_data: 'quiet_s_23' },
-        { text: '開始 00:00', callback_data: 'quiet_s_00' }
-      ],
-      [
-        { text: '結束 06:00', callback_data: 'quiet_e_06' },
-        { text: '結束 07:00', callback_data: 'quiet_e_07' },
-        { text: '結束 08:00', callback_data: 'quiet_e_08' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderQuietText(newSettings), renderQuietKeyboard(newSettings));
   }
   
   // 設定安靜時段時間
@@ -1838,43 +1576,14 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     const timezone = data.replace('tz_', '');
     await updateUserSettings(db, uid, { timezone });
     await answerCb(cbId, `時區已設為 ${timezone}`);
-    let m = `🌍 <b>時區設定</b>\n\n`;
+    let m = `<b>時區設定</b>\n\n`;
     m += `目前時區：<code>${escHtml(timezone)}</code>`;
     return editTg(cid, msgId, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_settings' }]] });
   }
   
   // 資金設定
   if (data === 'u_capital') {
-    const riskAmount = settings.capital * (settings.risk_percent / 100);
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  💰 <b>資金設定</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `交易資金：<b>$${fmtNum(settings.capital)}</b>\n`;
-    m += `風險比例：<b>${settings.risk_percent}%</b>\n`;
-    m += `單筆風險：<b>$${fmtNum(riskAmount.toFixed(0))}</b>\n\n`;
-    m += `📝 設定後訊號會顯示建議口數\n`;
-    
-    const buttons = [
-      [
-        { text: '$1,000', callback_data: 'cap_1000' },
-        { text: '$5,000', callback_data: 'cap_5000' },
-        { text: '$10,000', callback_data: 'cap_10000' }
-      ],
-      [
-        { text: '$25,000', callback_data: 'cap_25000' },
-        { text: '$50,000', callback_data: 'cap_50000' },
-        { text: '$100,000', callback_data: 'cap_100000' }
-      ],
-      [
-        { text: '風險 0.5%', callback_data: 'risk_0.5' },
-        { text: '風險 1%', callback_data: 'risk_1' },
-        { text: '風險 2%', callback_data: 'risk_2' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderCapitalText(settings), renderCapitalKeyboard());
   }
   
   // 設定資金
@@ -1886,33 +1595,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     const newSettings = await getUserSettings(db, uid);
     const riskAmount = newSettings.capital * (newSettings.risk_percent / 100);
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  💰 <b>資金設定</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `交易資金：<b>$${fmtNum(newSettings.capital)}</b>\n`;
-    m += `風險比例：<b>${newSettings.risk_percent}%</b>\n`;
-    m += `單筆風險：<b>$${fmtNum(riskAmount.toFixed(0))}</b>\n`;
-    
-    const buttons = [
-      [
-        { text: '$1,000', callback_data: 'cap_1000' },
-        { text: '$5,000', callback_data: 'cap_5000' },
-        { text: '$10,000', callback_data: 'cap_10000' }
-      ],
-      [
-        { text: '$25,000', callback_data: 'cap_25000' },
-        { text: '$50,000', callback_data: 'cap_50000' },
-        { text: '$100,000', callback_data: 'cap_100000' }
-      ],
-      [
-        { text: '風險 0.5%', callback_data: 'risk_0.5' },
-        { text: '風險 1%', callback_data: 'risk_1' },
-        { text: '風險 2%', callback_data: 'risk_2' }
-      ],
-      [{ text: '« 返回', callback_data: 'u_settings' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return editTg(cid, msgId, renderCapitalText(newSettings), renderCapitalKeyboard());
   }
   
   // 設定風險
@@ -1969,7 +1652,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'copy_ref') {
     const refLink = `https://t.me/${CONFIG.BOT_USERNAME}?start=ref_${user.referral_code}`;
     await answerCb(cbId, '邀請連結已顯示在新訊息');
-    return sendTg(cid, `🎁 <b>您的邀請連結</b>\n\n<code>${escHtml(refLink)}</code>`);
+    return sendTg(cid, `<b>您的邀請連結</b>\n\n<code>${escHtml(refLink)}</code>`);
   }
   if (data === 'mystats_symbol') return handleUserCommand(cid, uid, '/perfbysymbol', [], env);
   if (data === 'mystats_month') return handleUserCommand(cid, uid, '/mymonth', [], env);
@@ -1977,26 +1660,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   // 訂閱方案
   if (data === 'order_pro' || data === 'order_vip') {
     const tier = data === 'order_pro' ? 'pro' : 'vip';
-    
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  💳 <b>訂閱 ${tierName(tier)}</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
-    m += `選擇訂閱時長：\n`;
-    
-    const prices = {
-      1: await getConfig(db, `${tier}_price_1m`),
-      3: await getConfig(db, `${tier}_price_3m`),
-      12: await getConfig(db, `${tier}_price_12m`)
-    };
-    
-    const buttons = [
-      [{ text: `📅 1個月 NT$${prices[1]}`, callback_data: `buy_${tier}_1` }],
-      [{ text: `📅 3個月 NT$${prices[3]} (省10%)`, callback_data: `buy_${tier}_3` }],
-      [{ text: `📅 12個月 NT$${prices[12]} (省20%)`, callback_data: `buy_${tier}_12` }],
-      [{ text: '« 返回', callback_data: 'u_plans' }]
-    ];
-    
-    return editTg(cid, msgId, m, { inline_keyboard: buttons });
+    return renderOrderPicker(cid, msgId, db, tier);
   }
   
   // 建立訂單
@@ -2018,23 +1682,20 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     const name = await getConfig(db, 'payment_name');
     const contact = await getConfig(db, 'contact_telegram');
     
-    let m = `┌─────────────────────────────┐\n`;
-    m += `│  📋 <b>訂單確認</b>\n`;
-    m += `└─────────────────────────────┘\n\n`;
+    let m = `<b>訂單確認</b>\n\n`;
     m += `訂單編號：<code>${orderId}</code>\n`;
     m += `方案：${tierName(tier)} ${months}個月\n`;
     m += `金額：<b>NT$ ${fmtNum(price)}</b>\n\n`;
-    m += `💳 付款方式\n`;
-    m += `─────────────────────\n`;
-    m += `🏦 銀行：${bank}\n`;
-    m += `📝 帳號：<code>${account}</code>\n`;
-    m += `👤 戶名：${name}\n\n`;
-    m += `⚠️ 付款後請點擊下方按鈕通知客服\n`;
+    m += `<b>付款方式</b>\n`;
+    m += `銀行：${escHtml(bank)}\n`;
+    m += `帳號：<code>${escHtml(account)}</code>\n`;
+    m += `戶名：${escHtml(name)}\n\n`;
+    m += `付款後請點擊下方按鈕通知客服。\n`;
     
     const buttons = [
-      [{ text: '✅ 我已付款', callback_data: `paid_${orderId}` }],
-      [{ text: '❌ 取消訂單', callback_data: `cancel_${orderId}` }],
-      [{ text: '📞 聯繫客服', callback_data: 'u_contact' }]
+      [{ text: '我已付款', callback_data: `paid_${orderId}` }],
+      [{ text: '取消訂單', callback_data: `cancel_${orderId}` }],
+      [{ text: '聯繫客服', callback_data: 'u_contact' }]
     ];
     
     // 通知管理員
@@ -2365,7 +2026,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     if (!message) return sendTg(cid, `請輸入廣播內容`);
     
-    const formattedMsg = `📢 <b>公告</b>\n━━━━━━━━━━━━━━━━━━\n${message}\n━━━━━━━━━━━━━━━━━━\n⏰ ${fmtTime()}`;
+    const formattedMsg = `<b>公告</b>\n\n${escHtml(message)}\n\n${fmtTime()}`;
     
     const result = await broadcastMessage(db, formattedMsg, targetGroup, 'announcement');
     
@@ -2379,7 +2040,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
   if (cmd === '/announce') {
     if (!fullText) return sendTg(cid, `用法：/announce [公告內容]`);
     
-    const msg = `╔═══════════════════════════╗\n║  🔔 <b>重要公告</b>\n╠═══════════════════════════╣\n║\n║  ${fullText}\n║\n╠═══════════════════════════╣\n║  ⏰ ${fmtTime()}\n╚═══════════════════════════╝`;
+    const msg = `<b>重要公告</b>\n\n${escHtml(fullText)}\n\n${fmtTime()}`;
     
     const result = await broadcastMessage(db, msg, 'all', 'announcement');
     await logAction(db, uid, 'announce', '', fullText.substring(0, 50));
@@ -2406,36 +2067,22 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     const paused = await getConfig(db, 'signals_paused');
     
-    let m = `╔═══════════════════════════════════╗\n`;
-    m += `║  📊 <b>DC Signals 管理儀表板</b>\n`;
-    m += `║  v${CONFIG.VERSION} ${CONFIG.BUILD}\n`;
-    m += `╠═══════════════════════════════════╣\n`;
-    m += `║\n`;
-    m += `║  👥 用戶\n`;
-    m += `║  ─────────────────────────\n`;
-    m += `║  總計 │ ${totalUsers?.c || 0}\n`;
-    m += `║  ⭐ Pro │ ${proUsers?.c || 0}\n`;
-    m += `║  👑 VIP │ ${vipUsers?.c || 0}\n`;
-    m += `║\n`;
-    m += `╠═══════════════════════════════════╣\n`;
-    m += `║\n`;
-    m += `║  📊 今日訊號\n`;
-    m += `║  ─────────────────────────\n`;
-    m += `║  發送 │ ${todaySignals?.c || 0} 筆\n`;
+    let m = `<b>DC Signals 管理儀表板</b>\n`;
+    m += `v${CONFIG.VERSION} ${CONFIG.BUILD}\n\n`;
+    m += `<b>用戶</b>\n`;
+    m += `總計 ${totalUsers?.c || 0}\n`;
+    m += `Pro ${proUsers?.c || 0} · VIP ${vipUsers?.c || 0}\n\n`;
+    m += `<b>今日訊號</b>\n`;
+    m += `發送 ${todaySignals?.c || 0} 筆\n`;
     const winRate = todayPerf?.total > 0 ? ((todayPerf.wins / todayPerf.total) * 100).toFixed(0) : 0;
-    m += `║  勝率 │ ${winRate}%\n`;
-    m += `║  盈虧 │ ${(todayPerf?.pnl || 0) >= 0 ? '+' : ''}${fmtPrice(todayPerf?.pnl || 0)} 點\n`;
-    m += `║\n`;
+    m += `勝率 ${winRate}%\n`;
+    m += `盈虧 ${(todayPerf?.pnl || 0) >= 0 ? '+' : ''}${fmtPrice(todayPerf?.pnl || 0)} 點\n`;
     
     if (pendingOrders?.c > 0) {
-      m += `╠═══════════════════════════════════╣\n`;
-      m += `║  ⚠️ 待處理訂單：${pendingOrders.c}\n`;
+      m += `\n待處理訂單：${pendingOrders.c}\n`;
     }
     
-    m += `╠═══════════════════════════════════╣\n`;
-    m += `║  ${paused === '1' ? '⏸️ 已暫停' : '🟢 運行中'}\n`;
-    m += `║  ⏰ ${fmtTime()}\n`;
-    m += `╚═══════════════════════════════════╝`;
+    m += `\n${paused === '1' ? '已暫停' : '運行中'} · ${fmtTime()}`;
     
     const kb = {
       inline_keyboard: [
@@ -2502,7 +2149,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const settings = await getUserSettings(db, userId);
     const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
     
-    let m = `👤 <b>用戶詳情</b>\n━━━━━━━━━━━━━━━━━━\n`;
+    let m = `<b>用戶詳情</b>\n\n`;
     m += `ID：<code>${user.user_id}</code>\n`;
     m += `用戶名：${user.username ? '@' + user.username : '-'}\n`;
     m += `姓名：${user.first_name || '-'}\n\n`;
@@ -2597,7 +2244,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     if (args.length < 2) return sendTg(cid, `用法：/msg [用戶ID] [訊息]`);
     const userId = args[0];
     const message = args.slice(1).join(' ');
-    const result = await sendTg(userId, `📬 <b>管理員訊息</b>\n━━━━━━━━━━━━━━━━━━\n${message}`);
+    const result = await sendTg(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`);
     return sendTg(cid, result?.ok ? `✅ 訊息已發送給 <code>${userId}</code>` : `❌ 發送失敗`);
   }
   
@@ -2626,7 +2273,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
       m += `├ ${status}\n`;
       m += `├ ${name}\n`;
       m += `├ ${tierName(o.tier)} ${o.months}個月\n`;
-      m += `└ NT$${fmtNum(o.amount)}\n\n`;
+      m += `NT$${fmtNum(o.amount)}\n\n`;
     }
     
     m += `確認：/confirm [訂單ID]\n`;
@@ -2705,7 +2352,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     const winRate = stats?.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(1) : '0';
     
-    let m = `📈 <b>績效統計</b> (${days}天)\n━━━━━━━━━━━━━━━━━━\n\n`;
+    let m = `<b>績效統計</b> (${days}天)\n\n`;
     m += `📊 總交易：${stats?.total || 0} 筆\n`;
     m += `✅ 獲利：${stats?.wins || 0} 筆\n`;
     m += `❌ 虧損：${stats?.losses || 0} 筆\n`;
@@ -2728,14 +2375,14 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const contact = await getConfig(db, 'contact_telegram');
     const paused = await getConfig(db, 'signals_paused');
     
-    let m = `⚙️ <b>系統設定</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+    let m = `<b>系統設定</b>\n\n`;
     m += `<b>價格</b>\n`;
-    m += `├ Pro月費：NT$${proPrice}\n`;
-    m += `└ VIP月費：NT$${vipPrice}\n\n`;
+    m += `Pro月費：NT$${proPrice}\n`;
+    m += `VIP月費：NT$${vipPrice}\n\n`;
     m += `<b>其他</b>\n`;
-    m += `├ 試用天數：${trialDays}\n`;
-    m += `├ 聯繫方式：${contact}\n`;
-    m += `└ 訊號狀態：${paused === '1' ? '已暫停' : '運行中'}\n\n`;
+    m += `試用天數：${trialDays}\n`;
+    m += `聯繫方式：${contact}\n`;
+    m += `訊號狀態：${paused === '1' ? '已暫停' : '運行中'}\n\n`;
     m += `修改：/setprice /settrial /setcontact`;
     
     return sendTg(cid, m);
