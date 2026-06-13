@@ -3170,6 +3170,41 @@ function memberCanViewSignal(user, sig) {
   return true;
 }
 
+async function getMemberPlans(db) {
+  const fallback = {
+    pro: { 1: 299, 3: 807, 12: 2868 },
+    vip: { 1: 599, 3: 1617, 12: 5748 }
+  };
+  const plans = {};
+  for (const tier of ['pro', 'vip']) {
+    plans[tier] = {
+      tier,
+      name: CONFIG.TIERS[tier].name,
+      months: {}
+    };
+    for (const months of [1, 3, 12]) {
+      const configured = await getConfig(db, `${tier}_price_${months}m`);
+      const price = Number(configured || fallback[tier][months] || 0);
+      plans[tier].months[months] = {
+        months,
+        days: months * 30,
+        amount: price
+      };
+    }
+  }
+  return plans;
+}
+
+async function getMemberPaymentInfo(db) {
+  return {
+    bank: await getConfig(db, 'payment_bank') || '',
+    account: await getConfig(db, 'payment_account') || '',
+    name: await getConfig(db, 'payment_name') || '',
+    contactTelegram: await getConfig(db, 'contact_telegram') || '',
+    contactLine: await getConfig(db, 'contact_line') || ''
+  };
+}
+
 function signalDto(sig, tier = 'free') {
   return {
     signal_uid: sig.signal_uid,
@@ -3254,9 +3289,68 @@ async function getMemberBootstrap(db, userId) {
     signalTypes: CONFIG.SIGNAL_TYPES,
     signals,
     orders,
+    plans: await getMemberPlans(db),
+    payment: await getMemberPaymentInfo(db),
     botUsername: CONFIG.BOT_USERNAME,
     serverTime: fmtTime()
   };
+}
+
+async function createMemberOrder(db, env, userId, payload) {
+  const tier = String(payload.tier || '').trim().toLowerCase();
+  const months = Number(payload.months || 0);
+  if (!['pro', 'vip'].includes(tier)) throw new Error('方案不正確');
+  if (![1, 3, 12].includes(months)) throw new Error('訂閱月份不正確');
+
+  const plans = await getMemberPlans(db);
+  const plan = plans[tier]?.months?.[months];
+  if (!plan || !plan.amount) throw new Error('方案價格尚未設定');
+
+  const existing = await db.prepare(`
+    SELECT order_id FROM orders
+    WHERE user_id = ? AND status IN ('pending','paid')
+    ORDER BY created_at DESC LIMIT 1
+  `).bind(userId).first();
+  if (existing?.order_id) throw new Error(`尚有未完成訂單 ${existing.order_id}，請先付款通知或取消`);
+
+  const orderId = genOrderId();
+  await db.prepare(`
+    INSERT INTO orders (order_id, user_id, tier, months, days, amount, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(orderId, userId, tier, months, plan.days, plan.amount).run();
+
+  const user = await getUser(db, userId);
+  for (const adminId of CONFIG.ADMIN_IDS) {
+    await sendTg(adminId, `新會員中心訂單\n\n用戶：${user.username ? '@' + user.username : user.first_name || userId}\nID：<code>${escHtml(userId)}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${fmtNum(plan.amount)}`);
+  }
+
+  await logAction(db, userId, 'member_order_create', orderId, `${tier} ${months}m`);
+  return { orderId, tier, months, days: plan.days, amount: plan.amount, status: 'pending' };
+}
+
+async function updateMemberOrderStatus(db, userId, orderId, action) {
+  const normalizedOrderId = String(orderId || '').trim().toUpperCase();
+  const order = await db.prepare('SELECT * FROM orders WHERE order_id = ? AND user_id = ?').bind(normalizedOrderId, userId).first();
+  if (!order) throw new Error('找不到訂單');
+
+  if (action === 'paid') {
+    if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法通知付款');
+    await db.prepare("UPDATE orders SET status = 'paid', payment_note = '會員中心通知付款' WHERE order_id = ?").bind(normalizedOrderId).run();
+    for (const adminId of CONFIG.ADMIN_IDS) {
+      await sendTg(adminId, `會員中心付款通知\n\n訂單：<code>${normalizedOrderId}</code>\n用戶：<code>${escHtml(userId)}</code>\n金額：NT$${fmtNum(order.amount)}\n\n請至後台確認訂單。`);
+    }
+    await logAction(db, userId, 'member_order_paid', normalizedOrderId, '');
+    return { orderId: normalizedOrderId, status: 'paid' };
+  }
+
+  if (action === 'cancel') {
+    if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法取消');
+    await db.prepare("UPDATE orders SET status = 'cancelled' WHERE order_id = ?").bind(normalizedOrderId).run();
+    await logAction(db, userId, 'member_order_cancel', normalizedOrderId, '');
+    return { orderId: normalizedOrderId, status: 'cancelled' };
+  }
+
+  throw new Error('不支援的訂單操作');
 }
 
 async function updateMemberSettings(db, userId, payload) {
@@ -3328,6 +3422,14 @@ async function handleMemberApi(request, env, pathname) {
       return json({ ok: true, data: await updateMemberSettings(db, session.userId, await readJsonBody(request)) });
     }
 
+    if (request.method === 'POST' && parts[0] === 'orders' && parts.length === 1) {
+      return json({ ok: true, data: await createMemberOrder(db, env, session.userId, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'orders' && parts[1] && parts[2]) {
+      return json({ ok: true, data: await updateMemberOrderStatus(db, session.userId, parts[1], parts[2]) });
+    }
+
     return json({ ok: false, error: 'Not found' }, 404);
   } catch (e) {
     return json({ ok: false, error: e.message }, 400);
@@ -3369,6 +3471,16 @@ function renderMemberPage() {
     .panel header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:10px; align-items:center; }
     .panel .body { padding:16px; }
     .stack { display:grid; gap:10px; }
+    .plan-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .plan { border:1px solid var(--line); border-radius:8px; padding:13px; display:grid; gap:10px; background:#fff; }
+    .plan.vip { border-color:rgba(183,121,31,.35); background:#fffdf7; }
+    .plan-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .plan-head strong { display:block; font-size:16px; }
+    .plan-price { display:grid; gap:7px; }
+    .plan-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; border:1px solid var(--line); border-radius:7px; padding:8px; background:#f8fafc; }
+    .payment-box { border:1px solid rgba(8,167,179,.24); background:#f4fbfc; border-radius:8px; padding:12px; display:grid; gap:7px; }
+    .order-card { border:1px solid var(--line); border-radius:8px; padding:11px; display:grid; gap:8px; }
+    .order-actions { display:flex; gap:7px; flex-wrap:wrap; }
     .chips { display:flex; gap:7px; flex-wrap:wrap; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
     .chip.green { background:#e8f7ef; color:var(--green); }
@@ -3391,7 +3503,7 @@ function renderMemberPage() {
     .hidden { display:none !important; }
     .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
     .toast:empty { display:none; }
-    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid { grid-template-columns:1fr; } .hero h2 { font-size:23px; } }
+    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid { grid-template-columns:1fr; } .hero h2 { font-size:23px; } }
   </style>
 </head>
 <body>
@@ -3418,6 +3530,7 @@ function renderMemberPage() {
         <section class="panel"><header><h3>最新訊號</h3><span class="muted" id="signalCount"></span></header><div class="body"><div class="stack" id="signals"></div></div></section>
       </div>
       <aside class="grid">
+        <section class="panel"><header><h3>升級 / 續費</h3></header><div class="body"><div class="stack"><div class="plan-grid" id="plans"></div><div class="payment-box" id="paymentBox"></div></div></div></section>
         <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
         <section class="panel"><header><h3>訂單紀錄</h3></header><div class="body"><div class="stack" id="orders"></div></div></section>
       </aside>
@@ -3454,6 +3567,41 @@ function renderSettings(){
       checkbox('notify_entry','進場',s.notify_entry)+checkbox('notify_tp','TP',s.notify_tp)+checkbox('notify_sl','止損',s.notify_sl)+checkbox('notify_update','更新',s.notify_update)+checkbox('notify_alert','警報',s.notify_alert)+checkbox('paused','暫停接收',s.paused)+
     '</div></div>';
 }
+function renderPlans(){
+  var plans = state.plans || {};
+  var tiers = ['pro','vip'];
+  document.getElementById('plans').innerHTML = tiers.map(function(tier){
+    var plan = plans[tier];
+    if(!plan) return '';
+    var rows = [1,3,12].map(function(months){
+      var item = plan.months[String(months)] || plan.months[months];
+      if(!item) return '';
+      return '<div class="plan-row"><div><b>'+esc(months)+' 個月</b><div class="muted">'+esc(item.days)+' 天</div></div><button class="btn primary" data-buy-tier="'+esc(tier)+'" data-buy-months="'+esc(months)+'">'+money(item.amount)+'</button></div>';
+    }).join('');
+    return '<article class="plan '+(tier==='vip'?'vip':'')+'"><div class="plan-head"><div><strong>'+esc(plan.name)+'</strong><p class="muted">'+(tier==='vip'?'含完整 TP3 與 VIP 訊號':'基礎付費訊號與 TP1/TP2')+'</p></div>'+chip(tier.toUpperCase(), tier==='vip'?'amber':'green')+'</div><div class="plan-price">'+rows+'</div></article>';
+  }).join('');
+  var pay = state.payment || {};
+  document.getElementById('paymentBox').innerHTML =
+    '<b>付款資訊</b>' +
+    '<div>銀行　'+esc(pay.bank || '-')+'</div>' +
+    '<div>帳號　<code>'+esc(pay.account || '-')+'</code></div>' +
+    '<div>戶名　'+esc(pay.name || '-')+'</div>' +
+    '<div class="muted">建立訂單後付款，再點「我已付款」通知客服確認。</div>';
+}
+function orderTone(status){ return status==='confirmed'?'green':status==='rejected'||status==='cancelled'?'red':status==='paid'?'amber':''; }
+function orderStatusText(status){
+  return status==='pending'?'待付款':status==='paid'?'待確認':status==='confirmed'?'已確認':status==='rejected'?'已拒絕':status==='cancelled'?'已取消':status;
+}
+function renderOrder(o){
+  var actions = '';
+  if(o.status === 'pending') actions = '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+  if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+  return '<article class="order-card">'+
+    '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
+    '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+dateText(o.created_at)+'</div>'+
+    actions+
+  '</article>';
+}
 function render(){
   loginView.classList.add('hidden'); appView.classList.remove('hidden');
   var u=state.user; document.getElementById('memberName').textContent=(u.username?'@'+u.username:(u.first_name||u.user_id))+' · '+u.tier_name;
@@ -3463,7 +3611,8 @@ function render(){
   document.getElementById('kpis').innerHTML = [['會員等級',u.tier_name],['剩餘天數',u.tier_expires_at?Math.max(0,Math.ceil((new Date(u.tier_expires_at)-new Date())/86400000))+' 天':'-'],['已訂閱',state.settings.subscribed_symbols.length+' 個品種'],['累計消費',money(u.total_spent)]].map(function(k){return '<div class="kpi"><span>'+esc(k[0])+'</span><strong>'+esc(k[1])+'</strong></div>';}).join('');
   document.getElementById('signalCount').textContent = (state.signals||[]).length + ' 筆';
   document.getElementById('signals').innerHTML = (state.signals||[]).map(renderSignal).join('') || '<div class="muted">目前沒有可查看的訊號。</div>';
-  document.getElementById('orders').innerHTML = (state.orders||[]).map(function(o){ return '<div>'+chip(o.status,o.status==='confirmed'?'green':o.status==='rejected'?'red':'amber')+' <b>'+esc(o.order_id)+'</b><div class="muted">'+esc(o.tier)+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+dateText(o.created_at)+'</div></div>'; }).join('') || '<div class="muted">尚無訂單。</div>';
+  document.getElementById('orders').innerHTML = (state.orders||[]).map(renderOrder).join('') || '<div class="muted">尚無訂單。</div>';
+  renderPlans();
   renderSettings();
 }
 document.getElementById('saveBtn').addEventListener('click', async function(){
@@ -3479,6 +3628,30 @@ document.getElementById('saveBtn').addEventListener('click', async function(){
 });
 document.getElementById('refreshBtn').addEventListener('click', load);
 document.getElementById('logoutBtn').addEventListener('click', async function(){ await api('/api/member/logout',{method:'POST',body:'{}'}).catch(function(){}); location.reload(); });
+document.body.addEventListener('click', async function(event){
+  try{
+    var buy = event.target.closest('[data-buy-tier]');
+    if(buy){
+      await api('/api/member/orders',{method:'POST',body:JSON.stringify({tier:buy.dataset.buyTier,months:Number(buy.dataset.buyMonths)})});
+      showToast('訂單已建立，請依付款資訊轉帳');
+      await load();
+      return;
+    }
+    var paid = event.target.closest('[data-order-paid]');
+    if(paid){
+      await api('/api/member/orders/'+encodeURIComponent(paid.dataset.orderPaid)+'/paid',{method:'POST',body:'{}'});
+      showToast('已通知客服確認付款');
+      await load();
+      return;
+    }
+    var cancel = event.target.closest('[data-order-cancel]');
+    if(cancel){
+      await api('/api/member/orders/'+encodeURIComponent(cancel.dataset.orderCancel)+'/cancel',{method:'POST',body:'{}'});
+      showToast('訂單已取消');
+      await load();
+    }
+  }catch(err){ showToast(err.message,'error'); }
+});
 load();
   </script>
 </body>
