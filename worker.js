@@ -676,6 +676,104 @@ async function renderOrderPicker(cid, msgId, db, tier) {
   return editTg(cid, msgId, m, { inline_keyboard: buttons });
 }
 
+async function getTelegramUserOrders(db, userId, limit = 8) {
+  await ensureOrderPaymentSchema(db);
+  const rows = await db.prepare(`
+    SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency,
+           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, created_at, confirmed_at
+    FROM orders
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).bind(userId, limit).all();
+  const orders = rows.results || [];
+  const events = await getOrderEvents(db, orders.map((order) => order.order_id), 80);
+  for (const order of orders) {
+    order.events = events[String(order.order_id || '').toUpperCase()] || [];
+  }
+  return orders;
+}
+
+function telegramOrderStatusIcon(status) {
+  if (status === 'confirmed') return '✅';
+  if (status === 'paid') return '💰';
+  if (status === 'pending') return '⏳';
+  if (status === 'cancelled' || status === 'rejected') return '❌';
+  return '📋';
+}
+
+function telegramOrderLine(order) {
+  const method = String(order.payment_provider || order.payment_method || 'manual').toLowerCase() === 'stripe' ? '線上付款' : '轉帳';
+  return `${telegramOrderStatusIcon(order.status)} <code>${escHtml(order.order_id)}</code>\n` +
+    `${tierName(order.tier)} ${order.months || 0}個月 · ${escHtml(memberReceiptMoney(order))}\n` +
+    `狀態：${escHtml(memberOrderStatusLabel(order.status))} · ${escHtml(method)}\n` +
+    `建立：${escHtml(memberReceiptDate(order.created_at))}`;
+}
+
+function renderTelegramOrdersText(orders) {
+  let m = `<b>我的訂單</b>\n\n`;
+  if (!orders.length) {
+    m += `目前沒有訂單紀錄。\n\n可從方案頁建立訂單，或到會員中心線上續費。`;
+    return m;
+  }
+  for (const order of orders) {
+    m += `${telegramOrderLine(order)}\n\n`;
+  }
+  m += `點選下方訂單可查看付款狀態、條款紀錄與流程。`;
+  return m.trim();
+}
+
+function renderTelegramOrdersKeyboard(orders, env) {
+  const rows = orders.slice(0, 6).map((order) => ([{
+    text: `${telegramOrderStatusIcon(order.status)} ${order.order_id}`,
+    callback_data: `u_order_${order.order_id}`
+  }]));
+  rows.push([{ text: '會員中心', url: memberPortalUrl(env) }]);
+  rows.push([{ text: '方案 / 續費', callback_data: 'u_plans' }]);
+  rows.push([{ text: '« 返回', callback_data: 'u_menu' }]);
+  return { inline_keyboard: rows };
+}
+
+function renderTelegramOrderReceipt(order, events = [], env = {}) {
+  let m = `<b>${order.status === 'confirmed' ? '付款收據' : '訂單明細'}</b>\n\n`;
+  m += `訂單：<code>${escHtml(order.order_id)}</code>\n`;
+  m += `狀態：${telegramOrderStatusIcon(order.status)} ${escHtml(memberOrderStatusLabel(order.status))}\n`;
+  m += `方案：${tierName(order.tier)} ${order.months || 0}個月 / ${order.days || 0}天\n`;
+  m += `金額：<b>${escHtml(memberReceiptMoney(order))}</b>\n`;
+  m += `付款：${escHtml(memberReceiptPaymentMethod(order))}\n`;
+  m += `建立：${escHtml(memberReceiptDate(order.created_at))}\n`;
+  if (order.paid_at || order.confirmed_at) m += `付款/確認：${escHtml(memberReceiptDate(order.confirmed_at || order.paid_at))}\n`;
+  if (order.terms_accepted_at) {
+    m += `\n<b>條款紀錄</b>\n`;
+    m += `版本：${escHtml(order.terms_version || '-')}\n`;
+    m += `同意：${escHtml(memberReceiptDate(order.terms_accepted_at))}\n`;
+  }
+  if (order.payment_note) {
+    m += `\n<b>付款備註</b>\n${escHtml(order.payment_note)}\n`;
+  }
+  if (events.length) {
+    m += `\n<b>流程</b>\n`;
+    for (const event of events.slice(0, 5)) {
+      m += `• ${escHtml(memberOrderEventLabel(event.event_type))} · ${escHtml(memberReceiptDate(event.created_at))}`;
+      if (event.message) m += `\n  ${escHtml(event.message)}`;
+      m += `\n`;
+    }
+  }
+  m += `\n網站版可列印或另存 PDF。`;
+  return m.trim();
+}
+
+function renderTelegramOrderReceiptKeyboard(order, env) {
+  return {
+    inline_keyboard: [
+      [{ text: '開啟網站收據', url: `${publicBaseUrl(env)}/member/receipt/${encodeURIComponent(order.order_id)}` }],
+      [{ text: '取得會員中心登入碼', callback_data: 'u_login' }],
+      [{ text: '我的訂單', callback_data: 'u_orders' }],
+      [{ text: '« 返回', callback_data: 'u_menu' }]
+    ]
+  };
+}
+
 function renderUserMenuText(user) {
   const dl = user.tier !== 'free' ? daysLeft(user.tier_expires_at) : 0;
   let m = `<b>DC Trading Signals</b>\n\n`;
@@ -701,6 +799,7 @@ function renderUserMenuKeyboard() {
         { text: '邀請好友', callback_data: 'u_invite' }
       ],
       [
+        { text: '我的訂單', callback_data: 'u_orders' },
         { text: '會員中心', callback_data: 'u_login' }
       ],
       [
@@ -1190,6 +1289,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
         { text: '續費', callback_data: 'u_renew' },
         { text: '升級 VIP', callback_data: 'u_upgrade' }
       ],
+      [{ text: '我的訂單', callback_data: 'u_orders' }],
       [{ text: '« 返回', callback_data: 'u_menu' }]
     ];
     
@@ -1262,6 +1362,32 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
       [{ text: '« 返回', callback_data: 'u_menu' }]
     ];
     return sendTg(cid, m, { inline_keyboard: buttons });
+  }
+
+  if (cmd === '/myorders' || cmd === '/orders' || cmd === '/order') {
+    const orders = await getTelegramUserOrders(db, uid, 8);
+    return sendTg(cid, renderTelegramOrdersText(orders), renderTelegramOrdersKeyboard(orders, env));
+  }
+
+  if (cmd === '/receipt') {
+    const requestedOrderId = String(args[0] || '').trim().toUpperCase();
+    let orderId = requestedOrderId;
+    if (!orderId) {
+      const latest = await getTelegramUserOrders(db, uid, 1);
+      orderId = latest[0]?.order_id || '';
+    }
+    if (!orderId) {
+      return sendTg(cid, `<b>訂單明細</b>\n\n目前沒有可查詢的訂單。`, {
+        inline_keyboard: [[{ text: '查看方案', callback_data: 'u_plans' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+      });
+    }
+    const receipt = await getMemberOrderReceipt(db, uid, orderId);
+    if (!receipt) {
+      return sendTg(cid, `<b>訂單明細</b>\n\n找不到訂單 <code>${escHtml(orderId)}</code>，或此訂單不屬於目前會員。`, {
+        inline_keyboard: [[{ text: '我的訂單', callback_data: 'u_orders' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+      });
+    }
+    return sendTg(cid, renderTelegramOrderReceipt(receipt.order, receipt.events, env), renderTelegramOrderReceiptKeyboard(receipt.order, env));
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1654,6 +1780,10 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     m += `📊 <b>訊號功能</b>\n`;
     m += `/signals - 最新訊號\n`;
     m += `/mystats - 我的績效\n\n`;
+
+    m += `💳 <b>訂單收據</b>\n`;
+    m += `/myorders - 我的訂單\n`;
+    m += `/receipt [訂單ID] - 查詢訂單明細 / 收據\n\n`;
     
     m += `🎁 <b>積分系統</b>\n`;
     m += `/checkin - 每日簽到\n`;
@@ -1854,6 +1984,17 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     const newSettings = await getUserSettings(db, uid);
     return editTg(cid, msgId, renderCapitalText(newSettings), renderCapitalKeyboard());
   }
+
+  if (data.startsWith('u_order_')) {
+    const orderId = data.replace('u_order_', '').toUpperCase();
+    const receipt = await getMemberOrderReceipt(db, uid, orderId);
+    if (!receipt) {
+      return editTg(cid, msgId, `<b>訂單明細</b>\n\n找不到訂單 <code>${escHtml(orderId)}</code>，或此訂單不屬於目前會員。`, {
+        inline_keyboard: [[{ text: '我的訂單', callback_data: 'u_orders' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+      });
+    }
+    return editTg(cid, msgId, renderTelegramOrderReceipt(receipt.order, receipt.events, env), renderTelegramOrderReceiptKeyboard(receipt.order, env));
+  }
   
   // 訊號執行記錄
   if (data.startsWith('exec_')) {
@@ -1895,6 +2036,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'u_points') return handleUserCommand(cid, uid, '/points', [], env);
   if (data === 'u_history') return handleUserCommand(cid, uid, '/history', [], env);
   if (data === 'u_renew') return handleUserCommand(cid, uid, '/renew', [], env);
+  if (data === 'u_orders') return handleUserCommand(cid, uid, '/myorders', [], env);
   if (data === 'u_upgrade') return renderOrderPicker(cid, msgId, db, 'vip');
   if (data === 'u_redeem') return handleUserCommand(cid, uid, '/redeem', [], env);
   if (data === 'u_timezone') return handleUserCommand(cid, uid, '/timezone', [], env);
@@ -1925,11 +2067,11 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     await db.prepare(`
       INSERT INTO orders (
-        order_id, user_id, tier, months, days, amount,
+        order_id, user_id, tier, months, days, amount, payment_method, payment_provider, currency,
         terms_version, terms_accepted_at, risk_acknowledged_at, terms_client_hash, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, datetime('now'))
-    `).bind(orderId, uid, tier, months, days, price, ORDER_TERMS_VERSION, clientHash).run();
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, datetime('now'))
+    `).bind(orderId, uid, tier, months, days, price, 'manual', 'manual', stripeCurrency(env).toUpperCase(), ORDER_TERMS_VERSION, clientHash).run();
     await recordOrderEvent(db, orderId, uid, 'created', uid, `Telegram 建立 ${tierName(tier)} ${months} 個月訂單`, {
       tier,
       months,
@@ -1960,7 +2102,9 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     const buttons = [
       [{ text: '我已付款', callback_data: `paid_${orderId}` }],
+      [{ text: '訂單明細', callback_data: `u_order_${orderId}` }],
       [{ text: '取消訂單', callback_data: `cancel_${orderId}` }],
+      [{ text: '我的訂單', callback_data: 'u_orders' }],
       [{ text: '聯繫客服', callback_data: 'u_contact' }]
     ];
     
@@ -1984,7 +2128,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
       await answerCb(cbId, '此訂單狀態無法通知付款');
       return;
     }
-    await db.prepare(`UPDATE orders SET status = 'paid', payment_note = '用戶已通知付款' WHERE order_id = ?`).bind(orderId).run();
+    await db.prepare(`UPDATE orders SET status = 'paid', paid_at = COALESCE(paid_at, datetime('now')), payment_note = '用戶已通知付款' WHERE order_id = ?`).bind(orderId).run();
     await recordOrderEvent(db, orderId, uid, 'paid_notice', uid, 'Telegram 用戶已通知付款', { previousStatus: order.status });
     
     // 通知管理員
@@ -1999,7 +2143,13 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     m += `客服確認付款後會自動開通會員\n`;
     m += `請稍候，通常10分鐘內處理完成`;
     
-    return editTg(cid, msgId, m, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
+    return editTg(cid, msgId, m, {
+      inline_keyboard: [
+        [{ text: '訂單明細', callback_data: `u_order_${orderId}` }],
+        [{ text: '我的訂單', callback_data: 'u_orders' }],
+        [{ text: '« 返回', callback_data: 'u_menu' }]
+      ]
+    });
   }
   
   // 取消訂單
@@ -2017,7 +2167,13 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE order_id = ?`).bind(orderId).run();
     await recordOrderEvent(db, orderId, uid, 'cancelled', uid, 'Telegram 用戶取消訂單', { previousStatus: order.status });
     await answerCb(cbId, '訂單已取消');
-    return editTg(cid, msgId, `❌ 訂單已取消\n\n如需重新訂閱，請使用 /plans`, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
+    return editTg(cid, msgId, `❌ 訂單已取消\n\n如需重新訂閱，請使用 /plans`, {
+      inline_keyboard: [
+        [{ text: '訂單明細', callback_data: `u_order_${orderId}` }],
+        [{ text: '我的訂單', callback_data: 'u_orders' }],
+        [{ text: '« 返回', callback_data: 'u_menu' }]
+      ]
+    });
   }
   
   return null;
@@ -4243,7 +4399,12 @@ async function confirmOrderRecord(db, actorId, order, options = {}) {
   ).run();
 
   if (options.notify !== false) {
-    await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`, {
+      inline_keyboard: [
+        [{ text: '查看收據', callback_data: `u_order_${orderId}` }],
+        [{ text: '我的訂單', callback_data: 'u_orders' }]
+      ]
+    });
   }
   await recordOrderEvent(db, orderId, order.user_id, 'confirmed', actorId, `訂單確認，會員到期日 ${fmtDate(newExpiry)}`, {
     tier: order.tier,
@@ -4723,7 +4884,7 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
     if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法通知付款');
     if ((order.payment_provider || order.payment_method) === 'stripe') throw new Error('線上付款訂單請完成 Stripe Checkout');
     const paymentNote = memberPaymentNote(payload);
-    await db.prepare("UPDATE orders SET status = 'paid', payment_note = ? WHERE order_id = ?").bind(paymentNote, normalizedOrderId).run();
+    await db.prepare("UPDATE orders SET status = 'paid', paid_at = COALESCE(paid_at, datetime('now')), payment_note = ? WHERE order_id = ?").bind(paymentNote, normalizedOrderId).run();
     await recordOrderEvent(db, normalizedOrderId, userId, 'paid_notice', userId, paymentNote, payload);
     for (const adminId of CONFIG.ADMIN_IDS) {
       await sendTg(adminId, `會員中心付款通知\n\n訂單：<code>${normalizedOrderId}</code>\n用戶：<code>${escHtml(userId)}</code>\n金額：NT$${fmtNum(order.amount)}\n\n${escHtml(paymentNote)}\n\n請至後台確認訂單。`);
