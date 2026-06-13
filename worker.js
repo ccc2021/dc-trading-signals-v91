@@ -63,6 +63,10 @@ const json = (d, s = 200) => new Response(JSON.stringify(d), {
   status: s, 
   headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } 
 });
+const html = (body, status = 200, headers = {}) => new Response(body, {
+  status,
+  headers: { 'Content-Type': 'text/html; charset=utf-8', ...headers }
+});
 
 const genUID = () => Date.now().toString(36).toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
 const genRef = () => 'DC' + Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -104,6 +108,37 @@ const photoCaption = (value) => {
   if (text.length <= 1000) return text;
   return stripHtml(text).slice(0, 1000);
 };
+const textBytes = (value) => new TextEncoder().encode(String(value));
+const bytesToHex = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+const base64UrlEncode = (value) => btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+const base64UrlDecode = (value) => {
+  const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
+  return atob(padded);
+};
+
+async function sha256Bytes(value) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', textBytes(value)));
+}
+
+async function hmacHex(keyBytes, value) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', key, textBytes(value))));
+}
+
+function timingSafeEqual(a, b) {
+  const left = String(a || '');
+  const right = String(b || '');
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i++) diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return diff === 0;
+}
+
+function readCookie(request, name) {
+  const cookie = request.headers.get('Cookie') || '';
+  const match = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : '';
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Telegram API
@@ -3060,6 +3095,396 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
   throw new Error('不支援的訂單操作');
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Member Web Portal
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const MEMBER_SESSION_COOKIE = 'dc_member_session';
+const MEMBER_SESSION_TTL = 30 * 86400;
+
+async function verifyTelegramLoginPayload(payload, env) {
+  const token = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
+  if (!token) throw new Error('BOT_TOKEN 尚未設定，無法啟用 Telegram Login');
+
+  const hash = String(payload.hash || '').trim();
+  const authDate = Number(payload.auth_date || 0);
+  if (!hash || !payload.id || !authDate) throw new Error('Telegram 登入資料不完整');
+  if (Math.floor(Date.now() / 1000) - authDate > 86400) throw new Error('Telegram 登入已逾時，請重新登入');
+
+  const dataCheckString = Object.keys(payload)
+    .filter((key) => key !== 'hash' && payload[key] !== undefined && payload[key] !== null)
+    .sort()
+    .map((key) => `${key}=${payload[key]}`)
+    .join('\n');
+  const secret = await sha256Bytes(token);
+  const expected = await hmacHex(secret, dataCheckString);
+  if (!timingSafeEqual(expected, hash)) throw new Error('Telegram 登入驗證失敗');
+
+  return {
+    userId: String(payload.id),
+    username: String(payload.username || ''),
+    firstName: String(payload.first_name || ''),
+    photoUrl: String(payload.photo_url || '')
+  };
+}
+
+async function memberSessionSecret(env) {
+  return sha256Bytes(env.BOT_TOKEN || env.ADMIN_WEB_PASSWORD || 'dc-member-session');
+}
+
+async function createMemberSession(userId, env) {
+  const exp = Math.floor(Date.now() / 1000) + MEMBER_SESSION_TTL;
+  const payload = base64UrlEncode(JSON.stringify({ uid: String(userId), exp }));
+  const sig = await hmacHex(await memberSessionSecret(env), payload);
+  return `${payload}.${sig}`;
+}
+
+async function readMemberSession(request, env) {
+  const raw = readCookie(request, MEMBER_SESSION_COOKIE);
+  const [payload, sig] = raw.split('.');
+  if (!payload || !sig) return null;
+  const expected = await hmacHex(await memberSessionSecret(env), payload);
+  if (!timingSafeEqual(expected, sig)) return null;
+  try {
+    const session = JSON.parse(base64UrlDecode(payload));
+    if (!session.uid || Number(session.exp || 0) < Math.floor(Date.now() / 1000)) return null;
+    return { userId: String(session.uid) };
+  } catch {
+    return null;
+  }
+}
+
+function memberCookie(value, maxAge = MEMBER_SESSION_TTL) {
+  return `${MEMBER_SESSION_COOKIE}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function memberCanReceive(user) {
+  if (!user || user.tier === 'free' || user.is_active === 0 || user.is_banned) return false;
+  if (!user.tier_expires_at) return true;
+  return new Date(user.tier_expires_at) > new Date();
+}
+
+function memberCanViewSignal(user, sig) {
+  if (!memberCanReceive(user)) return false;
+  if ((sig.is_vip_only || sig.target_group === 'vip') && user.tier !== 'vip') return false;
+  return true;
+}
+
+function signalDto(sig, tier = 'free') {
+  return {
+    signal_uid: sig.signal_uid,
+    ticker: sig.ticker,
+    action: sig.action,
+    signal_type: sig.signal_type,
+    entry_price: sig.entry_price,
+    stop_loss: sig.stop_loss,
+    tp1: sig.tp1,
+    tp2: sig.tp2,
+    tp3: tier === 'vip' ? sig.tp3 : null,
+    status: sig.status,
+    result: sig.result,
+    pnl_points: sig.pnl_points,
+    chart_url: sig.chart_url,
+    snapshot_url: sig.snapshot_url,
+    created_at: sig.created_at,
+    closed_at: sig.closed_at,
+    target_group: sig.target_group,
+    is_vip_only: sig.is_vip_only
+  };
+}
+
+async function getMemberBootstrap(db, userId) {
+  const user = await getUser(db, userId);
+  const settings = await getUserSettings(db, userId);
+  const symbols = (await db.prepare('SELECT * FROM symbols WHERE is_active = 1 ORDER BY sort_order, symbol').all()).results || [];
+  const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
+  const signalTypes = parseJSON(settings.signal_types, []);
+
+  let signals = [];
+  if (memberCanReceive(user)) {
+    const rows = await db.prepare(`
+      SELECT * FROM signals
+      WHERE status IN ('active','closed','cancelled')
+      ORDER BY created_at DESC
+      LIMIT 60
+    `).all();
+    signals = (rows.results || [])
+      .filter((sig) => (!subscribedSymbols.length || subscribedSymbols.includes(sig.ticker)))
+      .filter((sig) => (!signalTypes.length || signalTypes.includes(sig.signal_type)))
+      .filter((sig) => memberCanViewSignal(user, sig))
+      .slice(0, 30)
+      .map((sig) => signalDto(sig, user.tier));
+  }
+
+  const orders = (await db.prepare(`
+    SELECT order_id, tier, months, days, amount, status, created_at, confirmed_at
+    FROM orders WHERE user_id = ?
+    ORDER BY created_at DESC LIMIT 10
+  `).bind(userId).all()).results || [];
+
+  return {
+    user: {
+      user_id: user.user_id,
+      username: user.username,
+      first_name: user.first_name,
+      tier: user.tier || 'free',
+      tier_name: CONFIG.TIERS[user.tier || 'free']?.name || '免費會員',
+      tier_expires_at: user.tier_expires_at,
+      points: user.points || 0,
+      total_spent: user.total_spent || 0,
+      referral_code: user.referral_code,
+      can_receive: memberCanReceive(user)
+    },
+    settings: {
+      capital: settings.capital || 10000,
+      risk_percent: settings.risk_percent || 1,
+      subscribed_symbols: subscribedSymbols,
+      signal_types: signalTypes,
+      notify_entry: !!settings.notify_entry,
+      notify_tp: !!settings.notify_tp,
+      notify_sl: !!settings.notify_sl,
+      notify_update: !!settings.notify_update,
+      notify_daily_report: !!settings.notify_daily_report,
+      notify_announcement: !!settings.notify_announcement,
+      notify_alert: !!settings.notify_alert,
+      paused: !!settings.paused,
+      timezone: settings.timezone || 'Asia/Taipei'
+    },
+    symbols,
+    signalTypes: CONFIG.SIGNAL_TYPES,
+    signals,
+    orders,
+    botUsername: CONFIG.BOT_USERNAME,
+    serverTime: fmtTime()
+  };
+}
+
+async function updateMemberSettings(db, userId, payload) {
+  await getUserSettings(db, userId);
+  const data = {};
+  const symbols = (await db.prepare('SELECT symbol FROM symbols WHERE is_active = 1').all()).results?.map((row) => row.symbol) || [];
+  if (Array.isArray(payload.subscribed_symbols)) {
+    data.subscribed_symbols = JSON.stringify(payload.subscribed_symbols.map((s) => String(s).trim().toUpperCase()).filter((s) => symbols.includes(s)));
+  }
+  if (Array.isArray(payload.signal_types)) {
+    data.signal_types = JSON.stringify(payload.signal_types.filter((type) => CONFIG.SIGNAL_TYPES[type]));
+  }
+  if (payload.capital !== undefined) {
+    const capital = asNumber(payload.capital);
+    if (capital === null || capital < 0) throw new Error('交易資金格式不正確');
+    data.capital = capital;
+  }
+  if (payload.risk_percent !== undefined) {
+    const risk = asNumber(payload.risk_percent);
+    if (risk === null || risk < 0 || risk > 20) throw new Error('風險比例需介於 0 到 20');
+    data.risk_percent = risk;
+  }
+  for (const key of ['notify_entry', 'notify_tp', 'notify_sl', 'notify_update', 'notify_daily_report', 'notify_announcement', 'notify_alert', 'paused']) {
+    if (payload[key] !== undefined) data[key] = payload[key] ? 1 : 0;
+  }
+  if (payload.timezone !== undefined) data.timezone = String(payload.timezone || 'Asia/Taipei').trim() || 'Asia/Taipei';
+  if (!Object.keys(data).length) throw new Error('沒有可更新的設定');
+  await updateUserSettings(db, userId, data);
+  return { updated: Object.keys(data) };
+}
+
+async function handleMemberApi(request, env, pathname) {
+  const db = env.DB;
+  const parts = pathname.split('/').filter(Boolean).slice(2);
+
+  try {
+    if (request.method === 'POST' && parts[0] === 'login') {
+      const verified = await verifyTelegramLoginPayload(await readJsonBody(request), env);
+      await getUser(db, verified.userId);
+      await saveUserInfo(db, verified.userId, verified.username, verified.firstName);
+      const session = await createMemberSession(verified.userId, env);
+      return new Response(JSON.stringify({ ok: true, data: await getMemberBootstrap(db, verified.userId) }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie(session)
+        }
+      });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'logout') {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie('', 0)
+        }
+      });
+    }
+
+    const session = await readMemberSession(request, env);
+    if (!session) return json({ ok: false, error: 'Unauthorized' }, 401);
+
+    if (request.method === 'GET' && parts[0] === 'me') {
+      return json({ ok: true, data: await getMemberBootstrap(db, session.userId) });
+    }
+
+    if (request.method === 'PUT' && parts[0] === 'settings') {
+      return json({ ok: true, data: await updateMemberSettings(db, session.userId, await readJsonBody(request)) });
+    }
+
+    return json({ ok: false, error: 'Not found' }, 404);
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 400);
+  }
+}
+
+function renderMemberPage() {
+  const bot = escHtml(CONFIG.BOT_USERNAME || '');
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DC Signals 會員中心</title>
+  <style>
+    :root { --bg:#f4f7f9; --panel:#fff; --ink:#101828; --muted:#667085; --line:#d9e3ea; --accent:#08a7b3; --green:#16845a; --red:#d1433f; --amber:#b7791f; --soft:#eef6f8; --shadow:0 14px 34px rgba(15,23,42,.08); }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+    button, input { font:inherit; }
+    .wrap { max-width:1180px; margin:0 auto; padding:18px 18px 38px; display:grid; gap:16px; }
+    .top { display:flex; justify-content:space-between; gap:14px; align-items:center; }
+    .brand { display:flex; gap:10px; align-items:center; }
+    .mark { width:38px; height:38px; border-radius:8px; background:linear-gradient(135deg,#12c6d0,#1796ff); display:grid; place-items:center; font-weight:900; color:#06111c; }
+    h1, h2, h3, p { margin:0; }
+    h1 { font-size:20px; }
+    .muted { color:var(--muted); }
+    .btn { border:1px solid var(--line); border-radius:7px; min-height:40px; padding:8px 12px; background:#fff; color:var(--ink); font-weight:800; cursor:pointer; }
+    .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .hero { border:1px solid var(--line); border-radius:10px; background:linear-gradient(135deg,#fff 0%,#f3fbfc 55%,#eef6ff 100%); padding:20px; box-shadow:var(--shadow); display:grid; grid-template-columns:minmax(0,1fr) auto; gap:18px; align-items:center; }
+    .hero h2 { font-size:28px; line-height:1.12; }
+    .hero p { color:var(--muted); margin-top:8px; }
+    .grid { display:grid; gap:14px; }
+    .grid.two { grid-template-columns: minmax(0,1fr) minmax(330px,.55fr); align-items:start; }
+    .kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    .panel, .kpi, .signal { background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 4px 16px rgba(15,23,42,.04); }
+    .kpi { padding:13px; }
+    .kpi span, label { display:block; color:var(--muted); font-size:12px; font-weight:800; }
+    .kpi strong { display:block; margin-top:7px; font-size:22px; }
+    .panel header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .panel .body { padding:16px; }
+    .stack { display:grid; gap:10px; }
+    .chips { display:flex; gap:7px; flex-wrap:wrap; }
+    .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
+    .chip.green { background:#e8f7ef; color:var(--green); }
+    .chip.red { background:#fff0ef; color:var(--red); }
+    .chip.amber { background:#fff7e6; color:var(--amber); }
+    .signal { padding:14px; display:grid; gap:10px; }
+    .signal-head { display:flex; justify-content:space-between; gap:10px; }
+    .signal-head strong { display:block; font-size:17px; }
+    .levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .levels div { background:#f8fafc; border-radius:7px; padding:9px; }
+    .levels span { display:block; color:var(--muted); font-size:11px; font-weight:800; margin-bottom:4px; }
+    .levels b { font-size:14px; }
+    .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .full { grid-column:1/-1; }
+    input { width:100%; border:1px solid var(--line); border-radius:7px; min-height:40px; padding:8px 10px; }
+    .check { display:flex; align-items:center; gap:8px; min-height:34px; color:var(--ink); font-size:14px; }
+    .check input { width:auto; min-height:unset; }
+    .login { min-height:70vh; display:grid; place-items:center; padding:20px; }
+    .login-card { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:12px; padding:24px; box-shadow:var(--shadow); display:grid; gap:14px; text-align:center; }
+    .hidden { display:none !important; }
+    .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
+    .toast:empty { display:none; }
+    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid { grid-template-columns:1fr; } .hero h2 { font-size:23px; } }
+  </style>
+</head>
+<body>
+  <section class="login" id="loginView">
+    <div class="login-card">
+      <div class="mark" style="margin:0 auto">DC</div>
+      <h1>DC Signals 會員中心</h1>
+      <p class="muted">使用 Telegram 登入後，可線上查看訊號與維護訂閱設定。</p>
+      ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
+    </div>
+  </section>
+  <main class="wrap hidden" id="appView">
+    <div class="top">
+      <div class="brand"><div class="mark">DC</div><div><h1>DC Signals</h1><p class="muted" id="memberName">會員中心</p></div></div>
+      <div class="chips"><button class="btn" id="refreshBtn">重新整理</button><button class="btn" id="logoutBtn">登出</button></div>
+    </div>
+    <section class="hero">
+      <div><h2 id="heroTitle">線上訊號工作台</h2><p id="heroCopy">同步 Telegram 會員資料、訂閱品種與訊號歷史。</p></div>
+      <div class="chips" id="heroChips"></div>
+    </section>
+    <section class="kpis" id="kpis"></section>
+    <section class="grid two">
+      <div class="grid">
+        <section class="panel"><header><h3>最新訊號</h3><span class="muted" id="signalCount"></span></header><div class="body"><div class="stack" id="signals"></div></div></section>
+      </div>
+      <aside class="grid">
+        <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
+        <section class="panel"><header><h3>訂單紀錄</h3></header><div class="body"><div class="stack" id="orders"></div></div></section>
+      </aside>
+    </section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <script>
+var state = null;
+var loginView = document.getElementById('loginView');
+var appView = document.getElementById('appView');
+var toast = document.getElementById('toast');
+function esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function money(value){ return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
+function price(value){ var n = Number(value); return isFinite(n) ? n.toFixed(2) : '-'; }
+function dateText(value){ if(!value) return '-'; var text=String(value); var d=new Date(/(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(text)?text:text.replace(' ','T')+'Z'); return isNaN(d.getTime())?'-':d.toLocaleString('zh-TW',{timeZone:'Asia/Taipei',hour12:false}); }
+function chip(text,tone){ return '<span class="chip '+(tone||'')+'">'+esc(text)+'</span>'; }
+function showToast(text,tone){ toast.textContent=text||''; toast.style.color=tone==='error'?'#d1433f':'#667085'; if(text) setTimeout(function(){ if(toast.textContent===text) toast.textContent=''; },3600); }
+async function api(path, options){ var res=await fetch(path,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},options||{})); var data=await res.json().catch(function(){return{};}); if(!res.ok||!data.ok) throw new Error(data.error||('HTTP '+res.status)); return data.data; }
+window.onTelegramAuth = async function(user){ try{ state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); render(); }catch(err){ showToast(err.message,'error'); } };
+async function load(){ try{ state = await api('/api/member/me'); render(); }catch(err){ loginView.classList.remove('hidden'); appView.classList.add('hidden'); } }
+function tierTone(tier){ return tier === 'vip' ? 'amber' : tier === 'pro' ? 'green' : ''; }
+function signalTone(sig){ return sig.action === 'LONG' ? 'green' : 'red'; }
+function renderSignal(sig){
+  return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+(sig.action==='LONG'?'做多':'做空'))+'</strong><p class="muted">'+esc(dateText(sig.created_at))+' · '+esc(sig.signal_type)+'</p></div>'+chip(sig.status==='active'?'進行中':sig.status, signalTone(sig))+'</div><div class="levels"><div><span>進場</span><b>'+esc(price(sig.entry_price))+'</b></div><div><span>止損</span><b>'+esc(price(sig.stop_loss))+'</b></div><div><span>TP1</span><b>'+esc(price(sig.tp1))+'</b></div><div><span>TP2 / TP3</span><b>'+esc(price(sig.tp2))+' / '+esc(price(sig.tp3))+'</b></div></div>'+(sig.chart_url?'<a class="btn" target="_blank" rel="noopener" href="'+esc(sig.chart_url)+'">開啟 TradingView</a>':'')+'</article>';
+}
+function checkbox(name,label,checked){ return '<label class="check"><input type="checkbox" name="'+esc(name)+'" '+(checked?'checked':'')+'> '+esc(label)+'</label>'; }
+function renderSettings(){
+  var s=state.settings; var symbols=state.symbols||[]; var selected=s.subscribed_symbols||[]; var types=s.signal_types||[];
+  document.getElementById('settingsForm').innerHTML =
+    '<div class="form-grid"><div><label>交易資金</label><input name="capital" inputmode="decimal" value="'+esc(s.capital)+'"></div><div><label>每筆風險 %</label><input name="risk_percent" inputmode="decimal" value="'+esc(s.risk_percent)+'"></div></div>' +
+    '<div><label>訂閱品種</label><div class="chips">'+symbols.map(function(sym){ return checkbox('sym_'+sym.symbol, sym.symbol, selected.includes(sym.symbol)); }).join('')+'</div></div>' +
+    '<div><label>訊號類型</label><div class="chips">'+Object.keys(state.signalTypes||{}).map(function(type){ return checkbox('type_'+type, state.signalTypes[type].name, types.includes(type)); }).join('')+'</div></div>' +
+    '<div><label>通知</label><div class="chips">'+
+      checkbox('notify_entry','進場',s.notify_entry)+checkbox('notify_tp','TP',s.notify_tp)+checkbox('notify_sl','止損',s.notify_sl)+checkbox('notify_update','更新',s.notify_update)+checkbox('notify_alert','警報',s.notify_alert)+checkbox('paused','暫停接收',s.paused)+
+    '</div></div>';
+}
+function render(){
+  loginView.classList.add('hidden'); appView.classList.remove('hidden');
+  var u=state.user; document.getElementById('memberName').textContent=(u.username?'@'+u.username:(u.first_name||u.user_id))+' · '+u.tier_name;
+  document.getElementById('heroTitle').textContent = u.can_receive ? '會員訊號工作台' : '會員資格尚未啟用';
+  document.getElementById('heroCopy').textContent = u.can_receive ? '可線上查看您訂閱品種的最新訊號與維護通知設定。' : '請先完成訂閱，完成後即可線上查看訊號。';
+  document.getElementById('heroChips').innerHTML = chip(u.tier_name,tierTone(u.tier)) + chip(u.tier_expires_at ? '到期 '+dateText(u.tier_expires_at) : '無到期日', u.can_receive?'green':'amber');
+  document.getElementById('kpis').innerHTML = [['會員等級',u.tier_name],['剩餘天數',u.tier_expires_at?Math.max(0,Math.ceil((new Date(u.tier_expires_at)-new Date())/86400000))+' 天':'-'],['已訂閱',state.settings.subscribed_symbols.length+' 個品種'],['累計消費',money(u.total_spent)]].map(function(k){return '<div class="kpi"><span>'+esc(k[0])+'</span><strong>'+esc(k[1])+'</strong></div>';}).join('');
+  document.getElementById('signalCount').textContent = (state.signals||[]).length + ' 筆';
+  document.getElementById('signals').innerHTML = (state.signals||[]).map(renderSignal).join('') || '<div class="muted">目前沒有可查看的訊號。</div>';
+  document.getElementById('orders').innerHTML = (state.orders||[]).map(function(o){ return '<div>'+chip(o.status,o.status==='confirmed'?'green':o.status==='rejected'?'red':'amber')+' <b>'+esc(o.order_id)+'</b><div class="muted">'+esc(o.tier)+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+dateText(o.created_at)+'</div></div>'; }).join('') || '<div class="muted">尚無訂單。</div>';
+  renderSettings();
+}
+document.getElementById('saveBtn').addEventListener('click', async function(){
+  try{
+    var form=document.getElementById('settingsForm');
+    var payload={ capital:Number(form.elements.capital.value||0), risk_percent:Number(form.elements.risk_percent.value||0), subscribed_symbols:[], signal_types:[] };
+    (state.symbols||[]).forEach(function(sym){ if(form.elements['sym_'+sym.symbol]?.checked) payload.subscribed_symbols.push(sym.symbol); });
+    Object.keys(state.signalTypes||{}).forEach(function(type){ if(form.elements['type_'+type]?.checked) payload.signal_types.push(type); });
+    ['notify_entry','notify_tp','notify_sl','notify_update','notify_alert','paused'].forEach(function(key){ payload[key]=!!form.elements[key]?.checked; });
+    await api('/api/member/settings',{method:'PUT',body:JSON.stringify(payload)});
+    showToast('設定已儲存'); await load();
+  }catch(err){ showToast(err.message,'error'); }
+});
+document.getElementById('refreshBtn').addEventListener('click', load);
+document.getElementById('logoutBtn').addEventListener('click', async function(){ await api('/api/member/logout',{method:'POST',body:'{}'}).catch(function(){}); location.reload(); });
+load();
+  </script>
+</body>
+</html>`;
+}
+
 function normalizeTvTicker(value) {
   const raw = String(value || '').trim().toUpperCase().split(':').pop().replace(/[^A-Z0-9]/g, '');
   const aliases = [
@@ -4823,6 +5248,14 @@ export default {
 
     if (url.pathname.startsWith('/api/admin/')) {
       return handleAdminApi(request, env, url.pathname);
+    }
+
+    if (url.pathname === '/member' || url.pathname === '/member/') {
+      return html(renderMemberPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+
+    if (url.pathname.startsWith('/api/member/')) {
+      return handleMemberApi(request, env, url.pathname);
     }
 
     const tvMatch = url.pathname.match(/^\/(?:tv|tradingview|webhook\/tradingview)\/([A-Za-z0-9-]+)$/);
