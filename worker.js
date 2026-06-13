@@ -665,7 +665,8 @@ async function renderOrderPicker(cid, msgId, db, tier) {
     12: await getConfig(db, `${tier}_price_12m`) || (tier === 'vip' ? '5748' : '2868')
   };
   let m = `<b>訂閱 ${tierName(tier)}</b>\n\n`;
-  m += `選擇訂閱時長，系統會建立付款訂單。`;
+  m += `選擇訂閱時長，系統會建立付款訂單。\n\n`;
+  m += `點選方案即表示您已閱讀並同意服務條款與交易風險揭露（版本 ${ORDER_TERMS_VERSION}）。`;
   const buttons = [
     [{ text: `1個月 NT$${prices[1]}`, callback_data: `buy_${tier}_1` }],
     [{ text: `3個月 NT$${prices[3]} (省10%)`, callback_data: `buy_${tier}_3` }],
@@ -1919,16 +1920,27 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     const price = parseInt(await getConfig(db, `${tier}_price_${months}m`));
     const days = months * 30;
     const orderId = genOrderId();
+    await ensureOrderPaymentSchema(db);
+    const clientHash = (await sha256Hex(`telegram:${uid}`)).slice(0, 40);
     
     await db.prepare(`
-      INSERT INTO orders (order_id, user_id, tier, months, days, amount, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind(orderId, uid, tier, months, days, price).run();
+      INSERT INTO orders (
+        order_id, user_id, tier, months, days, amount,
+        terms_version, terms_accepted_at, risk_acknowledged_at, terms_client_hash, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, datetime('now'))
+    `).bind(orderId, uid, tier, months, days, price, ORDER_TERMS_VERSION, clientHash).run();
     await recordOrderEvent(db, orderId, uid, 'created', uid, `Telegram 建立 ${tierName(tier)} ${months} 個月訂單`, {
       tier,
       months,
       amount: price,
-      paymentProvider: 'manual'
+      paymentProvider: 'manual',
+      termsVersion: ORDER_TERMS_VERSION,
+      riskAcknowledged: true
+    });
+    await recordOrderEvent(db, orderId, uid, 'terms_accepted', uid, `Telegram 會員同意服務條款與交易風險揭露 ${ORDER_TERMS_VERSION}`, {
+      termsVersion: ORDER_TERMS_VERSION,
+      clientHash
     });
     
     const bank = await getConfig(db, 'payment_bank');
@@ -3533,9 +3545,14 @@ const MEMBER_OAUTH_COOKIE = 'dc_oauth_state';
 const MEMBER_SESSION_TTL = 30 * 86400;
 const MEMBER_OAUTH_TTL = 10 * 60;
 const MEMBER_PASSWORD_ITERATIONS = 100000;
+const ORDER_TERMS_VERSION = '2026-06-13';
 
 function memberPortalUrl(env = {}) {
   return `${publicBaseUrl(env)}/member`;
+}
+
+function memberTermsUrl(env = {}) {
+  return `${publicBaseUrl(env)}/terms`;
 }
 
 function genLoginCode() {
@@ -3604,6 +3621,10 @@ async function ensureOrderPaymentSchema(db) {
   await addColumnIfMissing(db, 'orders', 'payment_url', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'currency', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'paid_at', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'terms_version', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'terms_accepted_at', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'risk_acknowledged_at', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'terms_client_hash', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_session ON orders(payment_session_id)').run();
   await ensureOrderEventSchema(db);
@@ -4339,7 +4360,9 @@ async function getMemberPaymentInfo(db, env = {}) {
     contactTelegram: await getConfig(db, 'contact_telegram') || '',
     contactLine: await getConfig(db, 'contact_line') || '',
     stripeEnabled: stripeEnabledPublic(env),
-    stripeCurrency: stripeCurrency(env).toUpperCase()
+    stripeCurrency: stripeCurrency(env).toUpperCase(),
+    termsVersion: ORDER_TERMS_VERSION,
+    termsUrl: memberTermsUrl(env)
   };
 }
 
@@ -4450,7 +4473,8 @@ async function getMemberBootstrap(db, userId, env = {}) {
   }
 
   const orders = (await db.prepare(`
-    SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency, paid_at, created_at, confirmed_at
+    SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency,
+           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, created_at, confirmed_at
     FROM orders WHERE user_id = ?
     ORDER BY created_at DESC LIMIT 10
   `).bind(userId).all()).results || [];
@@ -4499,14 +4523,29 @@ async function getMemberBootstrap(db, userId, env = {}) {
   };
 }
 
-async function createMemberOrder(db, env, userId, payload) {
+function boolAccepted(value) {
+  return value === true || value === 'true' || value === '1' || value === 1;
+}
+
+async function termsClientHash(request) {
+  const ip = request ? requestClientIp(request) : 'unknown';
+  const ua = request ? String(request.headers.get('user-agent') || '').slice(0, 240) : '';
+  return (await sha256Hex(`terms:${ip}:${ua}`)).slice(0, 40);
+}
+
+async function createMemberOrder(db, env, userId, payload, request = null) {
   await ensureOrderPaymentSchema(db);
   const tier = String(payload.tier || '').trim().toLowerCase();
   const months = Number(payload.months || 0);
   const paymentProvider = String(payload.payment_provider || payload.paymentProvider || payload.method || 'manual').trim().toLowerCase();
+  const termsAccepted = boolAccepted(payload.accept_terms ?? payload.acceptTerms ?? payload.terms_accepted ?? payload.termsAccepted);
+  const riskAcknowledged = boolAccepted(payload.risk_acknowledged ?? payload.riskAcknowledged ?? payload.accept_risk ?? payload.acceptRisk);
+  const acceptedTermsVersion = String(payload.terms_version || payload.termsVersion || ORDER_TERMS_VERSION).trim();
   if (!['pro', 'vip'].includes(tier)) throw new Error('方案不正確');
   if (![1, 3, 12].includes(months)) throw new Error('訂閱月份不正確');
   if (!['manual', 'stripe'].includes(paymentProvider)) throw new Error('付款方式不正確');
+  if (!termsAccepted || !riskAcknowledged) throw new Error('請先閱讀並同意服務條款與交易風險揭露');
+  if (acceptedTermsVersion !== ORDER_TERMS_VERSION) throw new Error('服務條款版本已更新，請重新整理後再下單');
   if (paymentProvider === 'stripe' && !stripeEnabledPublic(env)) throw new Error('線上付款尚未完整啟用，請先設定 Stripe secret 與 webhook secret，或改用轉帳付款');
 
   const plans = await getMemberPlans(db);
@@ -4521,15 +4560,28 @@ async function createMemberOrder(db, env, userId, payload) {
   if (existing?.order_id) throw new Error(`尚有未完成訂單 ${existing.order_id}，請先付款通知或取消`);
 
   const orderId = genOrderId();
+  const clientHash = await termsClientHash(request);
   await db.prepare(`
-    INSERT INTO orders (order_id, user_id, tier, months, days, amount, payment_method, payment_provider, currency, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-  `).bind(orderId, userId, tier, months, plan.days, plan.amount, paymentProvider, paymentProvider, stripeCurrency(env).toUpperCase()).run();
+    INSERT INTO orders (
+      order_id, user_id, tier, months, days, amount, payment_method, payment_provider, currency,
+      terms_version, terms_accepted_at, risk_acknowledged_at, terms_client_hash, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, datetime('now'))
+  `).bind(
+    orderId, userId, tier, months, plan.days, plan.amount, paymentProvider, paymentProvider, stripeCurrency(env).toUpperCase(),
+    ORDER_TERMS_VERSION, clientHash
+  ).run();
   await recordOrderEvent(db, orderId, userId, 'created', userId, `會員中心建立 ${tierName(tier)} ${months} 個月訂單`, {
     tier,
     months,
     amount: plan.amount,
-    paymentProvider
+    paymentProvider,
+    termsVersion: ORDER_TERMS_VERSION,
+    riskAcknowledged: true
+  });
+  await recordOrderEvent(db, orderId, userId, 'terms_accepted', userId, `會員同意服務條款與交易風險揭露 ${ORDER_TERMS_VERSION}`, {
+    termsVersion: ORDER_TERMS_VERSION,
+    clientHash
   });
 
   const user = await getUser(db, userId);
@@ -4777,7 +4829,7 @@ async function handleMemberApi(request, env, pathname) {
         60 * 60,
         '訂單建立太頻繁，請稍後再試'
       );
-      return json({ ok: true, data: await createMemberOrder(db, env, session.userId, await readJsonBody(request)) });
+      return json({ ok: true, data: await createMemberOrder(db, env, session.userId, await readJsonBody(request), request) });
     }
 
     if (request.method === 'POST' && parts[0] === 'orders' && parts[1] && parts[2]) {
@@ -4850,6 +4902,7 @@ function renderMemberPage() {
     .proof-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .security-grid { display:grid; gap:9px; }
     .security-meta { display:grid; gap:6px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-size:13px; }
+    .terms-box { border:1px solid rgba(183,121,31,.26); background:#fffdf5; border-radius:8px; padding:10px; display:grid; gap:8px; font-size:13px; line-height:1.5; }
     .chips { display:flex; gap:7px; flex-wrap:wrap; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
     .chip.green { background:#e8f7ef; color:var(--green); }
@@ -5169,6 +5222,11 @@ function renderPlans(){
     '<div>銀行　'+esc(pay.bank || '-')+'</div>' +
     '<div>帳號　<code>'+esc(pay.account || '-')+'</code></div>' +
     '<div>戶名　'+esc(pay.name || '-')+'</div>' +
+    '<div class="terms-box">'+
+      '<b>交易風險與服務條款</b>'+
+      '<div>訊號僅供交易參考，不保證獲利；交易可能造成本金損失，請自行控管風險。</div>'+
+      '<label class="check"><input id="acceptOrderTerms" type="checkbox"> 我已閱讀並同意 <a href="'+esc(pay.termsUrl || '/terms')+'" target="_blank" rel="noopener">服務條款與風險揭露</a>（版本 '+esc(pay.termsVersion || '-')+'）</label>'+
+    '</div>'+
     '<div class="muted">建立訂單後付款，再點「我已付款」通知客服確認。</div>';
 }
 function orderTone(status){ return status==='confirmed'?'green':status==='rejected'||status==='cancelled'?'red':status==='paid'?'amber':''; }
@@ -5193,6 +5251,7 @@ function paymentNoteHtml(note){
 function renderOrder(o){
   var actions = '';
   var method = o.payment_provider || o.payment_method || 'manual';
+  var terms = o.terms_accepted_at ? '<div class="muted">條款版本 '+esc(o.terms_version || '-')+' · 同意 '+dateText(o.terms_accepted_at)+'</div>' : '';
   if(o.status === 'pending' && method === 'stripe') actions =
     '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
   if(o.status === 'pending' && method !== 'stripe') actions =
@@ -5207,6 +5266,7 @@ function renderOrder(o){
   return '<article class="order-card">'+
     '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
     '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+esc(method === 'stripe' ? '線上付款' : '轉帳')+' · '+dateText(o.created_at)+'</div>'+
+    terms+
     paymentNoteHtml(o.payment_note)+
     orderTimeline(o.events)+
     actions+
@@ -5278,7 +5338,12 @@ document.body.addEventListener('click', async function(event){
   try{
     var buy = event.target.closest('[data-buy-tier]');
     if(buy){
-      var order = await api('/api/member/orders',{method:'POST',body:JSON.stringify({tier:buy.dataset.buyTier,months:Number(buy.dataset.buyMonths),payment_provider:buy.dataset.buyMethod || 'manual'})});
+      var accepted = !!document.getElementById('acceptOrderTerms')?.checked;
+      if(!accepted){
+        showToast('請先同意服務條款與交易風險揭露','error');
+        return;
+      }
+      var order = await api('/api/member/orders',{method:'POST',body:JSON.stringify({tier:buy.dataset.buyTier,months:Number(buy.dataset.buyMonths),payment_provider:buy.dataset.buyMethod || 'manual',accept_terms:accepted,risk_acknowledged:accepted,terms_version:(state.payment && state.payment.termsVersion) || ''})});
       if(order.checkoutUrl){
         location.href = order.checkoutUrl;
         return;
@@ -5310,6 +5375,48 @@ document.body.addEventListener('click', async function(event){
 load();
 loadOAuthProviders();
   </script>
+</body>
+</html>`;
+}
+
+function renderTermsPage() {
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>服務條款與交易風險揭露</title>
+  <style>
+    body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f7f9;color:#101828;line-height:1.7}
+    main{max-width:820px;margin:0 auto;padding:28px 18px 48px}
+    article{background:#fff;border:1px solid #d9e3ea;border-radius:10px;padding:22px;box-shadow:0 14px 34px rgba(15,23,42,.08)}
+    h1{font-size:28px;line-height:1.15;margin:0 0 8px} h2{font-size:18px;margin:22px 0 8px} p,li{color:#475467} a{color:#087e90;font-weight:800}
+    .meta{color:#667085;font-size:13px;margin-bottom:18px}.notice{border:1px solid rgba(183,121,31,.28);background:#fffdf5;border-radius:8px;padding:12px;margin:14px 0}
+  </style>
+</head>
+<body>
+  <main>
+    <article>
+      <h1>服務條款與交易風險揭露</h1>
+      <div class="meta">版本 ${escHtml(ORDER_TERMS_VERSION)} · DC Trading Signals</div>
+      <div class="notice"><b>重要提醒：</b>本服務提供交易訊號、策略資訊與會員工具，內容僅供參考，不構成投資建議、保證獲利或代客操作承諾。</div>
+      <h2>1. 服務內容</h2>
+      <p>會員可依訂閱等級查看訊號、歷史紀錄、訂閱品種、通知設定與付款紀錄。訊號可能透過網站、Telegram 或其他系統管道提供。</p>
+      <h2>2. 交易風險</h2>
+      <ul>
+        <li>金融商品交易具有高風險，可能發生虧損，包含本金損失。</li>
+        <li>任何訊號、價格、停損、停利或績效紀錄都不保證未來結果。</li>
+        <li>會員應自行評估資金、槓桿、口數、風險承受度與交易適合性。</li>
+      </ul>
+      <h2>3. 會員責任</h2>
+      <p>會員需自行保管帳號密碼，不得轉售、公開散布或與未授權第三方分享訊號內容。若發現異常登入或帳號外流，應立即修改密碼或聯繫客服。</p>
+      <h2>4. 付款與訂閱</h2>
+      <p>建立訂單前，會員需同意本條款與風險揭露。轉帳訂單需由客服確認入帳；線上付款訂單依第三方支付 webhook 結果自動或人工確認。</p>
+      <h2>5. 系統限制</h2>
+      <p>TradingView、Telegram、支付服務、網路連線或雲端平台可能發生延遲或中斷。系統會盡力保存紀錄與狀態，但不保證所有通知即時送達。</p>
+      <p><a href="/member">返回會員中心</a></p>
+    </article>
+  </main>
 </body>
 </html>`;
 }
@@ -6614,7 +6721,8 @@ function orderRow(order, compact) {
   var session = order.payment_session_id ? '<div class="muted"><code>' + esc(order.payment_session_id) + '</code></div>' : '';
   var lastEvent = latestOrderEvent(order.order_id);
   var eventHtml = lastEvent ? '<div class="order-event"><b>' + esc(orderEventLabel(lastEvent.event_type)) + '</b> ' + esc(dateText(lastEvent.created_at)) + (lastEvent.message ? '<br>' + esc(lastEvent.message) : '') + '</div>' : '';
-  var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
+  var terms = order.terms_accepted_at ? '<div class="muted">條款 ' + esc(order.terms_version || '-') + ' · ' + esc(dateText(order.terms_accepted_at)) + '</div>' : '<div class="muted">條款：未記錄</div>';
+  var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + terms + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
   note += eventHtml;
   if (!note) note = '<span class="muted">-</span>';
   if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code><div class="note-cell">' + note + '</div></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
@@ -7240,6 +7348,10 @@ export default {
 
     if (url.pathname.startsWith('/api/admin/')) {
       return handleAdminApi(request, env, url.pathname);
+    }
+
+    if (url.pathname === '/terms' || url.pathname === '/terms/') {
+      return html(renderTermsPage(), 200, { 'Cache-Control': 'no-store' });
     }
 
     if (url.pathname === '/member' || url.pathname === '/member/' || url.pathname === '/login' || url.pathname === '/login/') {
