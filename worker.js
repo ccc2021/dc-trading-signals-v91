@@ -75,6 +75,7 @@ const genTicketId = () => 'TKT' + Date.now().toString(36).toUpperCase();
 const isAdmin = (id) => CONFIG.ADMIN_IDS.includes(String(id));
 const tierName = (t) => (CONFIG.TIERS[t]?.emoji || '👤') + ' ' + (CONFIG.TIERS[t]?.name || '免費會員');
 const tierEmoji = (t) => CONFIG.TIERS[t]?.emoji || '👤';
+const tierRank = (t) => ({ free: 0, pro: 1, vip: 2 }[String(t || 'free')] || 0);
 const fmtNum = (n) => n?.toLocaleString() || '0';
 const fmtPrice = (n) => n?.toFixed(2) || '0.00';
 const fmtDate = (d) => d ? new Date(d).toLocaleDateString('zh-TW') : '-';
@@ -84,6 +85,15 @@ const formatUserLabel = (user, fallback = '') => {
   const username = String(user?.username || '').trim();
   if (username) return username.includes('@') ? username : `@${username}`;
   return user?.first_name || fallback || user?.user_id || '-';
+};
+const effectiveTierRank = (user) => memberCanReceive(user) ? tierRank(user?.tier) : 0;
+const latestDateValue = (...values) => {
+  let latest = null;
+  for (const value of values) {
+    const parsed = parseDbTime(value);
+    if (parsed && (!latest || parsed > latest)) latest = parsed;
+  }
+  return latest ? latest.toISOString() : null;
 };
 const parseDbTime = (d) => {
   if (!d) return null;
@@ -176,9 +186,38 @@ function isTelegramChatId(value) {
   return /^-?\d+$/.test(String(value || '').trim());
 }
 
+async function ensureTelegramLinkSchema(db) {
+  await addColumnIfMissing(db, 'users', 'telegram_user_id', 'TEXT');
+  await addColumnIfMissing(db, 'users', 'telegram_linked_at', 'TEXT');
+  await db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_user ON users(telegram_user_id)').run();
+}
+
+async function resolveMemberUserId(db, userId) {
+  const incomingId = String(userId || '');
+  if (!incomingId || !isTelegramChatId(incomingId)) return incomingId;
+  await ensureTelegramLinkSchema(db);
+  const linked = await db.prepare(`
+    SELECT user_id FROM users
+    WHERE telegram_user_id = ? AND user_id != ?
+    LIMIT 1
+  `).bind(incomingId, incomingId).first();
+  return linked?.user_id || incomingId;
+}
+
+async function memberTelegramChatId(db, userId) {
+  const id = String(userId || '').trim();
+  if (!id) return '';
+  if (isTelegramChatId(id)) return id;
+  if (!db) return '';
+  await ensureTelegramLinkSchema(db);
+  const row = await db.prepare('SELECT telegram_user_id FROM users WHERE user_id = ?').bind(id).first();
+  return isTelegramChatId(row?.telegram_user_id) ? String(row.telegram_user_id) : '';
+}
+
 async function sendMemberNotice(userId, text, kb = null, options = {}) {
-  if (!isTelegramChatId(userId)) return { ok: false, skipped: true };
-  return sendTg(userId, text, kb, options);
+  const chatId = await memberTelegramChatId(options.db, userId);
+  if (!chatId) return { ok: false, skipped: true };
+  return sendTg(chatId, text, kb, options);
 }
 
 async function sendTgPhoto(chatId, photoUrl, caption = '', kb = null) {
@@ -1016,9 +1055,10 @@ async function isInQuietHours(settings) {
 
 async function broadcastSignal(db, signal, env = {}) {
   await addColumnIfMissing(db, 'queued_signals', 'photo_url', 'TEXT');
+  await ensureTelegramLinkSchema(db);
   // 取得所有付費會員
   const users = await db.prepare(`
-    SELECT u.user_id, u.tier, us.*
+    SELECT u.user_id, u.telegram_user_id, u.tier, us.*
     FROM users u
     LEFT JOIN user_settings us ON u.user_id = us.user_id
     WHERE u.is_active = 1 AND u.is_banned = 0 AND u.tier != 'free'
@@ -1028,7 +1068,8 @@ async function broadcastSignal(db, signal, env = {}) {
   let sent = 0, queued = 0, skipped = 0;
   
   for (const user of users.results || []) {
-    if (!isTelegramChatId(user.user_id)) {
+    const chatId = isTelegramChatId(user.telegram_user_id) ? user.telegram_user_id : user.user_id;
+    if (!isTelegramChatId(chatId)) {
       skipped++;
       continue;
     }
@@ -1057,7 +1098,7 @@ async function broadcastSignal(db, signal, env = {}) {
       await db.prepare(`
         INSERT INTO queued_signals (user_id, signal_uid, message, photo_url, scheduled_at)
         VALUES (?, ?, ?, ?, datetime('now', '+8 hours'))
-      `).bind(user.user_id, signal.signal_uid, msg, signalPhotoUrl(signal, env) || null).run();
+      `).bind(chatId, signal.signal_uid, msg, signalPhotoUrl(signal, env) || null).run();
       queued++;
       continue;
     }
@@ -1070,7 +1111,7 @@ async function broadcastSignal(db, signal, env = {}) {
       ]]
     };
     
-	    const r = await sendSignalTg(user.user_id, signal, msg, kb, env);
+    const r = await sendSignalTg(chatId, signal, msg, kb, env);
     if (r?.ok) sent++; else skipped++;
     
     // 避免頻率限制
@@ -1081,8 +1122,9 @@ async function broadcastSignal(db, signal, env = {}) {
 }
 
 async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
+  await ensureTelegramLinkSchema(db);
   const users = await db.prepare(`
-    SELECT u.user_id, us.notify_tp, us.notify_sl
+    SELECT u.user_id, u.telegram_user_id, us.notify_tp, us.notify_sl
     FROM users u
     LEFT JOIN user_settings us ON u.user_id = us.user_id
     WHERE u.is_active = 1 AND u.is_banned = 0 AND u.tier != 'free'
@@ -1096,7 +1138,9 @@ async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
     if (type.startsWith('TP') && !user.notify_tp) continue;
     if (type === 'SL' && !user.notify_sl) continue;
     
-    const r = await sendTg(user.user_id, msg);
+    const chatId = isTelegramChatId(user.telegram_user_id) ? user.telegram_user_id : user.user_id;
+    if (!isTelegramChatId(chatId)) continue;
+    const r = await sendTg(chatId, msg);
     if (r?.ok) sent++;
     
     if (sent % 20 === 0) await new Promise(r => setTimeout(r, 100));
@@ -1106,8 +1150,9 @@ async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
 }
 
 async function broadcastMessage(db, message, targetGroup = 'all', notifyType = 'announcement') {
+  await ensureTelegramLinkSchema(db);
   let query = `
-    SELECT u.user_id, us.*
+    SELECT u.user_id, u.telegram_user_id, us.*
     FROM users u
     LEFT JOIN user_settings us ON u.user_id = us.user_id
     WHERE u.is_active = 1 AND u.is_banned = 0
@@ -1127,7 +1172,7 @@ async function broadcastMessage(db, message, targetGroup = 'all', notifyType = '
     
     let sent = 0;
     for (const m of members.results || []) {
-      const r = await sendTg(m.user_id, message);
+      const r = await sendMemberNotice(m.user_id, message, null, { db });
       if (r?.ok) sent++;
     }
     return { sent };
@@ -1142,7 +1187,9 @@ async function broadcastMessage(db, message, targetGroup = 'all', notifyType = '
     if (notifyType === 'alert' && !user.notify_alert) continue;
     if (notifyType === 'daily_report' && !user.notify_daily_report) continue;
     
-    const r = await sendTg(user.user_id, message);
+    const chatId = isTelegramChatId(user.telegram_user_id) ? user.telegram_user_id : user.user_id;
+    if (!isTelegramChatId(chatId)) continue;
+    const r = await sendTg(chatId, message);
     if (r?.ok) sent++;
     
     if (sent % 20 === 0) await new Promise(r => setTimeout(r, 100));
@@ -1156,6 +1203,8 @@ async function broadcastMessage(db, message, targetGroup = 'all', notifyType = '
 
 async function handleUserCommand(cid, uid, cmd, args, env) {
   const db = env.DB;
+  const telegramUid = String(uid);
+  uid = await resolveMemberUserId(db, telegramUid);
   const user = await getUser(db, uid);
   const settings = await getUserSettings(db, uid);
 
@@ -1866,6 +1915,8 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
 
 async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   const db = env.DB;
+  const telegramUid = String(uid);
+  uid = await resolveMemberUserId(db, telegramUid);
   const user = await getUser(db, uid);
   const settings = await getUserSettings(db, uid);
   data = normalizeUserCallback(data);
@@ -2730,7 +2781,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await updateUser(db, userId, { tier, tier_expires_at: expires });
     await logAction(db, uid, `set_${tier}`, userId, `${days} days`);
     
-    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ${tierName(tier)}\n\n天數：${days} 天\n到期：${fmtDate(expires)}\n\n請使用 /subscribe 設定您想接收的品種`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ${tierName(tier)}\n\n天數：${days} 天\n到期：${fmtDate(expires)}\n\n請使用 /subscribe 設定您想接收的品種`, null, { db });
     
     return sendTg(cid, `✅ 已將 <code>${userId}</code> 設為 ${tierName(tier)} (${days}天)`);
   }
@@ -2752,7 +2803,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, `${days} days`);
     
-    await sendMemberNotice(userId, `🎉 您的會員已延長 <b>${days}</b> 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 <b>${days}</b> 天！\n新到期日：${fmtDate(newExpiry)}`, null, { db });
     
     return sendTg(cid, `✅ 已為 <code>${userId}</code> 延長 ${days} 天`);
   }
@@ -2775,7 +2826,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     if (args.length < 2) return sendTg(cid, `用法：/msg [用戶ID] [訊息]`);
     const userId = args[0];
     const message = args.slice(1).join(' ');
-    const result = await sendMemberNotice(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`);
+    const result = await sendMemberNotice(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`, null, { db });
     return sendTg(cid, result?.ok ? `✅ 訊息已發送給 <code>${userId}</code>` : `❌ 發送失敗`);
   }
 
@@ -2877,7 +2928,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     await db.prepare(`UPDATE orders SET status = 'rejected' WHERE order_id = ?`).bind(orderId).run();
     await recordOrderEvent(db, orderId, order.user_id, 'rejected', uid, reason, { source: 'telegram-admin' });
-    await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
+    await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`, null, { db });
     
     return sendTg(cid, `✅ 訂單 ${orderId} 已拒絕`);
   }
@@ -3043,7 +3094,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     const expires = new Date(Date.now() + 30 * 86400000).toISOString();
     await updateUser(db, userId, { tier: 'pro', tier_expires_at: expires });
     await logAction(db, uid, 'set_pro', userId, '30 days');
-    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ⭐ Pro會員\n天數：30天\n到期：${fmtDate(expires)}`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ⭐ Pro會員\n天數：30天\n到期：${fmtDate(expires)}`, null, { db });
     await answerCb(cbId, '已設為Pro 30天');
     return;
   }
@@ -3053,7 +3104,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     const expires = new Date(Date.now() + 30 * 86400000).toISOString();
     await updateUser(db, userId, { tier: 'vip', tier_expires_at: expires });
     await logAction(db, uid, 'set_vip', userId, '30 days');
-    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 👑 VIP會員\n天數：30天\n到期：${fmtDate(expires)}`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 👑 VIP會員\n天數：30天\n到期：${fmtDate(expires)}`, null, { db });
     await answerCb(cbId, '已設為VIP 30天');
     return;
   }
@@ -3069,7 +3120,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     }
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '7 days');
-    await sendMemberNotice(userId, `🎉 您的會員已延長 7 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 7 天！\n新到期日：${fmtDate(newExpiry)}`, null, { db });
     await answerCb(cbId, '已延長7天');
     return;
   }
@@ -3085,7 +3136,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     }
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '30 days');
-    await sendMemberNotice(userId, `🎉 您的會員已延長 30 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 30 天！\n新到期日：${fmtDate(newExpiry)}`, null, { db });
     await answerCb(cbId, '已延長30天');
     return;
   }
@@ -4061,7 +4112,7 @@ async function refundOrderRecord(db, actorId, order, payload = {}) {
         [{ text: '查看訂單', callback_data: `u_order_${orderId}` }],
         [{ text: '我的訂單', callback_data: 'u_orders' }]
       ]
-    });
+    }, { db });
   }
 
   await logAction(db, actorId, payload.action || 'order_refund', orderId, `${refundAmount} ${reason}`);
@@ -4125,7 +4176,7 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
     const reason = String(payload.reason || '未說明');
     await db.prepare("UPDATE orders SET status = 'rejected' WHERE order_id = ?").bind(normalizedOrderId).run();
     await recordOrderEvent(db, normalizedOrderId, order.user_id, 'rejected', adminId, reason, { source: 'admin-web' });
-    if (payload.notify !== false) await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
+    if (payload.notify !== false) await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`, null, { db });
     await logAction(db, adminId, 'web_order_reject', normalizedOrderId, reason);
     return { orderId: normalizedOrderId, status: 'rejected' };
   }
@@ -4341,6 +4392,164 @@ async function loginMemberWithCode(db, env, payload) {
   await getUser(db, row.user_id);
   const session = await createMemberSession(row.user_id, env);
   return { session, data: await getMemberBootstrap(db, row.user_id, env) };
+}
+
+async function mergeUserOwnedRows(db, currentUserId, telegramUserId) {
+  const run = async (sql, ...params) => {
+    try { await db.prepare(sql).bind(...params).run(); } catch (e) {}
+  };
+
+  await run(`
+    INSERT OR IGNORE INTO user_executions (
+      user_id, signal_uid, status, actual_entry, actual_contracts, actual_exit,
+      actual_pnl, notes, created_at, updated_at
+    )
+    SELECT ?, signal_uid, status, actual_entry, actual_contracts, actual_exit,
+           actual_pnl, notes, created_at, updated_at
+    FROM user_executions
+    WHERE user_id = ?
+  `, currentUserId, telegramUserId);
+  await run('DELETE FROM user_executions WHERE user_id = ?', telegramUserId);
+
+  await run(`
+    INSERT OR IGNORE INTO group_members (group_name, user_id, added_at)
+    SELECT group_name, ?, added_at
+    FROM group_members
+    WHERE user_id = ?
+  `, currentUserId, telegramUserId);
+  await run('DELETE FROM group_members WHERE user_id = ?', telegramUserId);
+
+  await run('UPDATE orders SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE order_events SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE order_events SET actor_id = ? WHERE actor_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE support_tickets SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE support_tickets SET last_actor_id = ? WHERE last_actor_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE support_replies SET actor_id = ? WHERE actor_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE point_history SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE member_login_codes SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+  await run('UPDATE member_oauth_identities SET user_id = ? WHERE user_id = ?', currentUserId, telegramUserId);
+}
+
+async function mergeTelegramUserSettings(db, currentUserId, telegramUserId, preferTelegram) {
+  const telegramSettings = await db.prepare('SELECT * FROM user_settings WHERE user_id = ?').bind(telegramUserId).first();
+  if (!telegramSettings) return;
+  await getUserSettings(db, currentUserId);
+
+  const currentSettings = await db.prepare('SELECT * FROM user_settings WHERE user_id = ?').bind(currentUserId).first();
+  const source = preferTelegram ? telegramSettings : currentSettings;
+  const data = {};
+  for (const field of [
+    'capital', 'risk_percent', 'subscribed_symbols', 'signal_types',
+    'notify_entry', 'notify_tp', 'notify_sl', 'notify_update',
+    'notify_daily_report', 'notify_weekly_report', 'notify_announcement',
+    'notify_alert', 'quiet_enabled', 'quiet_start', 'quiet_end',
+    'paused', 'timezone', 'language'
+  ]) {
+    data[field] = source?.[field] ?? currentSettings?.[field] ?? telegramSettings?.[field];
+  }
+  await updateUserSettings(db, currentUserId, data);
+}
+
+async function mergeTelegramAccountIntoMember(db, currentUserId, telegramUserId, currentUser, telegramUser) {
+  const currentEffectiveRank = effectiveTierRank(currentUser);
+  const telegramEffectiveRank = effectiveTierRank(telegramUser);
+  const preferTelegram = telegramEffectiveRank > currentEffectiveRank;
+  const sourceUser = preferTelegram ? telegramUser : currentUser;
+  const mergedTier = sourceUser.tier || 'free';
+  const mergedExpiry = mergedTier === 'free'
+    ? null
+    : (!sourceUser.tier_expires_at ? null : latestDateValue(currentUser.tier_expires_at, telegramUser.tier_expires_at));
+
+  await mergeTelegramUserSettings(db, currentUserId, telegramUserId, preferTelegram);
+  await mergeUserOwnedRows(db, currentUserId, telegramUserId);
+
+  const mergedNote = `Linked Telegram ${telegramUserId} into ${currentUserId} at ${fmtTime()}`;
+  await db.prepare(`
+    UPDATE users
+    SET telegram_user_id = ?,
+        telegram_linked_at = datetime('now'),
+        username = COALESCE(NULLIF(username, ''), ?),
+        first_name = COALESCE(NULLIF(first_name, ''), ?),
+        tier = ?,
+        tier_expires_at = ?,
+        points = COALESCE(points, 0) + ?,
+        referral_count = COALESCE(referral_count, 0) + ?,
+        total_signals = COALESCE(total_signals, 0) + ?,
+        total_spent = COALESCE(total_spent, 0) + ?,
+        referred_by = COALESCE(NULLIF(referred_by, ''), ?),
+        last_checkin_at = COALESCE(?, last_checkin_at),
+        last_active_at = COALESCE(?, last_active_at),
+        is_active = 1,
+        is_banned = CASE WHEN COALESCE(is_banned, 0) = 1 OR ? = 1 THEN 1 ELSE 0 END,
+        updated_at = datetime('now')
+    WHERE user_id = ?
+  `).bind(
+    telegramUserId,
+    telegramUser.username || null,
+    telegramUser.first_name || null,
+    mergedTier,
+    mergedExpiry,
+    Number(telegramUser.points || 0),
+    Number(telegramUser.referral_count || 0),
+    Number(telegramUser.total_signals || 0),
+    Number(telegramUser.total_spent || 0),
+    telegramUser.referred_by || null,
+    latestDateValue(currentUser.last_checkin_at, telegramUser.last_checkin_at),
+    latestDateValue(currentUser.last_active_at, telegramUser.last_active_at),
+    Number(telegramUser.is_banned || 0),
+    currentUserId
+  ).run();
+
+  await db.prepare(`
+    UPDATE users
+    SET tier = 'free',
+        tier_expires_at = NULL,
+        is_active = 0,
+        updated_at = datetime('now'),
+        admin_note = COALESCE(NULLIF(admin_note, '') || char(10), '') || ?
+    WHERE user_id = ?
+  `).bind(mergedNote, telegramUserId).run();
+}
+
+async function linkTelegramWithLoginCode(db, env, currentUserId, payload = {}) {
+  await ensureMemberLoginSchema(db);
+  await ensureTelegramLinkSchema(db);
+  const code = String(payload.code || '').replace(/\D/g, '');
+  if (!/^\d{6}$/.test(code)) throw new Error('請輸入 Telegram /login 取得的 6 位碼');
+
+  const row = await db.prepare(`
+    SELECT id, user_id FROM member_login_codes
+    WHERE code = ? AND used_at IS NULL AND expires_at > datetime('now')
+    ORDER BY created_at DESC LIMIT 1
+  `).bind(code).first();
+  if (!row) throw new Error('登入碼錯誤或已過期，請在 Telegram 重新輸入 /login');
+
+  const telegramUserId = String(row.user_id || '');
+  if (!isTelegramChatId(telegramUserId)) throw new Error('這組登入碼已屬於網站帳號，請用尚未綁定的 Telegram 帳號重新輸入 /login');
+  if (String(currentUserId) === telegramUserId) {
+    await db.prepare('UPDATE member_login_codes SET used_at = datetime("now") WHERE id = ?').bind(row.id).run();
+    return { linked: true, telegramUserId, alreadyTelegramAccount: true };
+  }
+
+  const existing = await db.prepare(`
+    SELECT user_id FROM users
+    WHERE telegram_user_id = ? AND user_id != ?
+    LIMIT 1
+  `).bind(telegramUserId, currentUserId).first();
+  if (existing?.user_id) throw new Error('此 Telegram 已綁定其他會員帳號');
+
+  const currentUser = await getUser(db, currentUserId);
+  if (currentUser.telegram_user_id && String(currentUser.telegram_user_id) !== telegramUserId) {
+    throw new Error('此網站會員已綁定其他 Telegram');
+  }
+  const telegramUser = await getUser(db, telegramUserId);
+  await mergeTelegramAccountIntoMember(db, currentUserId, telegramUserId, currentUser, telegramUser);
+  await db.prepare('UPDATE member_login_codes SET used_at = datetime("now") WHERE id = ?').bind(row.id).run();
+  await sendTg(telegramUserId, `✅ <b>Telegram 已綁定會員中心</b>\n\n之後付費訊號、訂單通知與客服回覆會同步推送到此 Telegram。`, {
+    inline_keyboard: [[{ text: '開啟會員中心', url: memberPortalUrl(env) }]]
+  });
+  await logAction(db, currentUserId, 'member_telegram_link', telegramUserId, 'website');
+  return { linked: true, telegramUserId, linkedAt: fmtTime() };
 }
 
 function normalizeMemberEmail(value) {
@@ -4890,7 +5099,7 @@ async function confirmOrderRecord(db, actorId, order, options = {}) {
         [{ text: '查看收據', callback_data: `u_order_${orderId}` }],
         [{ text: '我的訂單', callback_data: 'u_orders' }]
       ]
-    });
+    }, { db });
   }
   await recordOrderEvent(db, orderId, order.user_id, 'confirmed', actorId, `訂單確認，會員到期日 ${fmtDate(newExpiry)}`, {
     tier: order.tier,
@@ -5146,7 +5355,8 @@ async function getOrderEvents(db, orderIds, limit = 80) {
 async function getMemberSecurity(db, userId) {
   await ensureMemberPasswordSchema(db);
   await ensureMemberOAuthSchema(db);
-  const [passwordAccount, oauthRows] = await Promise.all([
+  await ensureTelegramLinkSchema(db);
+  const [passwordAccount, oauthRows, userRow] = await Promise.all([
     db.prepare(`
       SELECT email, display_name, created_at, updated_at, last_login_at
       FROM member_password_accounts
@@ -5157,8 +5367,10 @@ async function getMemberSecurity(db, userId) {
       FROM member_oauth_identities
       WHERE user_id = ?
       ORDER BY created_at DESC
-    `).bind(userId).all()
+    `).bind(userId).all(),
+    db.prepare('SELECT telegram_user_id, telegram_linked_at FROM users WHERE user_id = ?').bind(userId).first()
   ]);
+  const linkedTelegramId = isTelegramChatId(userId) ? String(userId) : String(userRow?.telegram_user_id || '');
   return {
     password_account: passwordAccount ? {
       enabled: true,
@@ -5174,13 +5386,19 @@ async function getMemberSecurity(db, userId) {
       display_name: row.display_name || '',
       last_login_at: row.last_login_at || null,
       created_at: row.created_at || null
-    }))
+    })),
+    telegram_link: {
+      linked: isTelegramChatId(linkedTelegramId),
+      telegram_user_id: linkedTelegramId,
+      linked_at: isTelegramChatId(userId) ? null : userRow?.telegram_linked_at || null
+    }
   };
 }
 
 async function getMemberBootstrap(db, userId, env = {}) {
   await ensureOrderPaymentSchema(db);
   await ensureSupportSchema(db);
+  await ensureTelegramLinkSchema(db);
   const user = await getUser(db, userId);
   const settings = await getUserSettings(db, userId);
   const symbols = (await db.prepare('SELECT * FROM symbols WHERE is_active = 1 ORDER BY sort_order, symbol').all()).results || [];
@@ -5696,7 +5914,7 @@ async function replySupportTicket(db, env, adminId, ticketId, message) {
     escHtml(reply),
     '',
     '若仍需協助，請再次使用 /support 留下補充問題。'
-  ].join('\n'));
+  ].join('\n'), null, { db });
   await logAction(db, adminId, 'support_ticket_reply', id, reply.slice(0, 200));
   return { ticketId: id, status: 'pending' };
 }
@@ -5761,7 +5979,7 @@ async function closeSupportTicket(db, env, adminId, ticketId, reason = '') {
     INSERT INTO support_replies (ticket_id, actor_type, actor_id, message, created_at)
     VALUES (?, 'system', ?, ?, datetime('now'))
   `).bind(id, String(adminId), note).run();
-  await sendMemberNotice(ticket.user_id, `✅ <b>客服工單已結案</b>\n\n工單：<code>${escHtml(id)}</code>\n原因：${escHtml(note)}`);
+  await sendMemberNotice(ticket.user_id, `✅ <b>客服工單已結案</b>\n\n工單：<code>${escHtml(id)}</code>\n原因：${escHtml(note)}`, null, { db });
   await logAction(db, adminId, 'support_ticket_close', id, note.slice(0, 200));
   return { ticketId: id, status: 'closed' };
 }
@@ -5779,8 +5997,9 @@ async function handleMemberApi(request, env, pathname) {
       const verified = await verifyTelegramLoginPayload(await readJsonBody(request), env);
       await getUser(db, verified.userId);
       await saveUserInfo(db, verified.userId, verified.username, verified.firstName);
-      const session = await createMemberSession(verified.userId, env);
-      return new Response(JSON.stringify({ ok: true, data: await getMemberBootstrap(db, verified.userId, env) }), {
+      const accountUserId = await resolveMemberUserId(db, verified.userId);
+      const session = await createMemberSession(accountUserId, env);
+      return new Response(JSON.stringify({ ok: true, data: await getMemberBootstrap(db, accountUserId, env) }), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
@@ -5890,6 +6109,25 @@ async function handleMemberApi(request, env, pathname) {
         '密碼修改太頻繁，請稍後再試'
       );
       return json({ ok: true, data: await changeMemberPassword(db, session.userId, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'telegram' && parts[1] === 'link') {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_telegram_link', session.userId, requestClientIp(request)]),
+        8,
+        10 * 60,
+        'Telegram 綁定嘗試過多，請稍後再試'
+      );
+      const result = await linkTelegramWithLoginCode(db, env, session.userId, await readJsonBody(request));
+      const sessionToken = await createMemberSession(session.userId, env);
+      return new Response(JSON.stringify({ ok: true, data: { ...result, bootstrap: await getMemberBootstrap(db, session.userId, env) } }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie(sessionToken)
+        }
+      });
     }
 
     if (request.method === 'POST' && parts[0] === 'support' && parts.length === 1) {
@@ -6301,6 +6539,18 @@ function renderSecurity(){
   var security = state.security || {};
   var password = security.password_account || {};
   var oauth = security.oauth_identities || [];
+  var telegram = security.telegram_link || {};
+  var botName = state.botUsername ? '@' + state.botUsername : 'Telegram 機器人';
+  var telegramBox = telegram.linked
+    ? '<div class="security-meta">'+
+        '<div>'+chip('Telegram 已綁定','green')+' <b>'+esc(telegram.telegram_user_id || '')+'</b></div>'+
+        '<div class="muted">訊號推播、訂單通知與客服回覆會送到此 Telegram。'+(telegram.linked_at ? ' 綁定 '+dateText(telegram.linked_at) : '')+'</div>'+
+      '</div>'
+    : '<div class="security-meta">'+
+        '<div>'+chip('Telegram 未綁定','amber')+' <b>尚未接收推播</b></div>'+
+        '<div class="muted">在 '+esc(botName)+' 輸入 /login，將 6 位登入碼填入下方，即可把網站會員與 Telegram 推播綁定。</div>'+
+        '<form id="telegramLinkForm" class="auth-form"><label>Telegram 6 位碼</label><input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="輸入 /login 取得的 6 位碼"><button class="btn primary" type="submit">綁定 Telegram</button></form>'+
+      '</div>';
   if(password.enabled){
     box.innerHTML =
       '<div class="security-meta">'+
@@ -6312,14 +6562,16 @@ function renderSecurity(){
         '<label>目前密碼</label><input name="current_password" type="password" autocomplete="current-password" placeholder="輸入目前密碼">'+
         '<label>新密碼</label><input name="new_password" type="password" autocomplete="new-password" placeholder="英文 + 數字，至少 8 碼">'+
         '<button class="btn primary" type="submit">更新密碼</button>'+
-      '</form>';
+      '</form>'+
+      telegramBox;
     return;
   }
   box.innerHTML =
     '<div class="security-meta">'+
       '<div>'+chip('外部登入','amber')+' <b>'+esc(oauth.length ? oauth.map(function(item){ return item.provider; }).join(', ') : 'Telegram / OAuth')+'</b></div>'+
       '<div class="muted">此會員尚未設定網站密碼，請使用原本的 Telegram 登入碼或第三方登入。</div>'+
-    '</div>';
+    '</div>'+
+    telegramBox;
 }
 function supportStatusText(status){
   return status === 'open' ? '待回覆' : status === 'pending' ? '已回覆' : status === 'closed' ? '已結案' : (status || '-');
@@ -6491,8 +6743,18 @@ document.getElementById('refreshBtn').addEventListener('click', load);
 document.getElementById('logoutBtn').addEventListener('click', async function(){ await api('/api/member/logout',{method:'POST',body:'{}'}).catch(function(){}); location.reload(); });
 document.getElementById('securityBox').addEventListener('submit', async function(event){
   var form = event.target.closest('#changePasswordForm');
-  if(!form) return;
+  var telegramForm = event.target.closest('#telegramLinkForm');
+  if(!form && !telegramForm) return;
   event.preventDefault();
+  if(telegramForm){
+    try{
+      var linked = await api('/api/member/telegram/link',{method:'POST',body:JSON.stringify({code:telegramForm.elements.code.value})});
+      if(linked.bootstrap) state = linked.bootstrap;
+      showToast('Telegram 已綁定');
+      render();
+    }catch(err){ showToast(err.message,'error'); }
+    return;
+  }
   try{
     await api('/api/member/password/change',{method:'POST',body:JSON.stringify({
       current_password: form.elements.current_password.value,
@@ -8542,7 +8804,7 @@ async function handleExpireCheck(env) {
   let count = 0;
   for (const user of expired.results || []) {
     await updateUser(db, user.user_id, { tier: 'free', tier_expires_at: null });
-    await sendMemberNotice(user.user_id, `⚠️ 您的會員已到期\n\n已降為免費會員\n使用 /plans 續費`);
+    await sendMemberNotice(user.user_id, `⚠️ 您的會員已到期\n\n已降為免費會員\n使用 /plans 續費`, null, { db });
     count++;
   }
   
@@ -8564,7 +8826,7 @@ async function handleExpireReminder(env) {
   let count = 0;
   for (const user of expiring.results || []) {
     const days = daysLeft(user.tier_expires_at);
-    await sendMemberNotice(user.user_id, `⏰ <b>會員即將到期</b>\n\n您的 ${tierName(user.tier)} 將在 <b>${days}</b> 天後到期\n\n👉 /renew 立即續費`);
+    await sendMemberNotice(user.user_id, `⏰ <b>會員即將到期</b>\n\n您的 ${tierName(user.tier)} 將在 <b>${days}</b> 天後到期\n\n👉 /renew 立即續費`, null, { db });
     count++;
   }
   

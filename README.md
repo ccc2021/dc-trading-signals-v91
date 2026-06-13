@@ -17,6 +17,7 @@
 - **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
 - **🌐 會員中心** - 會員可直接在網站查看最新/歷史訊號、依起訖時間查詢、維護訂閱設定與續費
 - **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊、登入與修改密碼，並保留 Telegram 登入碼與 Google / LINE OAuth
+- **🔔 Telegram 推播綁定** - 網站會員可用 Telegram `/login` 6 位碼綁定推播，之後訊號、訂單與客服通知會同步送達
 - **🎧 線上客服工單** - 會員可在網站或 Telegram 建立工單、補充內容，後台可回覆與結案
 - **🧾 訂單明細與條款紀錄** - 付費下單前記錄條款與風險揭露版本，會員可回看訂單明細/收據
 - **💳 Telegram 訂單查詢** - 會員可用 `/myorders` 與 `/receipt` 查詢付款狀態、流程與收據入口
@@ -154,7 +155,7 @@ wrangler secret put ADMIN_WEB_PASSWORD
 
 ### 3b. 選配第三方登入
 
-會員中心預設可用 Email + 密碼註冊登入，也可用 Telegram `/login` 一次性登入碼。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
+會員中心預設可用 Email + 密碼註冊登入，也可用 Telegram `/login` 一次性登入碼。網站會員登入後可在「帳號安全」輸入 Telegram `/login` 6 位碼，把網站帳號與 Telegram 推播綁在一起；綁定後，付費訊號、訂單通知與客服回覆會送到該 Telegram。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
 
 ```bash
 wrangler secret put GOOGLE_CLIENT_ID
@@ -231,7 +232,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 
 | 表名 | 用途 |
 |------|------|
-| `users` | 用戶資料 |
+| `users` | 用戶資料與網站會員 Telegram 綁定 |
 | `user_settings` | 用戶設定 |
 | `user_executions` | 執行記錄 |
 | `symbols` | 品種資訊 |

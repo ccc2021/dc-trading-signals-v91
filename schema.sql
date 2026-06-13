@@ -12,6 +12,8 @@ CREATE TABLE users (
   user_id TEXT UNIQUE NOT NULL,
   username TEXT,
   first_name TEXT,
+  telegram_user_id TEXT,
+  telegram_linked_at TEXT,
   
   -- 會員等級 (free/pro/vip)
   tier TEXT DEFAULT 'free' CHECK(tier IN ('free', 'pro', 'vip')),
@@ -499,6 +501,7 @@ CREATE INDEX idx_users_tier ON users(tier);
 CREATE INDEX idx_users_active ON users(is_active);
 CREATE INDEX idx_users_referral ON users(referral_code);
 CREATE INDEX idx_users_expires ON users(tier_expires_at);
+CREATE UNIQUE INDEX idx_users_telegram_user ON users(telegram_user_id);
 
 CREATE INDEX idx_settings_user ON user_settings(user_id);
 
