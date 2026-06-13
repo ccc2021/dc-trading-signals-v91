@@ -3742,26 +3742,26 @@ async function getAdminBootstrap(db, env = {}) {
     db.prepare(`SELECT key, value FROM system_config WHERE key IN (${ADMIN_CONFIG_KEYS.map(() => '?').join(',')}) ORDER BY key`).bind(...ADMIN_CONFIG_KEYS).all(),
     db.prepare('SELECT * FROM symbols ORDER BY sort_order, symbol').all(),
     db.prepare('SELECT * FROM strategies ORDER BY sort_order, strategy_id').all(),
-    db.prepare('SELECT * FROM signals ORDER BY created_at DESC LIMIT 30').all(),
+    db.prepare('SELECT * FROM signals ORDER BY created_at DESC LIMIT 120').all(),
     db.prepare(`
       SELECT o.*, u.username, u.first_name FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id
-      ORDER BY o.created_at DESC LIMIT 30
+      ORDER BY o.created_at DESC LIMIT 150
     `).all(),
     db.prepare(`
       SELECT order_id, user_id, event_type, actor_id, message, metadata, created_at
       FROM order_events
-      ORDER BY created_at DESC LIMIT 80
+      ORDER BY created_at DESC LIMIT 250
     `).all(),
     db.prepare(`
-      SELECT user_id, username, first_name, tier, tier_expires_at, points, total_spent,
+      SELECT user_id, username, first_name, telegram_user_id, tier, tier_expires_at, points, total_spent,
              is_active, is_banned, last_active_at, admin_note, created_at
-      FROM users ORDER BY created_at DESC LIMIT 50
+      FROM users ORDER BY created_at DESC LIMIT 150
     `).all(),
     db.prepare('SELECT * FROM tradingview_sources ORDER BY created_at DESC').all(),
-    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 30').all(),
+    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 120').all(),
     getFinanceMetrics(db),
-    getAdminSupportTickets(db, 40),
+    getAdminSupportTickets(db, 150),
     db.prepare(`
       SELECT
         SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
@@ -7742,7 +7742,7 @@ function renderAdminPage() {
     <main class="main">
       <div class="topbar">
         <div><h1>自動交易訊號營運台</h1><div class="muted" id="serverTime">載入中</div></div>
-        <div class="command-search"><span>⌕</span><input id="commandSearch" placeholder="搜尋訊號 UID、用戶、品種、策略"></div>
+        <div class="command-search"><span>⌕</span><input id="commandSearch" placeholder="搜尋訊號、會員、訂單、客服、品種、策略、TV"></div>
         <div class="status">
           <span class="pill"><span class="dot"></span>Worker 線上</span>
           <span class="pill" id="dbPill">D1 連線中</span>
@@ -7777,10 +7777,10 @@ function renderAdminPage() {
           </div>
         </div>
         <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel has-mobile-cards"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>圖表</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div><div class="mobile-list" id="signalsCards"></div></section></div></div>
-        <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
+        <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th><th></th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
-        <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
-        <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 50 位用戶</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
+        <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th><th></th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
+        <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 150 位用戶，可用上方搜尋</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
         <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>付款備註</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
         <div class="view" id="view-support"><section class="panel"><header><div><h2>客服工單</h2><p>會員問題、付款協助與售後追蹤</p></div><div id="supportBadge"></div></header><div class="table-wrap"><table><thead><tr><th>更新</th><th>工單</th><th>會員</th><th>主旨</th><th>最近內容</th><th>狀態</th><th></th></tr></thead><tbody id="supportTable"></tbody></table></div></section></div>
         <div class="view" id="view-billing"><section class="panel"><header><h2>收費、付款與系統設定</h2></header><div class="body">${renderConfigFormHtml()}</div></section></div>
@@ -7856,7 +7856,7 @@ function renderTradingViewHtml() {
   <div class="grid two">
     <section class="panel">
       <header><div><h2>來源維護</h2><p>新增/更新 TradingView alert 來源</p></div></header>
-      <div class="table-wrap"><table><thead><tr><th>來源</th><th>策略</th><th>品種</th><th>目標</th><th>模式</th></tr></thead><tbody id="tvSourcesTable"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>來源</th><th>策略</th><th>品種</th><th>目標</th><th>模式</th><th></th></tr></thead><tbody id="tvSourcesTable"></tbody></table></div>
       <div class="body">${renderTradingViewSourceFormHtml()}</div>
     </section>
     <section class="panel">
@@ -8251,6 +8251,17 @@ function renderSignals() {
   document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="10" class="muted">尚無訊號</td></tr>';
   document.getElementById('signalsCards').innerHTML = signals.map(signalCard).join('') || '<div class="muted">尚無訊號</div>';
 }
+function queryText() {
+  return (state.query || '').trim().toLowerCase();
+}
+function matchesQuery(row, fields) {
+  var q = queryText();
+  if (!q) return true;
+  return fields.some(function (field) {
+    var value = typeof field === 'function' ? field(row) : row[field];
+    return String(value == null ? '' : value).toLowerCase().includes(q);
+  });
+}
 function orderEventLabel(type) {
   var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消', refunded:'已退款' };
   return map[type] || type || '紀錄';
@@ -8284,10 +8295,15 @@ function orderRow(order, compact) {
   return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(refunded ? '已退款' : order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
 }
 function renderOrders() {
-  var orders = state.data.orders || [];
+  var orders = filteredOrders();
   var pending = orders.filter(function (o) { return o.status === 'pending' || o.status === 'paid'; });
   document.getElementById('pendingOrders').innerHTML = pending.slice(0, 8).map(function (o) { return orderRow(o, true); }).join('') || '<tr><td colspan="5" class="muted">沒有待處理訂單</td></tr>';
   document.getElementById('ordersTable').innerHTML = orders.map(function (o) { return orderRow(o, false); }).join('') || '<tr><td colspan="8" class="muted">尚無訂單</td></tr>';
+}
+function filteredOrders() {
+  return (state.data.orders || []).filter(function (order) {
+    return matchesQuery(order, ['order_id', 'user_id', 'username', 'first_name', 'tier', 'status', 'payment_method', 'payment_provider', 'payment_session_id', 'payment_note', 'refund_note']);
+  });
 }
 function supportStatusLabel(status) {
   return status === 'open' ? '待回覆' : status === 'pending' ? '已回覆' : status === 'closed' ? '已結案' : (status || '-');
@@ -8312,36 +8328,57 @@ function supportRow(ticket) {
   return '<tr><td>' + esc(dateText(ticket.updated_at)) + '</td><td><code>' + esc(ticket.ticket_id) + '</code><div class="muted">' + esc(ticket.priority || 'normal') + '</div></td><td>' + esc(user) + '<div class="muted"><code>' + esc(ticket.user_id) + '</code></div></td><td>' + esc(ticket.subject || '-') + '</td><td class="note-cell"><div class="ticket-thread">' + thread + '</div></td><td>' + chip(supportStatusLabel(ticket.status), supportStatusTone(ticket.status)) + '</td><td class="actions">' + actions + '</td></tr>';
 }
 function renderSupport() {
-  var tickets = state.data.supportTickets || [];
+  var tickets = filteredSupportTickets();
   var stats = state.data.supportStats || {};
   var badge = document.getElementById('supportBadge');
-  if (badge) badge.innerHTML = chip((stats.open || 0) + ' 待回覆', stats.open ? 'amber' : 'green') + ' ' + chip((stats.pending || 0) + ' 已回覆', '');
+  if (badge) badge.innerHTML = chip((stats.open || 0) + ' 待回覆', stats.open ? 'amber' : 'green') + ' ' + chip((stats.pending || 0) + ' 已回覆', '') + (queryText() ? ' ' + chip(tickets.length + ' 筆符合搜尋', 'amber') : '');
   document.getElementById('supportTable').innerHTML = tickets.map(supportRow).join('') || '<tr><td colspan="7" class="muted">尚無客服工單</td></tr>';
 }
+function filteredSupportTickets() {
+  return (state.data.supportTickets || []).filter(function (ticket) {
+    return matchesQuery(ticket, ['ticket_id', 'user_id', 'username', 'first_name', 'subject', 'message', 'last_reply', 'priority', 'status', function (row) {
+      return (row.replies || []).map(function (reply) { return reply.message; }).join(' ');
+    }]);
+  });
+}
 function renderUsers() {
-  var users = state.data.users || [];
+  var users = filteredUsers();
   document.getElementById('usersTable').innerHTML = users.map(function (u) {
     var name = adminUserName(u);
     var status = u.is_banned ? chip('封禁', 'red') : u.is_active ? chip('啟用', 'green') : chip('停用', 'amber');
-    return '<tr><td><div>' + esc(name) + '</div><div class="muted"><code>' + esc(u.user_id) + '</code></div></td><td>' + chip(u.tier, u.tier === 'vip' ? 'amber' : u.tier === 'pro' ? 'green' : '') + '</td><td>' + esc(u.tier_expires_at ? dateText(u.tier_expires_at) : '-') + '</td><td>' + money(u.total_spent || 0) + '</td><td>' + status + '</td><td class="actions"><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|pro">Pro+30</button><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|vip">VIP+30</button><button class="btn danger" data-user-ban="' + esc(u.user_id) + '|' + (u.is_banned ? '0' : '1') + '">' + (u.is_banned ? '解封' : '封禁') + '</button></td></tr>';
+    return '<tr><td><div>' + esc(name) + '</div><div class="muted"><code>' + esc(u.user_id) + '</code></div>' + (u.admin_note ? '<div class="muted">' + esc(u.admin_note).slice(0, 80) + '</div>' : '') + '</td><td>' + chip(u.tier, u.tier === 'vip' ? 'amber' : u.tier === 'pro' ? 'green' : '') + '</td><td>' + esc(u.tier_expires_at ? dateText(u.tier_expires_at) : '-') + '</td><td>' + money(u.total_spent || 0) + '</td><td>' + status + '</td><td class="actions"><button class="btn primary" data-user-edit="' + esc(u.user_id) + '">編輯</button><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|pro">Pro+30</button><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|vip">VIP+30</button><button class="btn danger" data-user-ban="' + esc(u.user_id) + '|' + (u.is_banned ? '0' : '1') + '">' + (u.is_banned ? '解封' : '封禁') + '</button></td></tr>';
   }).join('') || '<tr><td colspan="6" class="muted">尚無會員</td></tr>';
 }
+function filteredUsers() {
+  return (state.data.users || []).filter(function (user) {
+    return matchesQuery(user, ['user_id', 'username', 'first_name', 'tier', 'admin_note', 'telegram_user_id']);
+  });
+}
+function findUser(userId) {
+  return (state.data.users || []).find(function (user) { return String(user.user_id || '') === String(userId || ''); }) || {};
+}
 function renderSymbols() {
-  document.getElementById('symbolsTable').innerHTML = (state.data.symbols || []).map(function (s) {
-    return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="6" class="muted">尚無品種</td></tr>';
+  document.getElementById('symbolsTable').innerHTML = filteredSymbols().map(function (s) {
+    return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-symbol="' + esc(s.symbol) + '">編輯</button></td></tr>';
+  }).join('') || '<tr><td colspan="7" class="muted">尚無品種</td></tr>';
+}
+function filteredSymbols() {
+  return (state.data.symbols || []).filter(function (symbol) {
+    return matchesQuery(symbol, ['symbol', 'name', 'name_zh', 'category']);
+  });
 }
 function renderStrategies() {
-  document.getElementById('strategiesTable').innerHTML = (state.data.strategies || []).map(function (s) {
-    return '<tr><td>' + esc(s.sort_order) + '</td><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.strategy_id) + '</code></div></td><td>' + chip(s.tier, s.tier === 'vip' ? 'amber' : 'green') + '</td><td>' + esc(parseJsonList(s.symbols).join(', ')) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="5" class="muted">尚無策略</td></tr>';
+  document.getElementById('strategiesTable').innerHTML = filteredStrategies().map(function (s) {
+    return '<tr><td>' + esc(s.sort_order) + '</td><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.strategy_id) + '</code></div></td><td>' + chip(s.tier, s.tier === 'vip' ? 'amber' : 'green') + '</td><td>' + esc(parseJsonList(s.symbols).join(', ')) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-strategy="' + esc(s.strategy_id) + '">編輯</button></td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">尚無策略</td></tr>';
+}
+function filteredStrategies() {
+  return (state.data.strategies || []).filter(function (strategy) {
+    return matchesQuery(strategy, ['strategy_id', 'name', 'description', 'signal_types', 'symbols', 'tier', 'rules_json', 'note']);
+  });
 }
 function signalMatchesQuery(sig) {
-  var q = (state.query || '').trim().toLowerCase();
-  if (!q) return true;
-  return [sig.signal_uid, sig.ticker, sig.action, sig.signal_type, sig.strategy_id, sig.source, sig.note].some(function (value) {
-    return String(value || '').toLowerCase().includes(q);
-  });
+  return matchesQuery(sig, ['signal_uid', 'ticker', 'action', 'signal_type', 'strategy_id', 'source', 'note', 'status']);
 }
 function filteredSignals() {
   return (state.data.signals || []).filter(function (sig) {
@@ -8384,7 +8421,7 @@ function tvSourceCard(source, compact) {
   return '<div class="source-card ' + (source.is_active ? '' : 'off') + '">' +
     '<div class="source-head"><div><strong>' + esc(source.name) + '</strong><span><code>' + esc(source.source_id) + '</code></span></div>' + (source.is_active ? chip('啟用','green') : chip('停用','red')) + '</div>' +
     '<div class="source-meta"><div><span>模式</span>' + esc(mode) + '</div><div><span>策略</span>' + esc(source.default_strategy_id || 'auto') + '</div><div><span>目標</span>' + esc(source.target_group || 'pro') + '</div><div><span>Secret</span>' + esc(maskedSecret(source.webhook_secret)) + '</div></div>' +
-    (compact ? '' : '<div class="copy-row"><code>' + esc(webhook) + '</code><button class="btn ghost" data-copy-value="' + esc(webhook) + '" type="button">複製</button></div>') +
+    (compact ? '' : '<div class="copy-row"><code>' + esc(webhook) + '</code><button class="btn ghost" data-copy-value="' + esc(webhook) + '" type="button">複製</button><button class="btn ghost" data-edit-tv-source="' + esc(source.source_id) + '" type="button">編輯</button></div>') +
   '</div>';
 }
 function renderRevenueSummary() {
@@ -8446,14 +8483,25 @@ function renderFinanceDashboard() {
     '</div></section>';
 }
 function renderOverviewTvLogs() {
-  document.getElementById('overviewTvLogs').innerHTML = (state.data.tvLogs || []).slice(0, 6).map(function (log) {
+  document.getElementById('overviewTvLogs').innerHTML = filteredTvLogs().slice(0, 6).map(function (log) {
     var tone = log.status === 'error' ? 'red' : log.status === 'active' ? 'green' : 'amber';
     return '<tr><td>' + esc(dateText(log.created_at)) + '</td><td>' + esc(log.source_id) + '</td><td>' + esc((log.ticker || '-') + ' ' + (log.action || '')) + '</td><td>' + chip(log.error || log.status, tone) + '</td></tr>';
   }).join('') || '<tr><td colspan="4" class="muted">尚無 alert</td></tr>';
 }
+function filteredTvLogs() {
+  return (state.data.tvLogs || []).filter(function (log) {
+    return matchesQuery(log, ['source_id', 'strategy_id', 'ticker', 'action', 'status', 'signal_uid', 'error', 'raw_payload']);
+  });
+}
+function filteredTvSources() {
+  return (state.data.tvSources || []).filter(function (source) {
+    return matchesQuery(source, ['source_id', 'name', 'default_strategy_id', 'allowed_symbols', 'default_signal_type', 'target_group', 'notes']);
+  });
+}
 function renderTradingView() {
   var strategies = state.data.strategies || [];
-  var sources = state.data.tvSources || [];
+  var allSources = state.data.tvSources || [];
+  var sources = filteredTvSources();
   var symbols = state.data.symbols || [];
   var strategyOptions = '<option value="">自動選擇</option>' + strategies.map(function (s) {
     return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name + ' (' + s.strategy_id + ')') + '</option>';
@@ -8461,7 +8509,7 @@ function renderTradingView() {
   var genStrategyOptions = '<option value="auto">自動選擇</option>' + strategies.map(function (s) {
     return '<option value="' + esc(s.strategy_id) + '">' + esc(s.name) + '</option>';
   }).join('');
-  var sourceOptions = sources.map(function (s) {
+  var sourceOptions = allSources.map(function (s) {
     return '<option value="' + esc(s.source_id) + '">' + esc(s.name + ' (' + s.source_id + ')') + '</option>';
   }).join('');
   var symbolOptions = symbols.filter(function (s) { return s.is_active; }).map(function (s) {
@@ -8474,10 +8522,10 @@ function renderTradingView() {
   document.getElementById('tvGenTicker').innerHTML = symbolOptions;
   document.getElementById('tvSourcesTable').innerHTML = sources.map(function (s) {
     var symbolsText = parseJsonList(s.allowed_symbols).join(', ') || '全部';
-    return '<tr><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.source_id) + '</code></div></td><td>' + esc(s.default_strategy_id || 'auto') + '</td><td>' + esc(symbolsText) + '</td><td>' + chip(s.target_group || 'pro', s.target_group === 'vip' ? 'amber' : 'green') + '</td><td>' + (s.auto_send ? chip('自動發送','green') : chip('草稿','amber')) + ' ' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="5" class="muted">尚無來源</td></tr>';
+    return '<tr><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.source_id) + '</code></div></td><td>' + esc(s.default_strategy_id || 'auto') + '</td><td>' + esc(symbolsText) + '</td><td>' + chip(s.target_group || 'pro', s.target_group === 'vip' ? 'amber' : 'green') + '</td><td>' + (s.auto_send ? chip('自動發送','green') : chip('草稿','amber')) + ' ' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-tv-source="' + esc(s.source_id) + '">編輯</button></td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">尚無來源</td></tr>';
   document.getElementById('tvSourceCards').innerHTML = sources.map(function (s) { return tvSourceCard(s, false); }).join('') || '<div class="muted">尚無來源</div>';
-  document.getElementById('tvLogsTable').innerHTML = (state.data.tvLogs || []).map(function (log) {
+  document.getElementById('tvLogsTable').innerHTML = filteredTvLogs().map(function (log) {
     var tone = log.status === 'error' ? 'red' : log.status === 'active' ? 'green' : 'amber';
     return '<tr><td>' + esc(dateText(log.created_at)) + '</td><td>' + esc(log.source_id) + '</td><td>' + esc(log.strategy_id || '-') + '</td><td>' + esc(log.ticker || '-') + '</td><td>' + esc(log.action || '-') + '</td><td>' + chip(log.error || log.status, tone) + '</td><td><code>' + esc(log.signal_uid || '-') + '</code></td></tr>';
   }).join('') || '<tr><td colspan="7" class="muted">尚無 alert</td></tr>';
@@ -8531,6 +8579,73 @@ function formPayload(form) {
   ['entry_price','stop_loss','tp1','tp2','tp3','tick_size','tick_value','sort_order'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
   ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
   return data;
+}
+function fillForm(formId, values) {
+  var form = document.getElementById(formId);
+  if (!form) return;
+  Object.keys(values || {}).forEach(function (key) {
+    var el = form.elements[key];
+    if (!el) return;
+    el.value = values[key] == null ? '' : values[key];
+  });
+  form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function listText(value) {
+  return parseJsonList(value).join(', ');
+}
+function prettyJson(value, fallback) {
+  var parsed = parseObject(value, fallback || {});
+  return JSON.stringify(parsed, null, 2);
+}
+function editSymbol(symbolId) {
+  var symbol = (state.data.symbols || []).find(function (row) { return String(row.symbol || '') === String(symbolId || ''); });
+  if (!symbol) return;
+  fillForm('symbolForm', {
+    symbol: symbol.symbol,
+    sort_order: symbol.sort_order || 0,
+    name: symbol.name || '',
+    name_zh: symbol.name_zh || '',
+    category: symbol.category || 'index',
+    is_active: symbol.is_active ? 'true' : 'false',
+    tick_size: symbol.tick_size || 0.25,
+    tick_value: symbol.tick_value || 5
+  });
+  setMessage('已帶入品種 ' + symbol.symbol + '，修改後按儲存品種', 'ok');
+}
+function editStrategy(strategyId) {
+  var strategy = (state.data.strategies || []).find(function (row) { return String(row.strategy_id || '') === String(strategyId || ''); });
+  if (!strategy) return;
+  fillForm('strategyForm', {
+    strategy_id: strategy.strategy_id,
+    sort_order: strategy.sort_order || 0,
+    name: strategy.name || '',
+    tier: strategy.tier || 'pro',
+    is_active: strategy.is_active ? 'true' : 'false',
+    signal_types: listText(strategy.signal_types),
+    symbols: listText(strategy.symbols),
+    description: strategy.description || '',
+    rules_json: prettyJson(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' }),
+    tv_alert_template: strategy.tv_alert_template || '',
+    note: strategy.note || ''
+  });
+  setMessage('已帶入策略 ' + strategy.strategy_id + '，修改後按儲存策略', 'ok');
+}
+function editTvSource(sourceId) {
+  var source = (state.data.tvSources || []).find(function (row) { return String(row.source_id || '') === String(sourceId || ''); });
+  if (!source) return;
+  fillForm('tvSourceForm', {
+    source_id: source.source_id,
+    name: source.name || '',
+    webhook_secret: source.webhook_secret || '',
+    default_strategy_id: source.default_strategy_id || '',
+    default_signal_type: source.default_signal_type || 'auto',
+    target_group: source.target_group || 'pro',
+    auto_send: source.auto_send ? 'true' : 'false',
+    is_active: source.is_active ? 'true' : 'false',
+    allowed_symbols: listText(source.allowed_symbols),
+    notes: source.notes || ''
+  });
+  setMessage('已帶入 TV 來源 ' + source.source_id + '，修改後按儲存來源', 'ok');
 }
 function currentSignalDraft() {
   var form = document.getElementById('signalForm');
@@ -8672,6 +8787,21 @@ document.body.addEventListener('click', async function (event) {
         setMessage('已複製到剪貼簿', 'ok');
       }
     }
+    var editSymbolBtn = event.target.closest('[data-edit-symbol]');
+    if (editSymbolBtn) {
+      editSymbol(editSymbolBtn.dataset.editSymbol);
+      return;
+    }
+    var editStrategyBtn = event.target.closest('[data-edit-strategy]');
+    if (editStrategyBtn) {
+      editStrategy(editStrategyBtn.dataset.editStrategy);
+      return;
+    }
+    var editTvSourceBtn = event.target.closest('[data-edit-tv-source]');
+    if (editTvSourceBtn) {
+      editTvSource(editTvSourceBtn.dataset.editTvSource);
+      return;
+    }
     var closeBtn = event.target.closest('[data-close]');
     if (closeBtn) {
       var closeSig = findSignal(closeBtn.dataset.close);
@@ -8761,6 +8891,25 @@ document.body.addEventListener('click', async function (event) {
     }
     var userTier = event.target.closest('[data-user-tier]');
     if (userTier) { var parts = userTier.dataset.userTier.split('|'); var tierOk = await confirmAdminAction('調整會員等級', '將此用戶升級為 ' + parts[1].toUpperCase() + ' 並增加 30 天。', '套用', 'primary'); if (!tierOk) return; await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
+    var userEdit = event.target.closest('[data-user-edit]');
+    if (userEdit) {
+      var editUser = findUser(userEdit.dataset.userEdit);
+      var edit = await adminDialog({
+        title: '編輯會員',
+        body: adminUserName(editUser) + ' · ' + (editUser.user_id || ''),
+        confirmText: '儲存會員',
+        tone: 'primary',
+        fields: [
+          { name: 'tier', label: '會員等級', type: 'select', value: editUser.tier || 'free', options: [{ value: 'free', label: 'Free' }, { value: 'pro', label: 'Pro' }, { value: 'vip', label: 'VIP' }] },
+          { name: 'days', label: '增加天數（可留空）', inputmode: 'numeric', value: '' },
+          { name: 'admin_note', label: '後台備註', type: 'textarea', value: editUser.admin_note || '' },
+          { name: 'is_banned', label: '封禁此會員', type: 'checkbox', checked: !!editUser.is_banned }
+        ]
+      });
+      if (!edit) return;
+      await api('/api/admin/users/' + encodeURIComponent(editUser.user_id), { method: 'POST', body: JSON.stringify({ tier: edit.tier, days: Number(edit.days || 0), admin_note: edit.admin_note, is_banned: edit.is_banned }) });
+      await load();
+    }
     var userBan = event.target.closest('[data-user-ban]');
     if (userBan) { var banParts = userBan.dataset.userBan.split('|'); var banOk = await confirmAdminAction(banParts[1] === '1' ? '封禁會員' : '解除封禁', '此操作會立即改變用戶狀態。', banParts[1] === '1' ? '封禁' : '解除', banParts[1] === '1' ? 'danger' : 'primary'); if (!banOk) return; await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
   } catch (err) {
@@ -8780,7 +8929,17 @@ document.querySelector('.seg').addEventListener('click', function (event) {
   setSignalAction(btn.dataset.action);
 });
 document.getElementById('refreshBtn').addEventListener('click', function () { load().catch(showError); });
-document.getElementById('commandSearch').addEventListener('input', function (event) { state.query = event.target.value; renderSignals(); });
+document.getElementById('commandSearch').addEventListener('input', function (event) {
+  state.query = event.target.value;
+  renderSignals();
+  renderOrders();
+  renderSupport();
+  renderUsers();
+  renderSymbols();
+  renderStrategies();
+  renderOverviewTvLogs();
+  renderTradingView();
+});
 document.getElementById('signalFilters').addEventListener('click', function (event) {
   var btn = event.target.closest('[data-filter]');
   if (!btn) return;
