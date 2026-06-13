@@ -3772,6 +3772,27 @@ async function loginMemberWithPassword(db, env, payload = {}) {
   return { session, data: await getMemberBootstrap(db, account.user_id, env) };
 }
 
+async function changeMemberPassword(db, userId, payload = {}) {
+  await ensureMemberPasswordSchema(db);
+  const currentPassword = String(payload.current_password || payload.currentPassword || '');
+  const newPassword = validateMemberPassword(payload.new_password || payload.newPassword);
+  if (currentPassword === newPassword) throw new Error('新密碼不可與目前密碼相同');
+
+  const account = await db.prepare('SELECT * FROM member_password_accounts WHERE user_id = ?').bind(userId).first();
+  if (!account) throw appError('此帳號尚未設定網站密碼，請使用原登入方式', 400);
+  if (!(await verifyMemberPassword(currentPassword, account))) throw appError('目前密碼不正確', 401);
+
+  const salt = randomHex(16);
+  const passwordHash = await hashMemberPassword(newPassword, salt);
+  await db.prepare(`
+    UPDATE member_password_accounts
+    SET password_hash = ?, password_salt = ?, iterations = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `).bind(passwordHash, salt, MEMBER_PASSWORD_ITERATIONS, account.id).run();
+  await logAction(db, userId, 'member_password_change', account.email, 'website');
+  return { updated: true, passwordUpdatedAt: fmtTime() };
+}
+
 async function verifyTelegramLoginPayload(payload, env) {
   const token = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
   if (!token) throw new Error('BOT_TOKEN 尚未設定，無法啟用 Telegram Login');
@@ -4369,6 +4390,41 @@ async function getOrderEvents(db, orderIds, limit = 80) {
   return grouped;
 }
 
+async function getMemberSecurity(db, userId) {
+  await ensureMemberPasswordSchema(db);
+  await ensureMemberOAuthSchema(db);
+  const [passwordAccount, oauthRows] = await Promise.all([
+    db.prepare(`
+      SELECT email, display_name, created_at, updated_at, last_login_at
+      FROM member_password_accounts
+      WHERE user_id = ?
+    `).bind(userId).first(),
+    db.prepare(`
+      SELECT provider, email, display_name, last_login_at, created_at
+      FROM member_oauth_identities
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+    `).bind(userId).all()
+  ]);
+  return {
+    password_account: passwordAccount ? {
+      enabled: true,
+      email: passwordAccount.email || '',
+      display_name: passwordAccount.display_name || '',
+      created_at: passwordAccount.created_at || null,
+      updated_at: passwordAccount.updated_at || null,
+      last_login_at: passwordAccount.last_login_at || null
+    } : { enabled: false },
+    oauth_identities: (oauthRows.results || []).map((row) => ({
+      provider: row.provider,
+      email: row.email || '',
+      display_name: row.display_name || '',
+      last_login_at: row.last_login_at || null,
+      created_at: row.created_at || null
+    }))
+  };
+}
+
 async function getMemberBootstrap(db, userId, env = {}) {
   await ensureOrderPaymentSchema(db);
   const user = await getUser(db, userId);
@@ -4435,6 +4491,7 @@ async function getMemberBootstrap(db, userId, env = {}) {
     signalTypes: CONFIG.SIGNAL_TYPES,
     signals,
     orders,
+    security: await getMemberSecurity(db, userId),
     plans: await getMemberPlans(db),
     payment: await getMemberPaymentInfo(db, env),
     botUsername: CONFIG.BOT_USERNAME,
@@ -4701,6 +4758,17 @@ async function handleMemberApi(request, env, pathname) {
       return json({ ok: true, data: await updateMemberSettings(db, session.userId, await readJsonBody(request)) });
     }
 
+    if (request.method === 'POST' && parts[0] === 'password' && parts[1] === 'change') {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_password_change', session.userId, requestClientIp(request)]),
+        5,
+        60 * 60,
+        '密碼修改太頻繁，請稍後再試'
+      );
+      return json({ ok: true, data: await changeMemberPassword(db, session.userId, await readJsonBody(request)) });
+    }
+
     if (request.method === 'POST' && parts[0] === 'orders' && parts.length === 1) {
       await enforceRateLimit(
         db,
@@ -4780,6 +4848,8 @@ function renderMemberPage() {
     .order-timeline div { display:grid; grid-template-columns:auto minmax(0,1fr); gap:8px; align-items:start; color:var(--muted); font-size:12px; line-height:1.4; }
     .order-timeline b { color:var(--ink); font-size:12px; white-space:nowrap; }
     .proof-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .security-grid { display:grid; gap:9px; }
+    .security-meta { display:grid; gap:6px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-size:13px; }
     .chips { display:flex; gap:7px; flex-wrap:wrap; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
     .chip.green { background:#e8f7ef; color:var(--green); }
@@ -4890,6 +4960,7 @@ function renderMemberPage() {
       <aside class="grid">
         <section class="panel"><header><h3>升級 / 續費</h3></header><div class="body"><div class="stack"><div class="plan-grid" id="plans"></div><div class="payment-box" id="paymentBox"></div></div></div></section>
         <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
+        <section class="panel"><header><h3>帳號安全</h3></header><div class="body"><div id="securityBox" class="security-grid"></div></div></section>
         <section class="panel"><header><h3>訂單紀錄</h3></header><div class="body"><div class="stack" id="orders"></div></div></section>
       </aside>
     </section>
@@ -5051,6 +5122,31 @@ function renderSettings(){
       checkbox('notify_entry','進場',s.notify_entry)+checkbox('notify_tp','TP',s.notify_tp)+checkbox('notify_sl','止損',s.notify_sl)+checkbox('notify_update','更新',s.notify_update)+checkbox('notify_alert','警報',s.notify_alert)+checkbox('paused','暫停接收',s.paused)+
     '</div></div>';
 }
+function renderSecurity(){
+  var box = document.getElementById('securityBox');
+  var security = state.security || {};
+  var password = security.password_account || {};
+  var oauth = security.oauth_identities || [];
+  if(password.enabled){
+    box.innerHTML =
+      '<div class="security-meta">'+
+        '<div>'+chip('網站帳號','green')+' <b>'+esc(password.email || state.user.username || '')+'</b></div>'+
+        '<div class="muted">上次登入：'+esc(dateText(password.last_login_at))+'</div>'+
+        '<div class="muted">密碼更新：'+esc(dateText(password.updated_at))+'</div>'+
+      '</div>'+
+      '<form id="changePasswordForm" class="auth-form">'+
+        '<label>目前密碼</label><input name="current_password" type="password" autocomplete="current-password" placeholder="輸入目前密碼">'+
+        '<label>新密碼</label><input name="new_password" type="password" autocomplete="new-password" placeholder="英文 + 數字，至少 8 碼">'+
+        '<button class="btn primary" type="submit">更新密碼</button>'+
+      '</form>';
+    return;
+  }
+  box.innerHTML =
+    '<div class="security-meta">'+
+      '<div>'+chip('外部登入','amber')+' <b>'+esc(oauth.length ? oauth.map(function(item){ return item.provider; }).join(', ') : 'Telegram / OAuth')+'</b></div>'+
+      '<div class="muted">此會員尚未設定網站密碼，請使用原本的 Telegram 登入碼或第三方登入。</div>'+
+    '</div>';
+}
 function renderPlans(){
   var plans = state.plans || {};
   var stripeEnabled = !!(state.payment && state.payment.stripeEnabled);
@@ -5134,6 +5230,7 @@ function render(){
   document.getElementById('orders').innerHTML = (state.orders||[]).map(renderOrder).join('') || '<div class="muted">尚無訂單。</div>';
   renderPlans();
   renderSettings();
+  renderSecurity();
   showCheckoutReturnToast();
 }
 document.getElementById('saveBtn').addEventListener('click', async function(){
@@ -5149,6 +5246,20 @@ document.getElementById('saveBtn').addEventListener('click', async function(){
 });
 document.getElementById('refreshBtn').addEventListener('click', load);
 document.getElementById('logoutBtn').addEventListener('click', async function(){ await api('/api/member/logout',{method:'POST',body:'{}'}).catch(function(){}); location.reload(); });
+document.getElementById('securityBox').addEventListener('submit', async function(event){
+  var form = event.target.closest('#changePasswordForm');
+  if(!form) return;
+  event.preventDefault();
+  try{
+    await api('/api/member/password/change',{method:'POST',body:JSON.stringify({
+      current_password: form.elements.current_password.value,
+      new_password: form.elements.new_password.value
+    })});
+    form.reset();
+    showToast('密碼已更新');
+    await load();
+  }catch(err){ showToast(err.message,'error'); }
+});
 document.getElementById('signalTabs').addEventListener('click', function(event){
   var btn = event.target.closest('[data-member-signal-filter]');
   if(!btn) return;
