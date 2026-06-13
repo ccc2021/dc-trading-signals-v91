@@ -2294,7 +2294,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const configRows = await db.prepare(`SELECT key, value FROM system_config WHERE key IN (${ADMIN_CONFIG_KEYS.map(() => '?').join(',')})`).bind(...ADMIN_CONFIG_KEYS).all();
     const config = {};
     for (const row of configRows.results || []) config[row.key] = row.value;
-    const ops = await getOperationalHealth(db, config, Date.now());
+    const ops = await getOperationalHealth(db, config, Date.now(), env);
     const statusIcon = ops.status === 'critical' ? '🔴' : ops.status === 'warning' ? '🟡' : '🟢';
     let m = `${statusIcon} <b>營運健康檢查</b>\n\n`;
     m += `狀態：<b>${escHtml(ops.statusText)}</b>\n`;
@@ -2970,7 +2970,8 @@ function opsIssue(severity, title, detail, action, view = 'overview') {
   return { severity, title, detail, action, view };
 }
 
-async function getOperationalHealth(db, config = {}, startedAt = Date.now()) {
+async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env = {}) {
+  const integrations = integrationReadiness(env);
   const [
     sourceStats, alertStats, latestAlert, signalStats, orderStats, queueStats
   ] = await Promise.all([
@@ -3035,6 +3036,17 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now()) {
   if (Number(sourceStats?.active || 0) > 0 && !latestAlert) {
     issues.push(opsIssue('info', '尚未收到 TradingView Alert', '來源已啟用，但還沒有 alert 紀錄。', '從 TradingView 送一筆測試 alert。', 'tradingview'));
   }
+  if (!integrations.stripe.secretKey) {
+    issues.push(opsIssue('warning', '線上付款尚未啟用', '會員中心目前只會顯示轉帳訂單。', '設定 STRIPE_SECRET_KEY 與 Stripe webhook。', 'billing'));
+  } else if (!integrations.stripe.webhookSecret) {
+    issues.push(opsIssue('critical', 'Stripe webhook 尚未啟用', 'Checkout 可收款但訂單無法自動確認，系統已暫停對會員顯示線上付款。', '設定 STRIPE_WEBHOOK_SECRET 並在 Stripe 訂閱 webhook 事件。', 'billing'));
+  }
+  if (!integrations.oauth.enabledCount) {
+    issues.push(opsIssue('info', '第三方登入尚未啟用', '會員仍可用 Telegram 登入碼，但 Google / LINE 按鈕不會顯示。', '設定 Google 或 LINE OAuth secret。', 'billing'));
+  }
+  if (!integrations.telegram.botToken) {
+    issues.push(opsIssue('critical', 'Telegram Bot Token 未設定', '會員登入碼與 Telegram 推播都無法使用。', '設定 BOT_TOKEN secret。', 'billing'));
+  }
 
   const hasCritical = issues.some((issue) => issue.severity === 'critical');
   const hasWarning = issues.some((issue) => issue.severity === 'warning');
@@ -3056,6 +3068,7 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now()) {
       latestAgeHours: hoursSinceDbTime(latestAlert?.created_at || alertStats?.latest_at),
       latest: latestAlert || null
     },
+    integrations,
     signalStats: {
       total: signalStats?.total || 0,
       drafts: signalStats?.drafts || 0,
@@ -3077,7 +3090,7 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now()) {
   };
 }
 
-async function getAdminBootstrap(db) {
+async function getAdminBootstrap(db, env = {}) {
   const startedAt = Date.now();
   await ensureAdminSchema(db);
 
@@ -3120,7 +3133,7 @@ async function getAdminBootstrap(db) {
   const config = {};
   for (const row of configRows.results || []) config[row.key] = row.value;
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
-  const ops = await getOperationalHealth(db, config, startedAt);
+  const ops = await getOperationalHealth(db, config, startedAt, env);
 
   return {
     stats: {
@@ -3144,6 +3157,7 @@ async function getAdminBootstrap(db) {
     users: users.results || [],
     tvSources: tvSources.results || [],
     tvLogs: tvLogs.results || [],
+    integrations: ops.integrations,
     ops,
     serverTime: fmtTime()
   };
@@ -3770,6 +3784,10 @@ function stripeConfigured(env = {}) {
   return Boolean(env.STRIPE_SECRET_KEY);
 }
 
+function stripeWebhookConfigured(env = {}) {
+  return Boolean(env.STRIPE_WEBHOOK_SECRET);
+}
+
 function stripeCurrency(env = {}) {
   return String(env.STRIPE_CURRENCY || 'twd').trim().toLowerCase();
 }
@@ -3785,7 +3803,39 @@ function stripeUnitAmount(amount, currency) {
 }
 
 function stripeEnabledPublic(env = {}) {
-  return stripeConfigured(env);
+  return stripeConfigured(env) && stripeWebhookConfigured(env);
+}
+
+function integrationReadiness(env = {}) {
+  const baseUrl = publicBaseUrl(env);
+  const providers = oauthPublicProviders(env);
+  const enabledProviders = providers.filter((provider) => provider.enabled);
+  const stripeKey = String(env.STRIPE_SECRET_KEY || '');
+  const stripeMode = stripeKey.startsWith('sk_live_') ? 'live' : stripeKey.startsWith('sk_test_') ? 'test' : stripeConfigured(env) ? 'custom' : 'off';
+  return {
+    memberUrl: `${baseUrl}/member`,
+    telegram: {
+      botToken: Boolean(env.BOT_TOKEN || CONFIG.BOT_TOKEN),
+      botUsername: CONFIG.BOT_USERNAME || '',
+      loginCodeEnabled: Boolean(env.BOT_TOKEN || CONFIG.BOT_TOKEN)
+    },
+    oauth: {
+      enabledCount: enabledProviders.length,
+      providers,
+      callbackUrls: {
+        google: `${baseUrl}/auth/google/callback`,
+        line: `${baseUrl}/auth/line/callback`
+      }
+    },
+    stripe: {
+      enabled: stripeEnabledPublic(env),
+      secretKey: stripeConfigured(env),
+      webhookSecret: stripeWebhookConfigured(env),
+      mode: stripeMode,
+      currency: stripeCurrency(env).toUpperCase(),
+      webhookUrl: `${baseUrl}/webhook/stripe`
+    }
+  };
 }
 
 async function createStripeCheckoutSession(env, order, user = {}) {
@@ -4083,7 +4133,7 @@ async function createMemberOrder(db, env, userId, payload) {
   if (!['pro', 'vip'].includes(tier)) throw new Error('方案不正確');
   if (![1, 3, 12].includes(months)) throw new Error('訂閱月份不正確');
   if (!['manual', 'stripe'].includes(paymentProvider)) throw new Error('付款方式不正確');
-  if (paymentProvider === 'stripe' && !stripeConfigured(env)) throw new Error('線上付款尚未啟用，請改用轉帳付款');
+  if (paymentProvider === 'stripe' && !stripeEnabledPublic(env)) throw new Error('線上付款尚未完整啟用，請先設定 Stripe secret 與 webhook secret，或改用轉帳付款');
 
   const plans = await getMemberPlans(db);
   const plan = plans[tier]?.months?.[months];
@@ -5133,7 +5183,7 @@ async function handleAdminApi(request, env, pathname) {
 
   try {
     if (request.method === 'GET' && parts[0] === 'bootstrap') {
-      return json({ ok: true, data: await getAdminBootstrap(db) });
+      return json({ ok: true, data: await getAdminBootstrap(db, env) });
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts.length === 1) {
@@ -5633,7 +5683,9 @@ function renderSymbolFormHtml() {
 }
 
 function renderConfigFormHtml() {
-  return `<form id="configForm" class="stack">
+  return `<div class="stack">
+  <div class="card-grid two" id="billingReadiness"></div>
+  <form id="configForm" class="stack">
     <div class="form-grid">
       <div><label>Pro 月費</label><input name="pro_price_1m"></div>
       <div><label>VIP 月費</label><input name="vip_price_1m"></div>
@@ -5651,7 +5703,8 @@ function renderConfigFormHtml() {
       <div class="full"><label>歡迎訊息</label><textarea name="welcome_message"></textarea></div>
     </div>
     <button class="btn primary" type="submit">儲存設定</button>
-  </form>`;
+  </form>
+  </div>`;
 }
 
 function renderAdminScript() {
@@ -5712,6 +5765,7 @@ function renderAll() {
   renderKpis();
   renderConfigSummary();
   renderConfigForm();
+  renderBillingReadiness();
   renderSignals();
   renderOrders();
   renderUsers();
@@ -5745,6 +5799,9 @@ function renderOpsSummary() {
 }
 function renderOpsHealth() {
   var ops = state.data.ops || { status: 'ok', statusText: '正常', issues: [] };
+  var integrations = state.data.integrations || ops.integrations || {};
+  var stripe = integrations.stripe || {};
+  var oauth = integrations.oauth || {};
   var badgeTone = ops.status === 'critical' ? 'red' : ops.status === 'warning' ? 'amber' : 'green';
   var badge = document.getElementById('opsHealthBadge');
   if (badge) badge.innerHTML = chip(ops.statusText || '正常', badgeTone);
@@ -5760,6 +5817,9 @@ function renderOpsHealth() {
   } else {
     cards.push('<article class="health-card"><strong>營運狀態正常</strong><p>目前沒有待處理的付款、發訊或 TradingView 錯誤。</p><small>最後同步 ' + esc(state.data.serverTime || '-') + '</small></article>');
   }
+  cards.push('<article class="health-card ' + (stripe.enabled ? 'info' : 'warning') + '"><strong>線上付款</strong><p>' + (stripe.enabled ? 'Stripe Checkout 與 webhook 已完整啟用。' : '線上付款尚未完整啟用，會員目前不會看到線上付款按鈕。') + '</p><small>' + esc(stripe.mode || 'off') + ' · ' + esc(stripe.currency || '-') + '</small></article>');
+  var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
+  cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>第三方登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google / LINE，會員仍可用 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/member') + '</small></article>');
   cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
   cards.push('<article class="health-card info"><strong>後台效能</strong><p>Bootstrap ' + esc(ops.bootstrapMs || '-') + 'ms。</p><small>待發佇列 ' + esc((ops.queueStats && ops.queueStats.due) || 0) + '，付款待確認 ' + esc((ops.orderStats && ops.orderStats.paid) || 0) + '</small></article>');
   document.getElementById('opsHealthGrid').innerHTML = cards.join('');
@@ -5786,8 +5846,11 @@ function renderConfigSummary() {
   var summary = document.getElementById('configSummary');
   if (!summary) return;
   var c = state.data.config;
+  var integrations = state.data.integrations || {};
+  var stripe = integrations.stripe || {};
+  var oauth = integrations.oauth || {};
   summary.innerHTML =
-    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + '</div>' +
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip((oauth.enabledCount || 0) + ' 個第三方登入', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
     '<div class="muted">付款：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">客服：' + esc(c.contact_telegram || '-') + ' / ' + esc(c.contact_line || '-') + '</div>';
 }
@@ -5797,6 +5860,53 @@ function renderConfigForm() {
   Object.keys(state.data.config).forEach(function (key) {
     if (form.elements[key]) form.elements[key].value = state.data.config[key] == null ? '' : state.data.config[key];
   });
+}
+function readinessCard(title, tone, body, small, copyValue) {
+  return '<article class="health-card ' + esc(tone || 'info') + '">' +
+    '<strong>' + esc(title) + '</strong>' +
+    '<p>' + body + '</p>' +
+    (small ? '<small>' + small + '</small>' : '') +
+    (copyValue ? '<div class="copy-row"><code>' + esc(copyValue) + '</code><button class="btn ghost" type="button" data-copy-value="' + esc(copyValue) + '">複製</button></div>' : '') +
+  '</article>';
+}
+function renderBillingReadiness() {
+  var box = document.getElementById('billingReadiness');
+  if (!box) return;
+  var integrations = state.data.integrations || {};
+  var stripe = integrations.stripe || {};
+  var oauth = integrations.oauth || { providers: [] };
+  var telegram = integrations.telegram || {};
+  var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
+  var cards = [];
+  cards.push(readinessCard(
+    'Stripe 線上付款',
+    stripe.enabled ? 'info' : 'warning',
+    stripe.enabled ? '會員可用 Checkout 付款，webhook 會自動確認訂單。' : '需要同時設定 STRIPE_SECRET_KEY 與 STRIPE_WEBHOOK_SECRET，才會對會員開放線上付款。',
+    esc((stripe.mode || 'off').toUpperCase()) + ' · ' + esc(stripe.currency || '-') + ' · secret ' + (stripe.secretKey ? 'OK' : 'missing') + ' · webhook ' + (stripe.webhookSecret ? 'OK' : 'missing'),
+    stripe.webhookUrl || ''
+  ));
+  cards.push(readinessCard(
+    '會員第三方登入',
+    oauth.enabledCount ? 'info' : 'warning',
+    oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '，純網站會員可直接登入會員中心。' : '尚未啟用 Google / LINE；會員仍可由 Telegram /login 取得一次性登入碼。',
+    'Google callback 與 LINE callback 請分別貼到 OAuth 後台。',
+    (oauth.callbackUrls && oauth.callbackUrls.google) || ''
+  ));
+  cards.push(readinessCard(
+    'LINE OAuth Callback',
+    (oauth.providers || []).some(function (p) { return p.id === 'line' && p.enabled; }) ? 'info' : 'warning',
+    'LINE 登入啟用時使用此 callback URL。',
+    '若暫時不用 LINE，可先保持未設定。',
+    (oauth.callbackUrls && oauth.callbackUrls.line) || ''
+  ));
+  cards.push(readinessCard(
+    'Telegram 會員入口',
+    telegram.botToken ? 'info' : 'critical',
+    telegram.botToken ? 'Telegram 登入碼與推播可用。' : 'BOT_TOKEN 尚未設定，Telegram 推播與登入碼不可用。',
+    'Bot ' + esc(telegram.botUsername || '-') + ' · 會員中心 ' + esc(integrations.memberUrl || '/member'),
+    integrations.memberUrl || ''
+  ));
+  box.innerHTML = cards.join('');
 }
 function renderSignalSymbolOptions() {
   var select = document.getElementById('signalTicker');

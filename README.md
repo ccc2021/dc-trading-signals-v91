@@ -161,7 +161,7 @@ https://your-worker.workers.dev/auth/line/callback
 
 ### 3c. 選配 Stripe 線上付款
 
-會員中心會保留轉帳付款；設定 Stripe 後會額外顯示「線上付款」並透過 Checkout 自動確認訂單。
+會員中心會保留轉帳付款；`STRIPE_SECRET_KEY` 與 `STRIPE_WEBHOOK_SECRET` 都設定完成後，才會額外顯示「線上付款」並透過 Checkout 自動確認訂單。
 
 ```bash
 wrangler secret put STRIPE_SECRET_KEY
