@@ -304,6 +304,20 @@ CREATE TABLE orders (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- 10b. 會員中心一次性登入碼 (member_login_codes)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS member_login_codes;
+CREATE TABLE member_login_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- 11. 積分歷史 (point_history)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS point_history;
@@ -400,6 +414,8 @@ CREATE INDEX idx_tv_logs_created ON tv_alert_logs(created_at);
 
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_at);
+CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
 
 CREATE INDEX idx_queued_user ON queued_signals(user_id);
 CREATE INDEX idx_queued_scheduled ON queued_signals(scheduled_at);

@@ -9,7 +9,7 @@ database_id = "c659121a-1ab6-4a88-a263-da0e4d585b26"
 
 [vars]
 ADMIN_IDS = "810479094"
-BOT_USERNAME = "Dan_mix_bot"
+BOT_USERNAME = "DanMix_Bot"
 ADMIN_WEB_USER = "admin"
 
 [triggers]

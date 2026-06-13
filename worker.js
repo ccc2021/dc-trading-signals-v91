@@ -891,6 +891,14 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   const db = env.DB;
   const user = await getUser(db, uid);
   const settings = await getUserSettings(db, uid);
+
+  if (cmd === '/login') {
+    const code = await createMemberLoginCode(db, uid);
+    return sendTg(cid,
+      `<b>會員中心登入碼</b>\n\n<code>${code}</code>\n\n10 分鐘內有效，只能使用一次。\n請到會員中心輸入此登入碼完成登入。`,
+      { inline_keyboard: [[{ text: '開啟會員中心', url: memberPortalUrl(env) }]] }
+    );
+  }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 主選單 /menu
@@ -1476,6 +1484,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     m += `📱 <b>基本功能</b>\n`;
     m += `/menu - 主選單\n`;
+    m += `/login - 會員中心登入碼\n`;
     m += `/status - 會員狀態\n`;
     m += `/plans - 方案介紹\n`;
     m += `/contact - 聯繫客服\n\n`;
@@ -3102,6 +3111,76 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
 const MEMBER_SESSION_COOKIE = 'dc_member_session';
 const MEMBER_SESSION_TTL = 30 * 86400;
 
+function memberPortalUrl(env = {}) {
+  return String(env.MEMBER_WEB_URL || env.PUBLIC_MEMBER_URL || 'https://dc-signals-v91.cc559773.workers.dev/member');
+}
+
+function genLoginCode() {
+  const bytes = new Uint32Array(1);
+  crypto.getRandomValues(bytes);
+  return String(bytes[0] % 1000000).padStart(6, '0');
+}
+
+async function ensureMemberLoginSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS member_login_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_login_codes_user ON member_login_codes(user_id, created_at)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_login_codes_expires ON member_login_codes(expires_at)').run();
+}
+
+async function createMemberLoginCode(db, userId) {
+  await ensureMemberLoginSchema(db);
+  await db.prepare(`
+    UPDATE member_login_codes
+    SET used_at = datetime('now')
+    WHERE user_id = ? AND used_at IS NULL
+  `).bind(userId).run();
+
+  for (let i = 0; i < 8; i++) {
+    const code = genLoginCode();
+    try {
+      await db.prepare(`
+        INSERT INTO member_login_codes (code, user_id, expires_at)
+        VALUES (?, ?, datetime('now', '+10 minutes'))
+      `).bind(code, userId).run();
+      return code;
+    } catch {}
+  }
+  throw new Error('登入碼產生失敗，請稍後再試');
+}
+
+async function loginMemberWithCode(db, env, payload) {
+  await ensureMemberLoginSchema(db);
+  const code = String(payload.code || '').replace(/\D/g, '');
+  if (!/^\d{6}$/.test(code)) throw new Error('請輸入 6 位登入碼');
+
+  const row = await db.prepare(`
+    SELECT id, user_id FROM member_login_codes
+    WHERE code = ? AND used_at IS NULL AND expires_at > datetime('now')
+    ORDER BY created_at DESC LIMIT 1
+  `).bind(code).first();
+  if (!row) throw new Error('登入碼錯誤或已過期，請在 Telegram 重新輸入 /login');
+
+  const result = await db.prepare(`
+    UPDATE member_login_codes
+    SET used_at = datetime('now')
+    WHERE id = ? AND used_at IS NULL
+  `).bind(row.id).run();
+  if (result?.meta?.changes === 0) throw new Error('登入碼已使用，請重新取得');
+
+  await getUser(db, row.user_id);
+  const session = await createMemberSession(row.user_id, env);
+  return { session, data: await getMemberBootstrap(db, row.user_id) };
+}
+
 async function verifyTelegramLoginPayload(payload, env) {
   const token = env.BOT_TOKEN || CONFIG.BOT_TOKEN;
   if (!token) throw new Error('BOT_TOKEN 尚未設定，無法啟用 Telegram Login');
@@ -3252,7 +3331,7 @@ async function getMemberBootstrap(db, userId) {
   }
 
   const orders = (await db.prepare(`
-    SELECT order_id, tier, months, days, amount, status, created_at, confirmed_at
+    SELECT order_id, tier, months, days, amount, status, payment_note, created_at, confirmed_at
     FROM orders WHERE user_id = ?
     ORDER BY created_at DESC LIMIT 10
   `).bind(userId).all()).results || [];
@@ -3328,18 +3407,32 @@ async function createMemberOrder(db, env, userId, payload) {
   return { orderId, tier, months, days: plan.days, amount: plan.amount, status: 'pending' };
 }
 
-async function updateMemberOrderStatus(db, userId, orderId, action) {
+function memberPaymentNote(payload = {}) {
+  const payer = String(payload.payer_name || payload.payerName || '').trim();
+  const last5 = String(payload.transfer_last5 || payload.transferLast5 || '').trim();
+  const paidAt = String(payload.paid_at || payload.paidAt || '').trim();
+  const note = String(payload.note || '').trim();
+  const parts = [];
+  if (payer) parts.push(`付款人：${payer}`);
+  if (last5) parts.push(`後五碼：${last5}`);
+  if (paidAt) parts.push(`付款時間：${paidAt}`);
+  if (note) parts.push(`備註：${note}`);
+  return parts.join('\n') || '會員中心通知付款';
+}
+
+async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}) {
   const normalizedOrderId = String(orderId || '').trim().toUpperCase();
   const order = await db.prepare('SELECT * FROM orders WHERE order_id = ? AND user_id = ?').bind(normalizedOrderId, userId).first();
   if (!order) throw new Error('找不到訂單');
 
   if (action === 'paid') {
     if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法通知付款');
-    await db.prepare("UPDATE orders SET status = 'paid', payment_note = '會員中心通知付款' WHERE order_id = ?").bind(normalizedOrderId).run();
+    const paymentNote = memberPaymentNote(payload);
+    await db.prepare("UPDATE orders SET status = 'paid', payment_note = ? WHERE order_id = ?").bind(paymentNote, normalizedOrderId).run();
     for (const adminId of CONFIG.ADMIN_IDS) {
-      await sendTg(adminId, `會員中心付款通知\n\n訂單：<code>${normalizedOrderId}</code>\n用戶：<code>${escHtml(userId)}</code>\n金額：NT$${fmtNum(order.amount)}\n\n請至後台確認訂單。`);
+      await sendTg(adminId, `會員中心付款通知\n\n訂單：<code>${normalizedOrderId}</code>\n用戶：<code>${escHtml(userId)}</code>\n金額：NT$${fmtNum(order.amount)}\n\n${escHtml(paymentNote)}\n\n請至後台確認訂單。`);
     }
-    await logAction(db, userId, 'member_order_paid', normalizedOrderId, '');
+    await logAction(db, userId, 'member_order_paid', normalizedOrderId, paymentNote);
     return { orderId: normalizedOrderId, status: 'paid' };
   }
 
@@ -3401,6 +3494,17 @@ async function handleMemberApi(request, env, pathname) {
       });
     }
 
+    if (request.method === 'POST' && parts[0] === 'login-code') {
+      const login = await loginMemberWithCode(db, env, await readJsonBody(request));
+      return new Response(JSON.stringify({ ok: true, data: login.data }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie(login.session)
+        }
+      });
+    }
+
     if (request.method === 'POST' && parts[0] === 'logout') {
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -3427,7 +3531,7 @@ async function handleMemberApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'orders' && parts[1] && parts[2]) {
-      return json({ ok: true, data: await updateMemberOrderStatus(db, session.userId, parts[1], parts[2]) });
+      return json({ ok: true, data: await updateMemberOrderStatus(db, session.userId, parts[1], parts[2], await readJsonBody(request)) });
     }
 
     return json({ ok: false, error: 'Not found' }, 404);
@@ -3481,6 +3585,7 @@ function renderMemberPage() {
     .payment-box { border:1px solid rgba(8,167,179,.24); background:#f4fbfc; border-radius:8px; padding:12px; display:grid; gap:7px; }
     .order-card { border:1px solid var(--line); border-radius:8px; padding:11px; display:grid; gap:8px; }
     .order-actions { display:flex; gap:7px; flex-wrap:wrap; }
+    .proof-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .chips { display:flex; gap:7px; flex-wrap:wrap; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
     .chip.green { background:#e8f7ef; color:var(--green); }
@@ -3500,10 +3605,15 @@ function renderMemberPage() {
     .check input { width:auto; min-height:unset; }
     .login { min-height:70vh; display:grid; place-items:center; padding:20px; }
     .login-card { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:12px; padding:24px; box-shadow:var(--shadow); display:grid; gap:14px; text-align:center; }
+    .login-code { display:grid; gap:8px; text-align:left; }
+    .login-code button { width:100%; }
+    .login-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; font-weight:800; }
+    .login-divider:before, .login-divider:after { content:""; height:1px; background:var(--line); flex:1; }
+    .login-hint { font-size:13px; line-height:1.55; }
     .hidden { display:none !important; }
     .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
     .toast:empty { display:none; }
-    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid { grid-template-columns:1fr; } .hero h2 { font-size:23px; } }
+    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid, .proof-grid { grid-template-columns:1fr; } .hero h2 { font-size:23px; } }
   </style>
 </head>
 <body>
@@ -3513,6 +3623,13 @@ function renderMemberPage() {
       <h1>DC Signals 會員中心</h1>
       <p class="muted">使用 Telegram 登入後，可線上查看訊號與維護訂閱設定。</p>
       ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
+      <div class="login-divider"><span>備援登入</span></div>
+      <form class="login-code" id="loginCodeForm">
+        <label for="loginCodeInput">一次性登入碼</label>
+        <input id="loginCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="輸入 6 位碼">
+        <button class="btn primary" type="submit">登入會員中心</button>
+      </form>
+      <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b> 取得登入碼。</p>
     </div>
   </section>
   <main class="wrap hidden" id="appView">
@@ -3542,6 +3659,8 @@ var state = null;
 var loginView = document.getElementById('loginView');
 var appView = document.getElementById('appView');
 var toast = document.getElementById('toast');
+var loginCodeForm = document.getElementById('loginCodeForm');
+var loginCodeInput = document.getElementById('loginCodeInput');
 function esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function money(value){ return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
 function price(value){ var n = Number(value); return isFinite(n) ? n.toFixed(2) : '-'; }
@@ -3550,6 +3669,15 @@ function chip(text,tone){ return '<span class="chip '+(tone||'')+'">'+esc(text)+
 function showToast(text,tone){ toast.textContent=text||''; toast.style.color=tone==='error'?'#d1433f':'#667085'; if(text) setTimeout(function(){ if(toast.textContent===text) toast.textContent=''; },3600); }
 async function api(path, options){ var res=await fetch(path,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},options||{})); var data=await res.json().catch(function(){return{};}); if(!res.ok||!data.ok) throw new Error(data.error||('HTTP '+res.status)); return data.data; }
 window.onTelegramAuth = async function(user){ try{ state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); render(); }catch(err){ showToast(err.message,'error'); } };
+loginCodeForm.addEventListener('submit', async function(event){
+  event.preventDefault();
+  var code = (loginCodeInput.value || '').replace(/\\D/g,'');
+  try{
+    state = await api('/api/member/login-code',{method:'POST',body:JSON.stringify({code:code})});
+    loginCodeInput.value = '';
+    render();
+  }catch(err){ showToast(err.message,'error'); }
+});
 async function load(){ try{ state = await api('/api/member/me'); render(); }catch(err){ loginView.classList.remove('hidden'); appView.classList.add('hidden'); } }
 function tierTone(tier){ return tier === 'vip' ? 'amber' : tier === 'pro' ? 'green' : ''; }
 function signalTone(sig){ return sig.action === 'LONG' ? 'green' : 'red'; }
@@ -3592,13 +3720,25 @@ function orderTone(status){ return status==='confirmed'?'green':status==='reject
 function orderStatusText(status){
   return status==='pending'?'待付款':status==='paid'?'待確認':status==='confirmed'?'已確認':status==='rejected'?'已拒絕':status==='cancelled'?'已取消':status;
 }
+function paymentNoteHtml(note){
+  if(!note) return '';
+  return '<div class="muted">'+esc(note).replace(/\\n/g,'<br>')+'</div>';
+}
 function renderOrder(o){
   var actions = '';
-  if(o.status === 'pending') actions = '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+  if(o.status === 'pending') actions =
+    '<div class="proof-grid">'+
+      '<div><label>付款人</label><input data-proof="payer_name" placeholder="轉帳戶名"></div>'+
+      '<div><label>帳號後五碼</label><input data-proof="transfer_last5" inputmode="numeric" placeholder="例如 12345"></div>'+
+      '<div><label>付款時間</label><input data-proof="paid_at" placeholder="例如 6/13 18:30"></div>'+
+      '<div><label>備註</label><input data-proof="note" placeholder="可填銀行、截圖連結等"></div>'+
+    '</div>'+
+    '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
   if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
   return '<article class="order-card">'+
     '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
     '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+dateText(o.created_at)+'</div>'+
+    paymentNoteHtml(o.payment_note)+
     actions+
   '</article>';
 }
@@ -3639,7 +3779,12 @@ document.body.addEventListener('click', async function(event){
     }
     var paid = event.target.closest('[data-order-paid]');
     if(paid){
-      await api('/api/member/orders/'+encodeURIComponent(paid.dataset.orderPaid)+'/paid',{method:'POST',body:'{}'});
+      var card = paid.closest('.order-card');
+      var proof = {};
+      if(card){
+        card.querySelectorAll('[data-proof]').forEach(function(input){ proof[input.dataset.proof] = input.value; });
+      }
+      await api('/api/member/orders/'+encodeURIComponent(paid.dataset.orderPaid)+'/paid',{method:'POST',body:JSON.stringify(proof)});
       showToast('已通知客服確認付款');
       await load();
       return;
@@ -4317,6 +4462,7 @@ function renderAdminPage() {
     .source-meta { display:grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
     .source-meta div { background: var(--panel-2); border-radius: 6px; padding: 8px; font-size: 12px; }
     .source-meta span { display:block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+    .note-cell { min-width: 160px; white-space: normal; color: var(--muted); font-size: 12px; line-height: 1.45; }
     .copy-row { display:flex; gap: 8px; align-items:center; min-width:0; }
     .copy-row code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:8px; font-size: 12px; }
     .revenue-stack { display:grid; gap: 12px; }
@@ -4455,7 +4601,7 @@ function renderAdminPage() {
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
         <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
         <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 50 位用戶</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
-        <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
+        <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>付款備註</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
         <div class="view" id="view-billing"><section class="panel"><header><h2>收費、付款與系統設定</h2></header><div class="body">${renderConfigFormHtml()}</div></section></div>
         <div class="message" id="message"></div>
       </section>
@@ -4821,14 +4967,15 @@ function orderRow(order, compact) {
   var actions = order.status === 'pending' || order.status === 'paid'
     ? '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>'
     : '';
-  if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
-  return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
+  var note = order.payment_note ? esc(order.payment_note).replace(/\\n/g, '<br>') : '<span class="muted">-</span>';
+  if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code><div class="note-cell">' + note + '</div></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
+  return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
 }
 function renderOrders() {
   var orders = state.data.orders || [];
   var pending = orders.filter(function (o) { return o.status === 'pending' || o.status === 'paid'; });
   document.getElementById('pendingOrders').innerHTML = pending.slice(0, 8).map(function (o) { return orderRow(o, true); }).join('') || '<tr><td colspan="5" class="muted">沒有待處理訂單</td></tr>';
-  document.getElementById('ordersTable').innerHTML = orders.map(function (o) { return orderRow(o, false); }).join('') || '<tr><td colspan="7" class="muted">尚無訂單</td></tr>';
+  document.getElementById('ordersTable').innerHTML = orders.map(function (o) { return orderRow(o, false); }).join('') || '<tr><td colspan="8" class="muted">尚無訂單</td></tr>';
 }
 function renderUsers() {
   var users = state.data.users || [];
