@@ -79,6 +79,11 @@ const fmtPrice = (n) => n?.toFixed(2) || '0.00';
 const fmtDate = (d) => d ? new Date(d).toLocaleDateString('zh-TW') : '-';
 const fmtDateTime = (d) => d ? new Date(d).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-';
 const fmtTime = () => new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+const formatUserLabel = (user, fallback = '') => {
+  const username = String(user?.username || '').trim();
+  if (username) return username.includes('@') ? username : `@${username}`;
+  return user?.first_name || fallback || user?.user_id || '-';
+};
 const parseDbTime = (d) => {
   if (!d) return null;
   const text = String(d).trim();
@@ -110,6 +115,12 @@ const photoCaption = (value) => {
 };
 const textBytes = (value) => new TextEncoder().encode(String(value));
 const bytesToHex = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+const hexToBytes = (hex) => {
+  const clean = String(hex || '').replace(/[^0-9a-f]/gi, '');
+  const bytes = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+};
 const base64UrlEncode = (value) => btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 const base64UrlDecode = (value) => {
   const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
@@ -1943,7 +1954,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
     
     // 通知管理員
     for (const adminId of CONFIG.ADMIN_IDS) {
-      await sendTg(adminId, `📋 新訂單！\n\n用戶：${user.username ? '@' + user.username : user.first_name || uid}\nID：<code>${uid}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${price}`);
+      await sendTg(adminId, `📋 新訂單！\n\n用戶：${escHtml(formatUserLabel(user, uid))}\nID：<code>${uid}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${price}`);
     }
     
     return editTg(cid, msgId, m, { inline_keyboard: buttons });
@@ -3521,6 +3532,7 @@ const MEMBER_SESSION_COOKIE = 'dc_member_session';
 const MEMBER_OAUTH_COOKIE = 'dc_oauth_state';
 const MEMBER_SESSION_TTL = 30 * 86400;
 const MEMBER_OAUTH_TTL = 10 * 60;
+const MEMBER_PASSWORD_ITERATIONS = 100000;
 
 function memberPortalUrl(env = {}) {
   return `${publicBaseUrl(env)}/member`;
@@ -3565,6 +3577,25 @@ async function ensureMemberOAuthSchema(db) {
   `).run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_oauth_user ON member_oauth_identities(user_id)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_oauth_provider ON member_oauth_identities(provider, provider_user_id)').run();
+}
+
+async function ensureMemberPasswordSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS member_password_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      user_id TEXT UNIQUE NOT NULL,
+      display_name TEXT,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      iterations INTEGER NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      last_login_at TEXT
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_password_email ON member_password_accounts(email)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_password_user ON member_password_accounts(user_id)').run();
 }
 
 async function ensureOrderPaymentSchema(db) {
@@ -3648,6 +3679,97 @@ async function loginMemberWithCode(db, env, payload) {
   await getUser(db, row.user_id);
   const session = await createMemberSession(row.user_id, env);
   return { session, data: await getMemberBootstrap(db, row.user_id, env) };
+}
+
+function normalizeMemberEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new Error('請輸入有效 Email');
+  return email;
+}
+
+function normalizeMemberDisplayName(value, email) {
+  const name = String(value || '').trim().replace(/\s+/g, ' ').slice(0, 64);
+  return name || String(email || '').split('@')[0].slice(0, 64) || '網站會員';
+}
+
+function validateMemberPassword(value) {
+  const password = String(value || '');
+  if (password.length < 8) throw new Error('密碼至少需要 8 個字元');
+  if (password.length > 128) throw new Error('密碼不可超過 128 個字元');
+  if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) throw new Error('密碼需同時包含英文與數字');
+  return password;
+}
+
+function randomHex(byteLength = 16) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+async function hashMemberPassword(password, saltHex, iterations = MEMBER_PASSWORD_ITERATIONS) {
+  const keyMaterial = await crypto.subtle.importKey('raw', textBytes(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({
+    name: 'PBKDF2',
+    hash: 'SHA-256',
+    salt: hexToBytes(saltHex),
+    iterations: Number(iterations || MEMBER_PASSWORD_ITERATIONS)
+  }, keyMaterial, 256);
+  return bytesToHex(new Uint8Array(bits));
+}
+
+async function verifyMemberPassword(password, account) {
+  if (!account?.password_hash || !account?.password_salt) return false;
+  const actual = await hashMemberPassword(password, account.password_salt, account.iterations || MEMBER_PASSWORD_ITERATIONS);
+  return timingSafeEqual(actual, account.password_hash);
+}
+
+async function webUserIdForEmail(email) {
+  const digest = await sha256Hex(`email:${email}`);
+  return `web_email_${digest.slice(0, 18)}`;
+}
+
+async function registerMemberWithPassword(db, env, payload = {}) {
+  await ensureMemberPasswordSchema(db);
+  const email = normalizeMemberEmail(payload.email);
+  const password = validateMemberPassword(payload.password);
+  const displayName = normalizeMemberDisplayName(payload.display_name || payload.displayName || payload.name, email);
+
+  const existing = await db.prepare('SELECT user_id FROM member_password_accounts WHERE email = ?').bind(email).first();
+  if (existing?.user_id) throw appError('此 Email 已註冊，請直接登入', 409);
+
+  const userId = await webUserIdForEmail(email);
+  const salt = randomHex(16);
+  const passwordHash = await hashMemberPassword(password, salt);
+  await getUser(db, userId);
+  await saveUserInfo(db, userId, email, displayName);
+  await db.prepare(`
+    INSERT INTO member_password_accounts (email, user_id, display_name, password_hash, password_salt, iterations, created_at, updated_at, last_login_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'))
+  `).bind(email, userId, displayName, passwordHash, salt, MEMBER_PASSWORD_ITERATIONS).run();
+
+  await logAction(db, userId, 'member_password_register', email, 'website');
+  const session = await createMemberSession(userId, env);
+  return { session, data: await getMemberBootstrap(db, userId, env) };
+}
+
+async function loginMemberWithPassword(db, env, payload = {}) {
+  await ensureMemberPasswordSchema(db);
+  const email = normalizeMemberEmail(payload.email);
+  const password = String(payload.password || '');
+  const account = await db.prepare('SELECT * FROM member_password_accounts WHERE email = ?').bind(email).first();
+  if (!account || !(await verifyMemberPassword(password, account))) throw appError('Email 或密碼不正確', 401);
+
+  await getUser(db, account.user_id);
+  await saveUserInfo(db, account.user_id, email, account.display_name || normalizeMemberDisplayName('', email));
+  await db.prepare(`
+    UPDATE member_password_accounts
+    SET last_login_at = datetime('now'), updated_at = datetime('now')
+    WHERE id = ?
+  `).bind(account.id).run();
+
+  await logAction(db, account.user_id, 'member_password_login', email, 'website');
+  const session = await createMemberSession(account.user_id, env);
+  return { session, data: await getMemberBootstrap(db, account.user_id, env) };
 }
 
 async function verifyTelegramLoginPayload(payload, env) {
@@ -3973,6 +4095,10 @@ function integrationReadiness(env = {}) {
         google: `${baseUrl}/auth/google/callback`,
         line: `${baseUrl}/auth/line/callback`
       }
+    },
+    passwordAuth: {
+      enabled: true,
+      registerUrl: `${baseUrl}/member`
     },
     stripe: {
       enabled: stripeEnabledPublic(env),
@@ -4378,7 +4504,7 @@ async function createMemberOrder(db, env, userId, payload) {
   }
 
   for (const adminId of CONFIG.ADMIN_IDS) {
-    await sendTg(adminId, `新會員中心訂單\n\n用戶：${user.username ? '@' + user.username : user.first_name || userId}\nID：<code>${escHtml(userId)}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${fmtNum(plan.amount)}\n付款：${paymentProvider === 'stripe' ? 'Stripe Checkout' : '轉帳'}`);
+    await sendTg(adminId, `新會員中心訂單\n\n用戶：${escHtml(formatUserLabel(user, userId))}\nID：<code>${escHtml(userId)}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${fmtNum(plan.amount)}\n付款：${paymentProvider === 'stripe' ? 'Stripe Checkout' : '轉帳'}`);
   }
 
   await logAction(db, userId, 'member_order_create', orderId, `${tier} ${months}m ${paymentProvider}`);
@@ -4498,6 +4624,53 @@ async function handleMemberApi(request, env, pathname) {
         '登入嘗試過多，請稍後再試'
       );
       const login = await loginMemberWithCode(db, env, await readJsonBody(request));
+      return new Response(JSON.stringify({ ok: true, data: login.data }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie(login.session)
+        }
+      });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'register') {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_register_ip', requestClientIp(request)]),
+        5,
+        60 * 60,
+        '註冊太頻繁，請稍後再試'
+      );
+      const login = await registerMemberWithPassword(db, env, await readJsonBody(request));
+      return new Response(JSON.stringify({ ok: true, data: login.data }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': memberCookie(login.session)
+        }
+      });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'password-login') {
+      const payload = await readJsonBody(request);
+      const emailForLimit = String(payload.email || '').trim().toLowerCase();
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_password_login_ip', requestClientIp(request)]),
+        12,
+        10 * 60,
+        '登入嘗試過多，請稍後再試'
+      );
+      if (emailForLimit) {
+        await enforceRateLimit(
+          db,
+          await rateKey(['member_password_login_email', emailForLimit]),
+          8,
+          10 * 60,
+          '此 Email 登入嘗試過多，請稍後再試'
+        );
+      }
+      const login = await loginMemberWithPassword(db, env, payload);
       return new Response(JSON.stringify({ ok: true, data: login.data }), {
         status: 200,
         headers: {
@@ -4631,6 +4804,12 @@ function renderMemberPage() {
     .login-card { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:12px; padding:24px; box-shadow:var(--shadow); display:grid; gap:14px; text-align:center; }
     .login-code { display:grid; gap:8px; text-align:left; }
     .login-code button { width:100%; }
+    .auth-tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding:4px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; }
+    .auth-tabs button { border:0; border-radius:6px; min-height:34px; background:transparent; color:var(--muted); font-weight:900; cursor:pointer; }
+    .auth-tabs button.active { background:#fff; color:var(--ink); box-shadow:0 2px 8px rgba(15,23,42,.06); }
+    .auth-form { display:grid; gap:9px; }
+    .auth-form .btn { width:100%; }
+    .login-switch { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; display:grid; gap:9px; }
     .login-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; font-weight:800; }
     .login-divider:before, .login-divider:after { content:""; height:1px; background:var(--line); flex:1; }
     .login-hint { font-size:13px; line-height:1.55; }
@@ -4655,14 +4834,37 @@ function renderMemberPage() {
       <div class="mark" style="margin:0 auto">DC</div>
       <h1>DC Signals 會員中心</h1>
       <p class="muted">登入後可線上查看訊號、維護訂閱品種與處理續費。</p>
+      <div class="auth-tabs">
+        <button class="active" type="button" data-auth-tab="login">會員登入</button>
+        <button type="button" data-auth-tab="register">建立帳號</button>
+      </div>
+      <form class="auth-form" id="passwordLoginForm">
+        <label for="loginEmailInput">Email</label>
+        <input id="loginEmailInput" type="email" autocomplete="email" placeholder="you@example.com">
+        <label for="loginPasswordInput">密碼</label>
+        <input id="loginPasswordInput" type="password" autocomplete="current-password" placeholder="至少 8 碼">
+        <button class="btn primary" type="submit">登入會員中心</button>
+      </form>
+      <form class="auth-form hidden" id="passwordRegisterForm">
+        <label for="registerNameInput">顯示名稱</label>
+        <input id="registerNameInput" autocomplete="name" placeholder="例如 Juliot">
+        <label for="registerEmailInput">Email</label>
+        <input id="registerEmailInput" type="email" autocomplete="email" placeholder="you@example.com">
+        <label for="registerPasswordInput">密碼</label>
+        <input id="registerPasswordInput" type="password" autocomplete="new-password" placeholder="英文 + 數字，至少 8 碼">
+        <button class="btn primary" type="submit">建立並登入</button>
+      </form>
+      <div class="login-divider"><span>其他登入方式</span></div>
+      <div class="oauth-grid" id="oauthLogin"></div>
+      <details class="login-switch">
+        <summary>使用 Telegram /login 登入碼</summary>
       <form class="login-code" id="loginCodeForm">
         <label for="loginCodeInput">一次性登入碼</label>
         <input id="loginCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="輸入 6 位碼">
         <button class="btn primary" type="submit">登入會員中心</button>
       </form>
       <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b> 取得登入碼。</p>
-      <div class="oauth-grid" id="oauthLogin"></div>
-      <div class="login-divider"><span>Telegram</span></div>
+      </details>
       <details class="login-widget">
         <summary>Telegram 一鍵登入</summary>
         <div class="widget-box">
@@ -4702,6 +4904,8 @@ var appView = document.getElementById('appView');
 var toast = document.getElementById('toast');
 var loginCodeForm = document.getElementById('loginCodeForm');
 var loginCodeInput = document.getElementById('loginCodeInput');
+var passwordLoginForm = document.getElementById('passwordLoginForm');
+var passwordRegisterForm = document.getElementById('passwordRegisterForm');
 var oauthLogin = document.getElementById('oauthLogin');
 function esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function money(value){ return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
@@ -4732,6 +4936,38 @@ async function loadOAuthProviders(){
   }catch(err){ oauthLogin.innerHTML = ''; }
 }
 window.onTelegramAuth = async function(user){ try{ state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); render(); }catch(err){ showToast(err.message,'error'); } };
+function setAuthTab(tab){
+  Array.prototype.slice.call(document.querySelectorAll('[data-auth-tab]')).forEach(function(btn){ btn.classList.toggle('active', btn.dataset.authTab === tab); });
+  passwordLoginForm.classList.toggle('hidden', tab !== 'login');
+  passwordRegisterForm.classList.toggle('hidden', tab !== 'register');
+}
+document.querySelector('.auth-tabs').addEventListener('click', function(event){
+  var btn = event.target.closest('[data-auth-tab]');
+  if(btn) setAuthTab(btn.dataset.authTab);
+});
+passwordLoginForm.addEventListener('submit', async function(event){
+  event.preventDefault();
+  try{
+    state = await api('/api/member/password-login',{method:'POST',body:JSON.stringify({
+      email: document.getElementById('loginEmailInput').value,
+      password: document.getElementById('loginPasswordInput').value
+    })});
+    document.getElementById('loginPasswordInput').value = '';
+    render();
+  }catch(err){ showToast(err.message,'error'); }
+});
+passwordRegisterForm.addEventListener('submit', async function(event){
+  event.preventDefault();
+  try{
+    state = await api('/api/member/register',{method:'POST',body:JSON.stringify({
+      display_name: document.getElementById('registerNameInput').value,
+      email: document.getElementById('registerEmailInput').value,
+      password: document.getElementById('registerPasswordInput').value
+    })});
+    document.getElementById('registerPasswordInput').value = '';
+    render();
+  }catch(err){ showToast(err.message,'error'); }
+});
 loginCodeForm.addEventListener('submit', async function(event){
   event.preventDefault();
   var code = (loginCodeInput.value || '').replace(/\\D/g,'');
@@ -4743,6 +4979,7 @@ loginCodeForm.addEventListener('submit', async function(event){
 });
 async function load(){ try{ state = await api('/api/member/me'); render(); }catch(err){ loginView.classList.remove('hidden'); appView.classList.add('hidden'); } }
 function tierTone(tier){ return tier === 'vip' ? 'amber' : tier === 'pro' ? 'green' : ''; }
+function memberDisplayName(u){ return u.username ? (String(u.username).indexOf('@') >= 0 ? u.username : '@' + u.username) : (u.first_name || u.user_id); }
 function signalTone(sig){ return sig.action === 'LONG' ? 'green' : 'red'; }
 function statusText(sig){
   if(sig.status === 'active') return '進行中';
@@ -4888,7 +5125,7 @@ function renderSignalsOnly(){
 }
 function render(){
   loginView.classList.add('hidden'); appView.classList.remove('hidden');
-  var u=state.user; document.getElementById('memberName').textContent=(u.username?'@'+u.username:(u.first_name||u.user_id))+' · '+u.tier_name;
+  var u=state.user; document.getElementById('memberName').textContent=memberDisplayName(u)+' · '+u.tier_name;
   document.getElementById('heroTitle').textContent = u.can_receive ? '會員訊號工作台' : '會員資格尚未啟用';
   document.getElementById('heroCopy').textContent = u.can_receive ? '可線上查看您訂閱品種的最新訊號與維護通知設定。' : '請先完成訂閱，完成後即可線上查看訊號。';
   document.getElementById('heroChips').innerHTML = chip(u.tier_name,tierTone(u.tier)) + chip(u.tier_expires_at ? '到期 '+dateText(u.tier_expires_at) : '無到期日', u.can_receive?'green':'amber');
@@ -6037,6 +6274,7 @@ function renderOpsHealth() {
   var integrations = state.data.integrations || ops.integrations || {};
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || {};
+  var passwordAuth = integrations.passwordAuth || {};
   var cron = integrations.cron || {};
   var badgeTone = ops.status === 'critical' ? 'red' : ops.status === 'warning' ? 'amber' : 'green';
   var badge = document.getElementById('opsHealthBadge');
@@ -6056,6 +6294,7 @@ function renderOpsHealth() {
   cards.push('<article class="health-card ' + (stripe.enabled ? 'info' : 'warning') + '"><strong>線上付款</strong><p>' + (stripe.enabled ? 'Stripe Checkout 與 webhook 已完整啟用。' : '線上付款尚未完整啟用，會員目前不會看到線上付款按鈕。') + '</p><small>' + esc(stripe.mode || 'off') + ' · ' + esc(stripe.currency || '-') + '</small></article>');
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
   cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>第三方登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google / LINE，會員仍可用 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/member') + '</small></article>');
+  cards.push('<article class="health-card ' + (passwordAuth.enabled ? 'info' : 'warning') + '"><strong>網站帳號登入</strong><p>' + (passwordAuth.enabled ? '會員可直接用 Email + 密碼註冊與登入會員中心。' : '網站帳號登入尚未啟用。') + '</p><small>' + esc(passwordAuth.registerUrl || integrations.memberUrl || '/member') + '</small></article>');
   cards.push('<article class="health-card ' + (cron.manualSecret ? 'info' : 'warning') + '"><strong>Cron 手動端點</strong><p>' + (cron.manualSecret ? '手動維運端點已由 CRON_SECRET 保護。' : '手動維運端點已鎖定；需設定 CRON_SECRET 才能外部觸發。') + '</p><small>Cloudflare scheduled cron 不受影響</small></article>');
   cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
   cards.push('<article class="health-card info"><strong>會員安全</strong><p>登入碼與訂單建立已啟用速率限制。</p><small>目前限制中 ' + esc((ops.securityStats && ops.securityStats.activeRateLimits) || 0) + '，高頻 ' + esc((ops.securityStats && ops.securityStats.hotRateLimits) || 0) + '</small></article>');
@@ -6114,6 +6353,7 @@ function renderBillingReadiness() {
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || { providers: [] };
   var telegram = integrations.telegram || {};
+  var passwordAuth = integrations.passwordAuth || {};
   var cron = integrations.cron || {};
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
   var cards = [];
@@ -6130,6 +6370,13 @@ function renderBillingReadiness() {
     oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '，純網站會員可直接登入會員中心。' : '尚未啟用 Google / LINE；會員仍可由 Telegram /login 取得一次性登入碼。',
     'Google callback 與 LINE callback 請分別貼到 OAuth 後台。',
     (oauth.callbackUrls && oauth.callbackUrls.google) || ''
+  ));
+  cards.push(readinessCard(
+    '網站帳號註冊',
+    passwordAuth.enabled ? 'info' : 'warning',
+    passwordAuth.enabled ? 'Email + 密碼註冊已啟用，會員可不經 Telegram 直接使用會員中心。' : '網站帳號註冊尚未啟用。',
+    '密碼以 PBKDF2 雜湊保存，登入與註冊已套用限流。',
+    passwordAuth.registerUrl || integrations.memberUrl || ''
   ));
   cards.push(readinessCard(
     'LINE OAuth Callback',
@@ -6241,8 +6488,13 @@ function latestOrderEvent(orderId) {
   var id = String(orderId || '').toUpperCase();
   return (state.data.orderEvents || []).find(function (event) { return String(event.order_id || '').toUpperCase() === id; });
 }
+function adminUserName(user) {
+  var username = String(user && user.username || '').trim();
+  if (username) return username.indexOf('@') >= 0 ? username : '@' + username;
+  return (user && (user.first_name || user.user_id)) || '-';
+}
 function orderRow(order, compact) {
-  var user = order.username ? '@' + order.username : (order.first_name || order.user_id);
+  var user = adminUserName(order);
   var tone = order.status === 'paid' ? 'amber' : order.status === 'confirmed' ? 'green' : order.status === 'rejected' ? 'red' : '';
   var actions = order.status === 'pending' || order.status === 'paid'
     ? '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>'
@@ -6266,7 +6518,7 @@ function renderOrders() {
 function renderUsers() {
   var users = state.data.users || [];
   document.getElementById('usersTable').innerHTML = users.map(function (u) {
-    var name = u.username ? '@' + u.username : (u.first_name || u.user_id);
+    var name = adminUserName(u);
     var status = u.is_banned ? chip('封禁', 'red') : u.is_active ? chip('啟用', 'green') : chip('停用', 'amber');
     return '<tr><td><div>' + esc(name) + '</div><div class="muted"><code>' + esc(u.user_id) + '</code></div></td><td>' + chip(u.tier, u.tier === 'vip' ? 'amber' : u.tier === 'pro' ? 'green' : '') + '</td><td>' + esc(u.tier_expires_at ? dateText(u.tier_expires_at) : '-') + '</td><td>' + money(u.total_spent || 0) + '</td><td>' + status + '</td><td class="actions"><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|pro">Pro+30</button><button class="btn ghost" data-user-tier="' + esc(u.user_id) + '|vip">VIP+30</button><button class="btn danger" data-user-ban="' + esc(u.user_id) + '|' + (u.is_banned ? '0' : '1') + '">' + (u.is_banned ? '解封' : '封禁') + '</button></td></tr>';
   }).join('') || '<tr><td colspan="6" class="muted">尚無會員</td></tr>';

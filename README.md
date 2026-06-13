@@ -16,7 +16,7 @@
 - **📝 執行記錄** - 記錄已執行/跳過的訊號
 - **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
 - **🌐 會員中心** - 會員可直接在網站查看訊號、歷史、訂閱設定與續費
-- **🔐 第三方登入** - 支援 Telegram 登入碼，並可選配 Google / LINE OAuth
+- **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊登入，並保留 Telegram 登入碼與 Google / LINE OAuth
 - **🔗 TradingView 綁定** - 多來源 webhook、策略自動選擇與點位推算
 
 ## 💎 會員等級
@@ -141,7 +141,7 @@ wrangler secret put ADMIN_WEB_PASSWORD
 
 ### 3b. 選配第三方登入
 
-會員中心預設可用 Telegram `/login` 一次性登入碼。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
+會員中心預設可用 Email + 密碼註冊登入，也可用 Telegram `/login` 一次性登入碼。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
 
 ```bash
 wrangler secret put GOOGLE_CLIENT_ID
@@ -231,6 +231,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `order_events` | 訂單狀態事件與客服追蹤紀錄 |
 | `member_login_codes` | 會員中心一次性登入碼 |
 | `member_oauth_identities` | Google / LINE 第三方登入身份 |
+| `member_password_accounts` | Email + 密碼網站會員帳號 |
 | `rate_limits` | 會員登入與訂單建立速率限制 |
 | `queued_signals` | 待發訊號 |
 

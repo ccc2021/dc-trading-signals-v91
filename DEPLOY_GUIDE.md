@@ -308,6 +308,15 @@ https://你的Worker網址/admin
 - 會員等級與到期日
 - 訂單確認與收費設定
 
+### 步驟 7.3b：測試會員中心
+
+開啟：
+```
+https://你的Worker網址/member
+```
+
+會員可直接用 Email + 密碼建立網站帳號並登入。登入後可線上查看訊號、維護訂閱品種、建立轉帳訂單；若已設定 Stripe secrets，會員也會看到線上付款按鈕。
+
 ### 步驟 7.4：綁定 TradingView
 
 後台會自動建立 `default-tv` 來源。進入 TradingView 分頁後複製：
