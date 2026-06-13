@@ -159,6 +159,35 @@ https://your-worker.workers.dev/auth/line/callback
 
 若有自訂網域，請設定 `PUBLIC_BASE_URL`，讓登入回呼與會員中心網址一致。
 
+### 3c. 選配 Stripe 線上付款
+
+會員中心會保留轉帳付款；設定 Stripe 後會額外顯示「線上付款」並透過 Checkout 自動確認訂單。
+
+```bash
+wrangler secret put STRIPE_SECRET_KEY
+wrangler secret put STRIPE_WEBHOOK_SECRET
+```
+
+可選環境變數：
+
+```text
+STRIPE_CURRENCY=twd
+PUBLIC_BASE_URL=https://your-worker.workers.dev
+```
+
+Stripe webhook endpoint：
+
+```text
+https://your-worker.workers.dev/webhook/stripe
+```
+
+建議訂閱事件：
+
+```text
+checkout.session.completed
+checkout.session.async_payment_succeeded
+```
+
 ### 4. 部署 Worker
 ```bash
 wrangler deploy

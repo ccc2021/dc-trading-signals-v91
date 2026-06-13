@@ -296,7 +296,12 @@ CREATE TABLE orders (
   amount REAL NOT NULL,
   status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'confirmed', 'rejected', 'cancelled')),
   payment_method TEXT,
+  payment_provider TEXT,
+  payment_session_id TEXT,
+  payment_url TEXT,
+  currency TEXT,
   payment_note TEXT,
+  paid_at TEXT,
   confirmed_by TEXT,
   confirmed_at TEXT,
   created_at TEXT DEFAULT (datetime('now')),
@@ -433,6 +438,8 @@ CREATE INDEX idx_tv_logs_created ON tv_alert_logs(created_at);
 
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_payment_provider ON orders(payment_provider);
+CREATE INDEX idx_orders_payment_session ON orders(payment_session_id);
 CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_at);
 CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
 CREATE INDEX idx_member_oauth_user ON member_oauth_identities(user_id);

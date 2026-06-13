@@ -2563,28 +2563,12 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     if (!order) return sendTg(cid, `❌ 找不到訂單 ${orderId}`);
     if (order.status === 'confirmed') return sendTg(cid, `❌ 訂單已確認`);
-    
-    const expires = new Date(Date.now() + order.days * 86400000).toISOString();
-    const user = await getUser(db, order.user_id);
-    
-    let newExpiry = expires;
-    if (user.tier === order.tier && user.tier_expires_at && new Date(user.tier_expires_at) > new Date()) {
-      newExpiry = new Date(new Date(user.tier_expires_at).getTime() + order.days * 86400000).toISOString();
-    }
-    
-    await updateUser(db, order.user_id, { tier: order.tier, tier_expires_at: newExpiry, total_spent: (user.total_spent || 0) + order.amount });
-    await db.prepare(`UPDATE orders SET status = 'confirmed', confirmed_by = ?, confirmed_at = datetime('now') WHERE order_id = ?`).bind(uid, orderId).run();
-    
-    // 推薦人獎勵
-    if (user.referred_by) {
-      const refPaidPoints = parseInt(await getConfig(db, 'referral_paid_points') || '100');
-      await addPoints(db, user.referred_by, refPaidPoints, '被推薦人付費');
-    }
-    
-    await logAction(db, uid, 'confirm_order', orderId, `${order.tier} ${order.days}d`);
-    
-    await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}\n\n請使用 /subscribe 設定訂閱品種`);
-    
+
+    await confirmOrderRecord(db, uid, order, {
+      paymentMethod: order.payment_method || 'manual',
+      paymentProvider: order.payment_provider || order.payment_method || 'manual',
+      action: 'confirm_order'
+    });
     return sendTg(cid, `✅ 訂單 ${orderId} 已確認\n用戶已升級為 ${tierName(order.tier)}`);
   }
   
@@ -3377,18 +3361,12 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
   if (!order) throw new Error('找不到訂單');
 
   if (action === 'confirm') {
-    if (order.status === 'confirmed') return { orderId: normalizedOrderId, status: 'confirmed' };
-    const expires = new Date(Date.now() + order.days * 86400000).toISOString();
-    const user = await getUser(db, order.user_id);
-    let newExpiry = expires;
-    if (user.tier === order.tier && user.tier_expires_at && new Date(user.tier_expires_at) > new Date()) {
-      newExpiry = new Date(new Date(user.tier_expires_at).getTime() + order.days * 86400000).toISOString();
-    }
-    await updateUser(db, order.user_id, { tier: order.tier, tier_expires_at: newExpiry, total_spent: (user.total_spent || 0) + order.amount });
-    await db.prepare("UPDATE orders SET status = 'confirmed', confirmed_by = ?, confirmed_at = datetime('now') WHERE order_id = ?").bind(adminId, normalizedOrderId).run();
-    if (payload.notify !== false) await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${normalizedOrderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
-    await logAction(db, adminId, 'web_order_confirm', normalizedOrderId, `${order.tier} ${order.days}d`);
-    return { orderId: normalizedOrderId, status: 'confirmed' };
+    return confirmOrderRecord(db, adminId, order, {
+      notify: payload.notify,
+      paymentMethod: order.payment_method || 'manual',
+      paymentProvider: order.payment_provider || order.payment_method || 'manual',
+      action: 'web_order_confirm'
+    });
   }
 
   if (action === 'reject') {
@@ -3456,6 +3434,16 @@ async function ensureMemberOAuthSchema(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_oauth_provider ON member_oauth_identities(provider, provider_user_id)').run();
 }
 
+async function ensureOrderPaymentSchema(db) {
+  await addColumnIfMissing(db, 'orders', 'payment_provider', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'payment_session_id', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'payment_url', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'currency', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'paid_at', 'TEXT');
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_session ON orders(payment_session_id)').run();
+}
+
 async function createMemberLoginCode(db, userId) {
   await ensureMemberLoginSchema(db);
   await db.prepare(`
@@ -3498,7 +3486,7 @@ async function loginMemberWithCode(db, env, payload) {
 
   await getUser(db, row.user_id);
   const session = await createMemberSession(row.user_id, env);
-  return { session, data: await getMemberBootstrap(db, row.user_id) };
+  return { session, data: await getMemberBootstrap(db, row.user_id, env) };
 }
 
 async function verifyTelegramLoginPayload(payload, env) {
@@ -3778,6 +3766,170 @@ async function handleOAuthCallback(request, env, providerId, url) {
   }
 }
 
+function stripeConfigured(env = {}) {
+  return Boolean(env.STRIPE_SECRET_KEY);
+}
+
+function stripeCurrency(env = {}) {
+  return String(env.STRIPE_CURRENCY || 'twd').trim().toLowerCase();
+}
+
+function stripeCheckoutBase(env = {}) {
+  return env.STRIPE_API_BASE || 'https://api.stripe.com/v1';
+}
+
+function stripeUnitAmount(amount, currency) {
+  const zeroDecimal = new Set(['bif', 'clp', 'djf', 'gnf', 'jpy', 'kmf', 'krw', 'mga', 'pyg', 'rwf', 'vnd', 'vuv', 'xaf', 'xof', 'xpf']);
+  const value = Number(amount || 0);
+  return zeroDecimal.has(String(currency || '').toLowerCase()) ? Math.round(value) : Math.round(value * 100);
+}
+
+function stripeEnabledPublic(env = {}) {
+  return stripeConfigured(env);
+}
+
+async function createStripeCheckoutSession(env, order, user = {}) {
+  if (!stripeConfigured(env)) throw new Error('Stripe 尚未設定');
+  const currency = stripeCurrency(env);
+  const baseUrl = publicBaseUrl(env);
+  const body = new URLSearchParams();
+  body.set('mode', 'payment');
+  body.set('client_reference_id', order.orderId);
+  body.set('success_url', `${baseUrl}/member?checkout=success&order=${encodeURIComponent(order.orderId)}`);
+  body.set('cancel_url', `${baseUrl}/member?checkout=cancel&order=${encodeURIComponent(order.orderId)}`);
+  body.set('allow_promotion_codes', 'true');
+  body.set('metadata[order_id]', order.orderId);
+  body.set('metadata[user_id]', String(order.userId));
+  body.set('metadata[tier]', order.tier);
+  body.set('metadata[months]', String(order.months));
+  body.set('line_items[0][quantity]', '1');
+  body.set('line_items[0][price_data][currency]', currency);
+  body.set('line_items[0][price_data][unit_amount]', String(stripeUnitAmount(order.amount, currency)));
+  body.set('line_items[0][price_data][product_data][name]', `DC Signals ${tierName(order.tier)} ${order.months} 個月`);
+  body.set('line_items[0][price_data][product_data][description]', `${order.days} 天會員方案`);
+  if (user.username && String(user.username).includes('@')) body.set('customer_email', String(user.username));
+
+  const res = await fetch(`${stripeCheckoutBase(env)}/checkout/sessions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Stripe-Version': '2026-02-25.clover'
+    },
+    body
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.id || !data.url) throw new Error(data.error?.message || 'Stripe Checkout 建立失敗');
+  return { sessionId: data.id, checkoutUrl: data.url, currency };
+}
+
+async function confirmOrderRecord(db, actorId, order, options = {}) {
+  if (!order) throw new Error('找不到訂單');
+  const orderId = String(order.order_id || order.orderId || '').toUpperCase();
+  if (!orderId) throw new Error('訂單缺少編號');
+  if (order.status === 'confirmed') return { orderId, status: 'confirmed' };
+
+  const expires = new Date(Date.now() + Number(order.days || 0) * 86400000).toISOString();
+  const user = await getUser(db, order.user_id);
+  let newExpiry = expires;
+  if (user.tier === order.tier && user.tier_expires_at && new Date(user.tier_expires_at) > new Date()) {
+    newExpiry = new Date(new Date(user.tier_expires_at).getTime() + Number(order.days || 0) * 86400000).toISOString();
+  }
+
+  await updateUser(db, order.user_id, {
+    tier: order.tier,
+    tier_expires_at: newExpiry,
+    total_spent: (user.total_spent || 0) + Number(order.amount || 0)
+  });
+
+  if (user.referred_by) {
+    const refPaidPoints = parseInt(await getConfig(db, 'referral_paid_points') || '100');
+    await addPoints(db, user.referred_by, refPaidPoints, '被推薦人付費');
+  }
+
+  await ensureOrderPaymentSchema(db);
+  await db.prepare(`
+    UPDATE orders
+    SET status = 'confirmed',
+        confirmed_by = ?,
+        confirmed_at = COALESCE(confirmed_at, datetime('now')),
+        paid_at = COALESCE(paid_at, datetime('now')),
+        payment_method = COALESCE(?, payment_method),
+        payment_provider = COALESCE(?, payment_provider),
+        payment_session_id = COALESCE(?, payment_session_id),
+        payment_note = COALESCE(?, payment_note)
+    WHERE order_id = ?
+  `).bind(
+    actorId,
+    options.paymentMethod || null,
+    options.paymentProvider || null,
+    options.paymentSessionId || null,
+    options.paymentNote || null,
+    orderId
+  ).run();
+
+  if (options.notify !== false) {
+    await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
+  }
+  await logAction(db, actorId, options.action || 'order_confirm', orderId, `${order.tier} ${order.days}d`);
+  return { orderId, status: 'confirmed', tier: order.tier, expiresAt: newExpiry };
+}
+
+function parseStripeSignature(header) {
+  const parts = {};
+  for (const item of String(header || '').split(',')) {
+    const [key, value] = item.split('=');
+    if (!key || !value) continue;
+    if (!parts[key]) parts[key] = [];
+    parts[key].push(value);
+  }
+  return parts;
+}
+
+async function verifyStripeWebhook(rawBody, signatureHeader, secret) {
+  if (!secret) throw new Error('STRIPE_WEBHOOK_SECRET 尚未設定');
+  const parsed = parseStripeSignature(signatureHeader);
+  const timestamp = Number(parsed.t?.[0] || 0);
+  const signatures = parsed.v1 || [];
+  if (!timestamp || !signatures.length) throw new Error('Stripe webhook signature 不完整');
+  if (Math.abs(Math.floor(Date.now() / 1000) - timestamp) > 300) throw new Error('Stripe webhook signature 已逾時');
+  const expected = await hmacHex(textBytes(secret), `${timestamp}.${rawBody}`);
+  if (!signatures.some((sig) => timingSafeEqual(sig, expected))) throw new Error('Stripe webhook signature 驗證失敗');
+}
+
+async function confirmStripeSessionOrder(db, session, eventType) {
+  await ensureOrderPaymentSchema(db);
+  const orderId = String(session?.metadata?.order_id || session?.client_reference_id || '').trim().toUpperCase();
+  if (!orderId) throw new Error('Stripe session 缺少 order_id');
+  const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(orderId).first();
+  if (!order) throw new Error(`找不到訂單 ${orderId}`);
+  if (session.payment_status && session.payment_status !== 'paid' && eventType !== 'checkout.session.async_payment_succeeded') {
+    return { orderId, status: order.status, skipped: true };
+  }
+  const paidNote = `Stripe ${eventType}\nSession：${session.id || '-'}\nPaymentIntent：${session.payment_intent || '-'}\nAmount：${session.amount_total || '-'} ${String(session.currency || order.currency || '').toUpperCase()}`;
+  return confirmOrderRecord(db, 'stripe:webhook', order, {
+    paymentMethod: 'stripe',
+    paymentProvider: 'stripe',
+    paymentSessionId: session.id || order.payment_session_id || null,
+    paymentNote: paidNote,
+    action: 'stripe_order_confirm'
+  });
+}
+
+async function handleStripeWebhook(request, env) {
+  try {
+    const rawBody = await request.text();
+    await verifyStripeWebhook(rawBody, request.headers.get('stripe-signature'), env.STRIPE_WEBHOOK_SECRET);
+    const event = JSON.parse(rawBody);
+    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+      return json({ ok: true, data: await confirmStripeSessionOrder(env.DB, event.data?.object || {}, event.type) });
+    }
+    return json({ ok: true, ignored: event.type || 'unknown' });
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 400);
+  }
+}
+
 function memberCanReceive(user) {
   if (!user || user.tier === 'free' || user.is_active === 0 || user.is_banned) return false;
   if (!user.tier_expires_at) return true;
@@ -3815,13 +3967,15 @@ async function getMemberPlans(db) {
   return plans;
 }
 
-async function getMemberPaymentInfo(db) {
+async function getMemberPaymentInfo(db, env = {}) {
   return {
     bank: await getConfig(db, 'payment_bank') || '',
     account: await getConfig(db, 'payment_account') || '',
     name: await getConfig(db, 'payment_name') || '',
     contactTelegram: await getConfig(db, 'contact_telegram') || '',
-    contactLine: await getConfig(db, 'contact_line') || ''
+    contactLine: await getConfig(db, 'contact_line') || '',
+    stripeEnabled: stripeEnabledPublic(env),
+    stripeCurrency: stripeCurrency(env).toUpperCase()
   };
 }
 
@@ -3852,7 +4006,8 @@ function signalDto(sig, tier = 'free') {
   };
 }
 
-async function getMemberBootstrap(db, userId) {
+async function getMemberBootstrap(db, userId, env = {}) {
+  await ensureOrderPaymentSchema(db);
   const user = await getUser(db, userId);
   const settings = await getUserSettings(db, userId);
   const symbols = (await db.prepare('SELECT * FROM symbols WHERE is_active = 1 ORDER BY sort_order, symbol').all()).results || [];
@@ -3876,7 +4031,7 @@ async function getMemberBootstrap(db, userId) {
   }
 
   const orders = (await db.prepare(`
-    SELECT order_id, tier, months, days, amount, status, payment_note, created_at, confirmed_at
+    SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency, paid_at, created_at, confirmed_at
     FROM orders WHERE user_id = ?
     ORDER BY created_at DESC LIMIT 10
   `).bind(userId).all()).results || [];
@@ -3914,17 +4069,21 @@ async function getMemberBootstrap(db, userId) {
     signals,
     orders,
     plans: await getMemberPlans(db),
-    payment: await getMemberPaymentInfo(db),
+    payment: await getMemberPaymentInfo(db, env),
     botUsername: CONFIG.BOT_USERNAME,
     serverTime: fmtTime()
   };
 }
 
 async function createMemberOrder(db, env, userId, payload) {
+  await ensureOrderPaymentSchema(db);
   const tier = String(payload.tier || '').trim().toLowerCase();
   const months = Number(payload.months || 0);
+  const paymentProvider = String(payload.payment_provider || payload.paymentProvider || payload.method || 'manual').trim().toLowerCase();
   if (!['pro', 'vip'].includes(tier)) throw new Error('方案不正確');
   if (![1, 3, 12].includes(months)) throw new Error('訂閱月份不正確');
+  if (!['manual', 'stripe'].includes(paymentProvider)) throw new Error('付款方式不正確');
+  if (paymentProvider === 'stripe' && !stripeConfigured(env)) throw new Error('線上付款尚未啟用，請改用轉帳付款');
 
   const plans = await getMemberPlans(db);
   const plan = plans[tier]?.months?.[months];
@@ -3939,17 +4098,49 @@ async function createMemberOrder(db, env, userId, payload) {
 
   const orderId = genOrderId();
   await db.prepare(`
-    INSERT INTO orders (order_id, user_id, tier, months, days, amount, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-  `).bind(orderId, userId, tier, months, plan.days, plan.amount).run();
+    INSERT INTO orders (order_id, user_id, tier, months, days, amount, payment_method, payment_provider, currency, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(orderId, userId, tier, months, plan.days, plan.amount, paymentProvider, paymentProvider, stripeCurrency(env).toUpperCase()).run();
 
   const user = await getUser(db, userId);
-  for (const adminId of CONFIG.ADMIN_IDS) {
-    await sendTg(adminId, `新會員中心訂單\n\n用戶：${user.username ? '@' + user.username : user.first_name || userId}\nID：<code>${escHtml(userId)}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${fmtNum(plan.amount)}`);
+  let checkout = null;
+  if (paymentProvider === 'stripe') {
+    try {
+      checkout = await createStripeCheckoutSession(env, {
+        orderId,
+        userId,
+        tier,
+        months,
+        days: plan.days,
+        amount: plan.amount
+      }, user);
+      await db.prepare(`
+        UPDATE orders
+        SET payment_session_id = ?, payment_url = ?, currency = ?
+        WHERE order_id = ?
+      `).bind(checkout.sessionId, checkout.checkoutUrl, checkout.currency.toUpperCase(), orderId).run();
+    } catch (e) {
+      await db.prepare("UPDATE orders SET status = 'cancelled', payment_note = ? WHERE order_id = ?").bind(`Stripe 建立失敗：${e.message}`, orderId).run();
+      throw e;
+    }
   }
 
-  await logAction(db, userId, 'member_order_create', orderId, `${tier} ${months}m`);
-  return { orderId, tier, months, days: plan.days, amount: plan.amount, status: 'pending' };
+  for (const adminId of CONFIG.ADMIN_IDS) {
+    await sendTg(adminId, `新會員中心訂單\n\n用戶：${user.username ? '@' + user.username : user.first_name || userId}\nID：<code>${escHtml(userId)}</code>\n訂單：<code>${orderId}</code>\n方案：${tierName(tier)} ${months}個月\n金額：NT$${fmtNum(plan.amount)}\n付款：${paymentProvider === 'stripe' ? 'Stripe Checkout' : '轉帳'}`);
+  }
+
+  await logAction(db, userId, 'member_order_create', orderId, `${tier} ${months}m ${paymentProvider}`);
+  return {
+    orderId,
+    tier,
+    months,
+    days: plan.days,
+    amount: plan.amount,
+    status: 'pending',
+    paymentProvider,
+    checkoutUrl: checkout?.checkoutUrl || '',
+    stripeSessionId: checkout?.sessionId || ''
+  };
 }
 
 function memberPaymentNote(payload = {}) {
@@ -3972,6 +4163,7 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
 
   if (action === 'paid') {
     if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法通知付款');
+    if ((order.payment_provider || order.payment_method) === 'stripe') throw new Error('線上付款訂單請完成 Stripe Checkout');
     const paymentNote = memberPaymentNote(payload);
     await db.prepare("UPDATE orders SET status = 'paid', payment_note = ? WHERE order_id = ?").bind(paymentNote, normalizedOrderId).run();
     for (const adminId of CONFIG.ADMIN_IDS) {
@@ -4034,7 +4226,7 @@ async function handleMemberApi(request, env, pathname) {
       await getUser(db, verified.userId);
       await saveUserInfo(db, verified.userId, verified.username, verified.firstName);
       const session = await createMemberSession(verified.userId, env);
-      return new Response(JSON.stringify({ ok: true, data: await getMemberBootstrap(db, verified.userId) }), {
+      return new Response(JSON.stringify({ ok: true, data: await getMemberBootstrap(db, verified.userId, env) }), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
@@ -4068,7 +4260,7 @@ async function handleMemberApi(request, env, pathname) {
     if (!session) return json({ ok: false, error: 'Unauthorized' }, 401);
 
     if (request.method === 'GET' && parts[0] === 'me') {
-      return json({ ok: true, data: await getMemberBootstrap(db, session.userId) });
+      return json({ ok: true, data: await getMemberBootstrap(db, session.userId, env) });
     }
 
     if (request.method === 'PUT' && parts[0] === 'settings') {
@@ -4139,6 +4331,7 @@ function renderMemberPage() {
     .plan-head strong { display:block; font-size:16px; }
     .plan-price { display:grid; gap:7px; }
     .plan-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; border:1px solid var(--line); border-radius:7px; padding:8px; background:#f8fafc; }
+    .plan-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
     .payment-box { border:1px solid rgba(8,167,179,.24); background:#f4fbfc; border-radius:8px; padding:12px; display:grid; gap:7px; }
     .order-card { border:1px solid var(--line); border-radius:8px; padding:11px; display:grid; gap:8px; }
     .order-actions { display:flex; gap:7px; flex-wrap:wrap; }
@@ -4182,7 +4375,7 @@ function renderMemberPage() {
     .hidden { display:none !important; }
     .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
     .toast:empty { display:none; }
-    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid, .proof-grid, .signal-toolbar, .date-range { grid-template-columns:1fr; } .hero h2 { font-size:23px; } .panel header { align-items:flex-start; flex-direction:column; } .tabs, .signal-actions { width:100%; } .tabs button, .signal-actions .btn { flex:1; } }
+    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid, .proof-grid, .signal-toolbar, .date-range, .plan-row { grid-template-columns:1fr; } .hero h2 { font-size:23px; } .panel header { align-items:flex-start; flex-direction:column; } .tabs, .signal-actions, .plan-actions { width:100%; } .tabs button, .signal-actions .btn, .plan-actions .btn { flex:1; } }
   </style>
 </head>
 <body>
@@ -4232,6 +4425,7 @@ function renderMemberPage() {
   <script>
 var state = null;
 var memberSignalFilter = 'all';
+var checkoutNoticeShown = false;
 var loginView = document.getElementById('loginView');
 var appView = document.getElementById('appView');
 var toast = document.getElementById('toast');
@@ -4245,6 +4439,16 @@ function dateText(value){ if(!value) return '-'; var text=String(value); var d=n
 function chip(text,tone){ return '<span class="chip '+(tone||'')+'">'+esc(text)+'</span>'; }
 function showToast(text,tone){ toast.textContent=text||''; toast.style.color=tone==='error'?'#d1433f':'#667085'; if(text) setTimeout(function(){ if(toast.textContent===text) toast.textContent=''; },3600); }
 async function api(path, options){ var res=await fetch(path,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},options||{})); var data=await res.json().catch(function(){return{};}); if(!res.ok||!data.ok) throw new Error(data.error||('HTTP '+res.status)); return data.data; }
+function showCheckoutReturnToast(){
+  if(checkoutNoticeShown) return;
+  var params = new URLSearchParams(location.search);
+  var status = params.get('checkout');
+  if(!status) return;
+  checkoutNoticeShown = true;
+  if(status === 'success') showToast('付款完成，系統正在確認訂單');
+  if(status === 'cancel') showToast('付款未完成，可在訂單紀錄繼續付款','error');
+  history.replaceState(null, '', location.pathname);
+}
 async function loadOAuthProviders(){
   if(!oauthLogin) return;
   try{
@@ -4341,6 +4545,7 @@ function renderSettings(){
 }
 function renderPlans(){
   var plans = state.plans || {};
+  var stripeEnabled = !!(state.payment && state.payment.stripeEnabled);
   var tiers = ['pro','vip'];
   document.getElementById('plans').innerHTML = tiers.map(function(tier){
     var plan = plans[tier];
@@ -4348,13 +4553,15 @@ function renderPlans(){
     var rows = [1,3,12].map(function(months){
       var item = plan.months[String(months)] || plan.months[months];
       if(!item) return '';
-      return '<div class="plan-row"><div><b>'+esc(months)+' 個月</b><div class="muted">'+esc(item.days)+' 天</div></div><button class="btn primary" data-buy-tier="'+esc(tier)+'" data-buy-months="'+esc(months)+'">'+money(item.amount)+'</button></div>';
+      var online = stripeEnabled ? '<button class="btn primary" data-buy-tier="'+esc(tier)+'" data-buy-months="'+esc(months)+'" data-buy-method="stripe">線上付款 '+money(item.amount)+'</button>' : '';
+      return '<div class="plan-row"><div><b>'+esc(months)+' 個月</b><div class="muted">'+esc(item.days)+' 天 · '+money(item.amount)+'</div></div><div class="plan-actions">'+online+'<button class="btn ghost" data-buy-tier="'+esc(tier)+'" data-buy-months="'+esc(months)+'" data-buy-method="manual">轉帳訂單</button></div></div>';
     }).join('');
     return '<article class="plan '+(tier==='vip'?'vip':'')+'"><div class="plan-head"><div><strong>'+esc(plan.name)+'</strong><p class="muted">'+(tier==='vip'?'含完整 TP3 與 VIP 訊號':'基礎付費訊號與 TP1/TP2')+'</p></div>'+chip(tier.toUpperCase(), tier==='vip'?'amber':'green')+'</div><div class="plan-price">'+rows+'</div></article>';
   }).join('');
   var pay = state.payment || {};
   document.getElementById('paymentBox').innerHTML =
     '<b>付款資訊</b>' +
+    '<div>線上付款　' + (pay.stripeEnabled ? '<b>已啟用 ' + esc(pay.stripeCurrency || '') + '</b>' : '<span class="muted">尚未啟用</span>') + '</div>' +
     '<div>銀行　'+esc(pay.bank || '-')+'</div>' +
     '<div>帳號　<code>'+esc(pay.account || '-')+'</code></div>' +
     '<div>戶名　'+esc(pay.name || '-')+'</div>' +
@@ -4370,7 +4577,10 @@ function paymentNoteHtml(note){
 }
 function renderOrder(o){
   var actions = '';
-  if(o.status === 'pending') actions =
+  var method = o.payment_provider || o.payment_method || 'manual';
+  if(o.status === 'pending' && method === 'stripe') actions =
+    '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+  if(o.status === 'pending' && method !== 'stripe') actions =
     '<div class="proof-grid">'+
       '<div><label>付款人</label><input data-proof="payer_name" placeholder="轉帳戶名"></div>'+
       '<div><label>帳號後五碼</label><input data-proof="transfer_last5" inputmode="numeric" placeholder="例如 12345"></div>'+
@@ -4381,7 +4591,7 @@ function renderOrder(o){
   if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
   return '<article class="order-card">'+
     '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
-    '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+dateText(o.created_at)+'</div>'+
+    '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+esc(method === 'stripe' ? '線上付款' : '轉帳')+' · '+dateText(o.created_at)+'</div>'+
     paymentNoteHtml(o.payment_note)+
     actions+
   '</article>';
@@ -4404,6 +4614,7 @@ function render(){
   document.getElementById('orders').innerHTML = (state.orders||[]).map(renderOrder).join('') || '<div class="muted">尚無訂單。</div>';
   renderPlans();
   renderSettings();
+  showCheckoutReturnToast();
 }
 document.getElementById('saveBtn').addEventListener('click', async function(){
   try{
@@ -4436,7 +4647,11 @@ document.body.addEventListener('click', async function(event){
   try{
     var buy = event.target.closest('[data-buy-tier]');
     if(buy){
-      await api('/api/member/orders',{method:'POST',body:JSON.stringify({tier:buy.dataset.buyTier,months:Number(buy.dataset.buyMonths)})});
+      var order = await api('/api/member/orders',{method:'POST',body:JSON.stringify({tier:buy.dataset.buyTier,months:Number(buy.dataset.buyMonths),payment_provider:buy.dataset.buyMethod || 'manual'})});
+      if(order.checkoutUrl){
+        location.href = order.checkoutUrl;
+        return;
+      }
       showToast('訂單已建立，請依付款資訊轉帳');
       await load();
       return;
@@ -5668,7 +5883,10 @@ function orderRow(order, compact) {
   var actions = order.status === 'pending' || order.status === 'paid'
     ? '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>'
     : '';
-  var note = order.payment_note ? esc(order.payment_note).replace(/\\n/g, '<br>') : '<span class="muted">-</span>';
+  var method = order.payment_provider || order.payment_method || 'manual';
+  var session = order.payment_session_id ? '<div class="muted"><code>' + esc(order.payment_session_id) + '</code></div>' : '';
+  var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
+  if (!note) note = '<span class="muted">-</span>';
   if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code><div class="note-cell">' + note + '</div></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
   return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
 }
@@ -6292,6 +6510,10 @@ export default {
 
     if (url.pathname.startsWith('/api/member/')) {
       return handleMemberApi(request, env, url.pathname);
+    }
+
+    if (url.pathname === '/webhook/stripe' && request.method === 'POST') {
+      return handleStripeWebhook(request, env);
     }
 
     const tvMatch = url.pathname.match(/^\/(?:tv|tradingview|webhook\/tradingview)\/([A-Za-z0-9-]+)$/);
