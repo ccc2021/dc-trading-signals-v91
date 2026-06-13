@@ -307,6 +307,7 @@ https://你的Worker網址/admin
 - TradingView webhook 來源
 - 會員等級與到期日
 - 訂單確認、拒絕、退款紀錄與收費設定
+- 淨營收、退款率、ARPU、LTV、流失率與 7 日內到期會員
 
 ### 步驟 7.3b：測試會員中心
 
@@ -412,6 +413,10 @@ wrangler tail
 /users                              # 用戶列表
 /orders                             # 待處理訂單
 /refund ORDxxxx 299 退款原因         # 記錄人工退款
+/revenue                            # 財務營收總覽
+/arpu                               # ARPU / 平均客單
+/churn                              # 流失與到期追蹤
+/lifetime                           # LTV / 付費客戶價值
 ```
 
 **用戶指令速查：**

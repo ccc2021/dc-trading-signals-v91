@@ -2826,6 +2826,11 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     });
     return sendTg(cid, `✅ 已記錄退款 ${orderId}\n金額：${orderRefundMoney({ ...order, refund_amount: result.refundAmount })}\n${escHtml(result.note || '')}`);
   }
+
+  if (cmd === '/revenue' || cmd === '/arpu' || cmd === '/churn' || cmd === '/lifetime') {
+    const metrics = await getFinanceMetrics(db);
+    return sendTg(cid, renderFinanceReportText(metrics, cmd.slice(1)));
+  }
   
   // ═══════════════════════════════════════════════════════════════════════════
   // 績效統計
@@ -2911,6 +2916,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     m += `<b>管理</b>\n`;
     m += `/users /user /pro /vip /adddays\n`;
     m += `/orders /confirm /reject /refund\n`;
+    m += `/revenue /arpu /churn /lifetime\n`;
     m += `/dash /ops /perf /config`;
     
     return sendTg(cid, m);
@@ -3416,6 +3422,171 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
   };
 }
 
+async function getFinanceMetrics(db) {
+  await ensureOrderPaymentSchema(db);
+  const [
+    lifetime,
+    gross30,
+    refunds30,
+    gross7,
+    refunds7,
+    grossToday,
+    refundsToday,
+    tierRows,
+    dailyRows,
+    activePaid,
+    expiring7,
+    expired30,
+    pendingValue
+  ] = await Promise.all([
+    db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN confirmed_at IS NOT NULL THEN amount ELSE 0 END), 0) AS gross_revenue,
+        COALESCE(SUM(CASE WHEN refunded_at IS NOT NULL THEN COALESCE(refund_amount, amount) ELSE 0 END), 0) AS refunds,
+        SUM(CASE WHEN confirmed_at IS NOT NULL THEN 1 ELSE 0 END) AS confirmed_orders,
+        SUM(CASE WHEN refunded_at IS NOT NULL THEN 1 ELSE 0 END) AS refunded_orders,
+        COUNT(DISTINCT CASE WHEN confirmed_at IS NOT NULL THEN user_id END) AS paying_customers
+      FROM orders
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE confirmed_at IS NOT NULL AND datetime(confirmed_at) >= datetime('now', '-30 days')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(COALESCE(refund_amount, amount)), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE refunded_at IS NOT NULL AND datetime(refunded_at) >= datetime('now', '-30 days')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE confirmed_at IS NOT NULL AND datetime(confirmed_at) >= datetime('now', '-7 days')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(COALESCE(refund_amount, amount)), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE refunded_at IS NOT NULL AND datetime(refunded_at) >= datetime('now', '-7 days')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE confirmed_at IS NOT NULL AND DATE(confirmed_at) = DATE('now')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(COALESCE(refund_amount, amount)), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE refunded_at IS NOT NULL AND DATE(refunded_at) = DATE('now')
+    `).first(),
+    db.prepare(`
+      SELECT tier,
+             COUNT(*) AS orders,
+             COALESCE(SUM(amount), 0) AS gross,
+             COALESCE(SUM(CASE WHEN refunded_at IS NOT NULL THEN COALESCE(refund_amount, amount) ELSE 0 END), 0) AS refunds
+      FROM orders
+      WHERE confirmed_at IS NOT NULL
+      GROUP BY tier
+      ORDER BY tier
+    `).all(),
+    db.prepare(`
+      SELECT day, COALESCE(SUM(gross), 0) AS gross, COALESCE(SUM(refunds), 0) AS refunds
+      FROM (
+        SELECT DATE(confirmed_at) AS day, amount AS gross, 0 AS refunds
+        FROM orders
+        WHERE confirmed_at IS NOT NULL AND DATE(confirmed_at) >= DATE('now', '-13 days')
+        UNION ALL
+        SELECT DATE(refunded_at) AS day, 0 AS gross, COALESCE(refund_amount, amount) AS refunds
+        FROM orders
+        WHERE refunded_at IS NOT NULL AND DATE(refunded_at) >= DATE('now', '-13 days')
+      )
+      GROUP BY day
+      ORDER BY day
+    `).all(),
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM users
+      WHERE tier IN ('pro','vip')
+        AND is_active = 1
+        AND is_banned = 0
+        AND tier_expires_at IS NOT NULL
+        AND datetime(tier_expires_at) > datetime('now')
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM users
+      WHERE tier IN ('pro','vip')
+        AND is_active = 1
+        AND is_banned = 0
+        AND tier_expires_at IS NOT NULL
+        AND datetime(tier_expires_at) > datetime('now')
+        AND datetime(tier_expires_at) <= datetime('now', '+7 days')
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM users
+      WHERE total_spent > 0
+        AND (tier = 'free' OR tier_expires_at IS NULL OR datetime(tier_expires_at) <= datetime('now'))
+        AND datetime(updated_at) >= datetime('now', '-30 days')
+    `).first(),
+    db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS orders
+      FROM orders
+      WHERE status IN ('pending','paid')
+    `).first()
+  ]);
+
+  const grossRevenue = Number(lifetime?.gross_revenue || 0);
+  const refunds = Number(lifetime?.refunds || 0);
+  const netRevenue = Math.max(0, grossRevenue - refunds);
+  const netRevenue30 = Math.max(0, Number(gross30?.amount || 0) - Number(refunds30?.amount || 0));
+  const netRevenue7 = Math.max(0, Number(gross7?.amount || 0) - Number(refunds7?.amount || 0));
+  const netRevenueToday = Math.max(0, Number(grossToday?.amount || 0) - Number(refundsToday?.amount || 0));
+  const confirmedOrders = Number(lifetime?.confirmed_orders || 0);
+  const payingCustomers = Number(lifetime?.paying_customers || 0);
+  const activePaidUsers = Number(activePaid?.c || 0);
+  const expiredPaidUsers30 = Number(expired30?.c || 0);
+  const churnBase = activePaidUsers + expiredPaidUsers30;
+  const tierRevenue = (tierRows.results || []).map((row) => ({
+    tier: row.tier || 'unknown',
+    orders: Number(row.orders || 0),
+    gross: Number(row.gross || 0),
+    refunds: Number(row.refunds || 0),
+    net: Math.max(0, Number(row.gross || 0) - Number(row.refunds || 0))
+  }));
+  const dailyRevenue = (dailyRows.results || []).map((row) => ({
+    day: row.day,
+    gross: Number(row.gross || 0),
+    refunds: Number(row.refunds || 0),
+    net: Math.max(0, Number(row.gross || 0) - Number(row.refunds || 0))
+  }));
+
+  return {
+    grossRevenue,
+    refunds,
+    netRevenue,
+    grossRevenue30: Number(gross30?.amount || 0),
+    refunds30: Number(refunds30?.amount || 0),
+    netRevenue30,
+    netRevenue7,
+    netRevenueToday,
+    confirmedOrders,
+    refundedOrders: Number(lifetime?.refunded_orders || 0),
+    payingCustomers,
+    activePaidUsers,
+    expiringPaidUsers7: Number(expiring7?.c || 0),
+    expiredPaidUsers30,
+    pendingOrderValue: Number(pendingValue?.amount || 0),
+    pendingOrderCount: Number(pendingValue?.orders || 0),
+    avgOrderValue: confirmedOrders ? netRevenue / confirmedOrders : 0,
+    arpu30: activePaidUsers ? netRevenue30 / activePaidUsers : 0,
+    ltv: payingCustomers ? netRevenue / payingCustomers : 0,
+    refundRate: grossRevenue ? (refunds / grossRevenue) * 100 : 0,
+    churnRate30: churnBase ? (expiredPaidUsers30 / churnBase) * 100 : 0,
+    tierRevenue,
+    dailyRevenue
+  };
+}
+
 async function getAdminBootstrap(db, env = {}) {
   const startedAt = Date.now();
   await ensureAdminSchema(db);
@@ -3423,7 +3594,7 @@ async function getAdminBootstrap(db, env = {}) {
 
   const [
     totalUsers, proUsers, vipUsers, todaySignals, activeSignals, pendingOrders,
-    todayPerf, configRows, symbols, strategies, signals, orders, orderEvents, users, tvSources, tvLogs
+    todayPerf, configRows, symbols, strategies, signals, orders, orderEvents, users, tvSources, tvLogs, finance
   ] = await Promise.all([
     db.prepare('SELECT COUNT(*) as c FROM users').first(),
     db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro' AND is_active = 1").first(),
@@ -3459,7 +3630,8 @@ async function getAdminBootstrap(db, env = {}) {
       FROM users ORDER BY created_at DESC LIMIT 50
     `).all(),
     db.prepare('SELECT * FROM tradingview_sources ORDER BY created_at DESC').all(),
-    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 30').all()
+    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 30').all(),
+    getFinanceMetrics(db)
   ]);
 
   const config = {};
@@ -3492,6 +3664,7 @@ async function getAdminBootstrap(db, env = {}) {
     tvLogs: tvLogs.results || [],
     integrations: ops.integrations,
     ops,
+    finance,
     serverTime: fmtTime()
   };
 }
@@ -3799,6 +3972,44 @@ async function refundOrderRecord(db, actorId, order, payload = {}) {
 
   await logAction(db, actorId, payload.action || 'order_refund', orderId, `${refundAmount} ${reason}`);
   return { orderId, status: 'refunded', refundAmount, accessRevoked, note: revokeNote };
+}
+
+function financeMoney(value) {
+  return `NT$${fmtNum(Math.round(Number(value || 0)))}`;
+}
+
+function financePercent(value) {
+  return `${Number(value || 0).toFixed(1)}%`;
+}
+
+function renderFinanceReportText(metrics, mode = 'revenue') {
+  const titleMap = {
+    revenue: '財務營收',
+    arpu: 'ARPU / 客單',
+    churn: '會員流失',
+    lifetime: 'LTV / 生命週期價值'
+  };
+  const title = titleMap[mode] || titleMap.revenue;
+  let m = `<b>${title}</b>\n\n`;
+  m += `淨營收：<b>${financeMoney(metrics.netRevenue)}</b>\n`;
+  m += `總收款：${financeMoney(metrics.grossRevenue)}\n`;
+  m += `退款：${financeMoney(metrics.refunds)}（${financePercent(metrics.refundRate)}）\n\n`;
+  m += `<b>近期</b>\n`;
+  m += `今日淨收：${financeMoney(metrics.netRevenueToday)}\n`;
+  m += `7 日淨收：${financeMoney(metrics.netRevenue7)}\n`;
+  m += `30 日淨收：${financeMoney(metrics.netRevenue30)}\n`;
+  m += `待處理訂單：${metrics.pendingOrderCount} 筆 / ${financeMoney(metrics.pendingOrderValue)}\n\n`;
+  m += `<b>會員價值</b>\n`;
+  m += `付費會員：${metrics.activePaidUsers} 位\n`;
+  m += `付費客戶：${metrics.payingCustomers} 位\n`;
+  m += `ARPU 30D：${financeMoney(metrics.arpu30)}\n`;
+  m += `平均客單：${financeMoney(metrics.avgOrderValue)}\n`;
+  m += `LTV：${financeMoney(metrics.ltv)}\n\n`;
+  m += `<b>流失</b>\n`;
+  m += `7 日內到期：${metrics.expiringPaidUsers7} 位\n`;
+  m += `30 日流失/到期：${metrics.expiredPaidUsers30} 位\n`;
+  m += `30 日流失率：${financePercent(metrics.churnRate30)}`;
+  return m;
 }
 
 async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}) {
@@ -6971,6 +7182,7 @@ function renderSymbolFormHtml() {
 function renderConfigFormHtml() {
   return `<div class="stack">
   <div class="card-grid two" id="billingReadiness"></div>
+  <div id="financeDashboard"></div>
   <form id="configForm" class="stack">
     <div class="form-grid">
       <div><label>Pro 月費</label><input name="pro_price_1m"></div>
@@ -7052,6 +7264,7 @@ function renderAll() {
   renderConfigSummary();
   renderConfigForm();
   renderBillingReadiness();
+  renderFinanceDashboard();
   renderSignals();
   renderOrders();
   renderUsers();
@@ -7118,14 +7331,13 @@ function renderOpsHealth() {
 function renderKpis() {
   var s = state.data.stats;
   var ops = state.data.ops || {};
-  var users = state.data.users || [];
-  var revenue = users.reduce(function (sum, u) { return sum + Number(u.total_spent || 0); }, 0);
+  var finance = state.data.finance || {};
   var sentToday = (state.data.signals || []).filter(function (sig) { return sig.status === 'active' || sig.status === 'closed'; }).length;
   var items = [
     ['↗', '今日訊號', s.todaySignals, '草稿/發送合計'],
     ['✓', '已發送', sentToday, '目前載入視窗'],
     ['◎', '會員總數', s.totalUsers, 'Pro ' + s.proUsers + ' / VIP ' + s.vipUsers],
-    ['$', '營收累計', money(revenue), '可見會員統計'],
+    ['$', '淨營收', money(finance.netRevenue || 0), '30D ' + money(finance.netRevenue30 || 0)],
     ['%', '勝率', s.winRate + '%', '今日績效'],
     ['⚡', '系統延遲', (ops.bootstrapMs || '-') + 'ms', ops.statusText || (s.paused ? '發訊暫停' : 'API 正常')]
   ];
@@ -7402,20 +7614,62 @@ function tvSourceCard(source, compact) {
   '</div>';
 }
 function renderRevenueSummary() {
-  var users = state.data.users || [];
-  var pro = users.filter(function (u) { return u.tier === 'pro'; }).length;
-  var vip = users.filter(function (u) { return u.tier === 'vip'; }).length;
-  var free = users.filter(function (u) { return u.tier === 'free'; }).length;
-  var total = Math.max(1, users.length);
-  var spent = users.reduce(function (sum, u) { return sum + Number(u.total_spent || 0); }, 0);
+  var finance = state.data.finance || {};
+  var tiers = finance.tierRevenue || [];
+  var tierTotal = Math.max(1, tiers.reduce(function (sum, row) { return sum + Number(row.net || 0); }, 0));
   document.getElementById('revenueSummary').innerHTML = '<div class="revenue-stack">' +
-    '<div class="revenue-total"><div><span class="muted">可見會員累計消費</span><strong>' + money(spent) + '</strong></div>' + chip('訂單 ' + state.data.stats.pendingOrders, state.data.stats.pendingOrders ? 'amber' : 'green') + '</div>' +
-    mixRow('VIP', vip, total) + mixRow('Pro', pro, total) + mixRow('Free', free, total) +
+    '<div class="revenue-total"><div><span class="muted">訂單淨營收</span><strong>' + money(finance.netRevenue || 0) + '</strong><div class="muted">總收 ' + money(finance.grossRevenue || 0) + ' · 退款 ' + money(finance.refunds || 0) + '</div></div>' + chip('30D ' + money(finance.netRevenue30 || 0), finance.netRevenue30 ? 'green' : '') + '</div>' +
+    '<div class="mini-stats">' +
+      '<div><span>ARPU 30D</span><strong>' + money(finance.arpu30 || 0) + '</strong></div>' +
+      '<div><span>LTV</span><strong>' + money(finance.ltv || 0) + '</strong></div>' +
+      '<div><span>流失率</span><strong>' + pctText(finance.churnRate30) + '</strong></div>' +
+    '</div>' +
+    (tiers.map(function (row) { return mixRow(String(row.tier || '-').toUpperCase(), Number(row.net || 0), tierTotal, money(row.net || 0)); }).join('') || '<div class="muted">尚無已確認收入。</div>') +
   '</div>';
 }
-function mixRow(label, value, total) {
+function pctText(value) {
+  return Number(value || 0).toFixed(1) + '%';
+}
+function mixRow(label, value, total, display) {
   var pct = Math.round((value / total) * 100);
-  return '<div class="mix-row"><span>' + esc(label) + '</span><div class="bar"><i style="width:' + pct + '%"></i></div><strong>' + esc(value) + ' (' + pct + '%)</strong></div>';
+  return '<div class="mix-row"><span>' + esc(label) + '</span><div class="bar"><i style="width:' + pct + '%"></i></div><strong>' + esc(display || value) + ' (' + pct + '%)</strong></div>';
+}
+function financeMetricCard(label, value, detail, tone) {
+  return '<article class="revenue-card">' +
+    '<span class="muted">' + esc(label) + '</span>' +
+    '<strong style="display:block;margin-top:6px;font-size:22px">' + esc(value) + '</strong>' +
+    (detail ? '<small class="muted" style="display:block;margin-top:6px">' + detail + '</small>' : '') +
+    (tone ? '<div style="margin-top:8px">' + chip(tone.text, tone.tone) + '</div>' : '') +
+  '</article>';
+}
+function renderFinanceDashboard() {
+  var box = document.getElementById('financeDashboard');
+  if (!box) return;
+  var finance = state.data.finance || {};
+  var maxDaily = Math.max(1, (finance.dailyRevenue || []).reduce(function (max, row) { return Math.max(max, Number(row.net || 0)); }, 0));
+  var daily = (finance.dailyRevenue || []).map(function (row) {
+    var width = Math.max(3, Math.round((Number(row.net || 0) / maxDaily) * 100));
+    return '<div class="mix-row"><span>' + esc(String(row.day || '').slice(5) || '-') + '</span><div class="bar"><i style="width:' + width + '%"></i></div><strong>' + money(row.net || 0) + '</strong></div>';
+  }).join('') || '<div class="muted">近 14 日尚無確認收入。</div>';
+  var tiers = (finance.tierRevenue || []).map(function (row) {
+    return '<div class="source-meta"><div><span>方案</span>' + esc(String(row.tier || '-').toUpperCase()) + '</div><div><span>淨收入</span>' + money(row.net || 0) + '</div><div><span>訂單</span>' + esc(row.orders || 0) + '</div><div><span>退款</span>' + money(row.refunds || 0) + '</div></div>';
+  }).join('') || '<div class="muted">尚無方案收入。</div>';
+  box.innerHTML =
+    '<section class="panel"><header><div><h2>財務營運指標</h2><p>以已確認訂單為收入來源，退款會扣回淨營收</p></div>' + chip('退款率 ' + pctText(finance.refundRate), finance.refundRate > 10 ? 'amber' : 'green') + '</header>' +
+    '<div class="body stack">' +
+      '<div class="card-grid two">' +
+        financeMetricCard('淨營收', money(finance.netRevenue || 0), '總收 ' + money(finance.grossRevenue || 0) + ' · 退款 ' + money(finance.refunds || 0)) +
+        financeMetricCard('30 日淨收', money(finance.netRevenue30 || 0), '7 日 ' + money(finance.netRevenue7 || 0) + ' · 今日 ' + money(finance.netRevenueToday || 0)) +
+        financeMetricCard('ARPU 30D', money(finance.arpu30 || 0), '目前付費會員 ' + esc(finance.activePaidUsers || 0) + ' 位') +
+        financeMetricCard('LTV', money(finance.ltv || 0), '付費客戶 ' + esc(finance.payingCustomers || 0) + ' 位 · 平均客單 ' + money(finance.avgOrderValue || 0)) +
+        financeMetricCard('流失/到期 30D', pctText(finance.churnRate30), '流失 ' + esc(finance.expiredPaidUsers30 || 0) + ' 位 · 7 日內到期 ' + esc(finance.expiringPaidUsers7 || 0) + ' 位', { text: finance.expiringPaidUsers7 ? '需續費跟進' : '穩定', tone: finance.expiringPaidUsers7 ? 'amber' : 'green' }) +
+        financeMetricCard('待處理訂單', money(finance.pendingOrderValue || 0), esc(finance.pendingOrderCount || 0) + ' 筆 pending/paid', { text: finance.pendingOrderCount ? '待處理' : '清空', tone: finance.pendingOrderCount ? 'amber' : 'green' }) +
+      '</div>' +
+      '<div class="grid two">' +
+        '<article class="revenue-card"><strong>近 14 日淨收入</strong><div class="revenue-stack" style="margin-top:10px">' + daily + '</div></article>' +
+        '<article class="revenue-card"><strong>方案收入拆分</strong><div class="revenue-stack" style="margin-top:10px">' + tiers + '</div></article>' +
+      '</div>' +
+    '</div></section>';
 }
 function renderOverviewTvLogs() {
   document.getElementById('overviewTvLogs').innerHTML = (state.data.tvLogs || []).slice(0, 6).map(function (log) {
