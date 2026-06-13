@@ -2837,11 +2837,17 @@ async function createAdminSignal(db, adminId, payload) {
   if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
   if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
   if (entry === null || stopLoss === null || tp1 === null) throw new Error('進場、止損、TP1 為必填數字');
+  if (action === 'LONG' && stopLoss >= entry) throw new Error('做多訊號的止損必須低於進場');
+  if (action === 'SHORT' && stopLoss <= entry) throw new Error('做空訊號的止損必須高於進場');
+  const targets = [tp1, tp2, tp3].filter((value) => value !== null);
+  if (action === 'LONG' && targets.some((value) => value <= entry)) throw new Error('做多訊號的目標價必須高於進場');
+  if (action === 'SHORT' && targets.some((value) => value >= entry)) throw new Error('做空訊號的目標價必須低於進場');
   const symbol = await db.prepare('SELECT symbol FROM symbols WHERE symbol = ? AND is_active = 1').bind(ticker).first();
   if (!symbol) throw new Error(`${ticker} 尚未啟用，請先到品種管理新增或啟用`);
 
   const sendNow = payload.send !== false;
   const targetGroup = String(payload.target_group || payload.targetGroup || (payload.is_vip_only ? 'vip' : 'all')).trim().toLowerCase() || 'all';
+  if (!['all', 'pro', 'vip', 'paid'].includes(targetGroup)) throw new Error('發送目標不正確');
   const isVipOnly = payload.is_vip_only === true || payload.isVipOnly === true || targetGroup === 'vip';
   const chartUrl = cleanUrl(payload.chart_url || payload.chartUrl || payload.chart);
   const snapshotUrl = cleanUrl(payload.snapshot_url || payload.snapshotUrl || payload.image_url || payload.imageUrl || payload.screenshot_url || payload.screenshotUrl);
@@ -2888,11 +2894,13 @@ async function createAdminSignal(db, adminId, payload) {
 async function closeAdminSignal(db, adminId, signalUid, payload) {
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal) throw new Error('找不到訊號');
+  if (signal.status !== 'active') throw new Error('只有已發送且進行中的訊號可以結案');
 
   const price = asNumber(payload.price);
   if (price === null) throw new Error('請輸入結案價格');
 
   const type = String(payload.type || 'CLOSE').toUpperCase();
+  if (!['CLOSE', 'TP1', 'TP2', 'TP3', 'SL'].includes(type)) throw new Error('結案類型不正確');
   const reason = String(payload.reason || (type === 'SL' ? '止損觸發' : '手動平倉')).trim();
   const pnl = signal.action === 'LONG' ? price - signal.entry_price : signal.entry_price - price;
   const result = type === 'SL' ? 'loss' : pnl > 0.5 ? 'win' : pnl < -0.5 ? 'loss' : 'breakeven';
@@ -3518,6 +3526,9 @@ async function handleAdminApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'cancel') {
+      const signal = await db.prepare('SELECT status FROM signals WHERE signal_uid = ?').bind(parts[1]).first();
+      if (!signal) throw new Error('找不到訊號');
+      if (signal.status !== 'pending') throw new Error('只有草稿訊號可以取消');
       await db.prepare("UPDATE signals SET status = 'cancelled', closed_at = datetime('now') WHERE signal_uid = ?").bind(parts[1]).run();
       await logAction(db, adminId, 'web_signal_cancel', parts[1], '');
       return json({ ok: true });
@@ -3664,13 +3675,18 @@ function renderAdminPage() {
     .chip.amber { background:#fff7e6; color: var(--amber); }
     .muted { color: var(--muted); }
     .stack { display:grid; gap: 10px; }
-    .message { min-height: 24px; font-size: 13px; color: var(--muted); }
-    .message.error { color: var(--red); }
-    .message.ok { color: var(--green); }
+    .message { position: fixed; right: 18px; bottom: 18px; z-index: 60; max-width: min(420px, calc(100vw - 36px)); min-height: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: rgba(255,255,255,.96); box-shadow: var(--shadow); font-size: 13px; color: var(--muted); }
+    .message:empty { display: none; }
+    .message.error { color: var(--red); border-color: rgba(209,67,63,.22); background: #fffafa; }
+    .message.ok { color: var(--green); border-color: rgba(22,132,90,.22); background: #f6fffb; }
     .copybox { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; min-height: 122px; }
     .readonly { background: #f8fafc; }
     .preview { border:1px solid var(--line); border-radius:6px; padding:10px; background:#f8fafc; display:grid; gap:6px; font-size:13px; }
     .preview b { font-size: 18px; }
+    .preview.warn { border-color: rgba(183,121,31,.35); background:#fffaf0; }
+    .preview.error { border-color: rgba(209,67,63,.26); background:#fff7f6; }
+    .target-stack { display:grid; gap: 4px; white-space: nowrap; }
+    .target-stack span { display:block; }
     .command-search { position: relative; }
     .command-search input { min-height: 42px; border-radius: 8px; padding-left: 40px; background: #f8fafc; box-shadow: inset 0 1px 0 rgba(255,255,255,.65); }
     .command-search span { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--muted); font-weight: 900; }
@@ -3712,6 +3728,25 @@ function renderAdminPage() {
     .bar { height: 8px; background: #edf2f7; border-radius: 99px; overflow:hidden; }
     .bar i { display:block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--blue)); border-radius: 99px; }
     .mobile-dock { display:none; }
+    .mobile-list { display:none; }
+    .signal-card { border:1px solid var(--line); border-radius: 8px; background:#fff; padding: 12px; display:grid; gap: 10px; box-shadow: var(--shadow-soft); }
+    .signal-card-head { display:flex; justify-content:space-between; gap: 10px; align-items:flex-start; }
+    .signal-card-head strong { display:block; font-size: 15px; }
+    .signal-card-head span { display:block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+    .signal-card-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .signal-card-grid div { background: var(--panel-2); border-radius: 6px; padding: 8px; min-width: 0; }
+    .signal-card-grid span { display:block; color: var(--muted); font-size: 11px; font-weight: 800; margin-bottom: 3px; }
+    .signal-card-grid strong { display:block; font-size: 13px; word-break: break-word; }
+    .admin-modal { position: fixed; inset: 0; display:none; place-items:center; z-index: 80; padding: 18px; background: rgba(8, 14, 22, .46); backdrop-filter: blur(8px); }
+    .admin-modal.open { display:grid; }
+    .admin-modal-card { width: min(460px, 100%); border-radius: 10px; border:1px solid var(--line); background:#fff; box-shadow: 0 24px 70px rgba(15,23,42,.28); overflow:hidden; }
+    .admin-modal-card header { padding: 16px; border-bottom:1px solid var(--line); }
+    .admin-modal-card h3 { margin:0; font-size: 17px; }
+    .admin-modal-card p { margin:6px 0 0; color:var(--muted); font-size: 13px; line-height:1.45; }
+    .admin-modal-body { padding: 16px; display:grid; gap: 12px; }
+    .check-row { display:flex; align-items:center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .check-row input { width:auto; min-height: unset; }
+    .admin-modal-actions { padding: 12px 16px 16px; display:flex; gap: 8px; justify-content:flex-end; }
     .admin-foot { margin-top: auto; border: 1px solid rgba(255,255,255,.11); border-radius: 8px; padding: 12px; background: rgba(255,255,255,.05); }
     .admin-foot strong { display:block; font-size: 13px; }
     .admin-foot span { display:block; color:#90a8ba; font-size: 12px; margin-top: 4px; }
@@ -3756,6 +3791,10 @@ function renderAdminPage() {
       .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .table-wrap table { min-width: 680px; }
       th, td { padding: 10px; }
+      .has-mobile-cards .table-wrap { display:none; }
+      .mobile-list { display:grid; gap: 10px; }
+      .signal-card-grid { grid-template-columns: 1fr; }
+      .message { left: 12px; right: 12px; bottom: 78px; max-width: none; }
       .mobile-dock { position: fixed; left: 10px; right: 10px; bottom: 10px; display:flex; gap: 4px; padding: 8px; border:1px solid rgba(255,255,255,.45); border-radius: 16px; background: rgba(13,24,36,.94); backdrop-filter: blur(18px); z-index: 30; box-shadow: 0 18px 40px rgba(0,0,0,.25); overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
       .mobile-dock::-webkit-scrollbar { display: none; }
 	      .mobile-dock button { border:0; background: transparent; color:#a9bdc9; display:grid; place-items:center; gap: 3px; min-height: 48px; min-width: 62px; border-radius: 10px; font-size: 11px; font-weight: 800; }
@@ -3813,7 +3852,7 @@ function renderAdminPage() {
             <section class="panel"><header><h2>最新 Alert 日誌</h2><button class="btn ghost" data-view-target="tradingview" type="button">查看全部</button></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>訊號</th><th>狀態</th></tr></thead><tbody id="overviewTvLogs"></tbody></table></div></section>
           </div>
         </div>
-        <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>圖表</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div></section></div></div>
+        <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel has-mobile-cards"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>圖表</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div><div class="mobile-list" id="signalsCards"></div></section></div></div>
         <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
         <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
@@ -3824,6 +3863,7 @@ function renderAdminPage() {
       </section>
     </main>
   </div>
+  <div class="admin-modal" id="adminModal" aria-hidden="true"></div>
   <nav class="mobile-dock" id="mobileDock">
 	    <button data-view-target="overview" data-icon="⌂" class="active">總覽</button>
 	    <button data-view-target="signals" data-icon="↗">訊號</button>
@@ -3856,6 +3896,7 @@ function renderSignalFormHtml() {
       <div class="full"><label>Telegram 截圖 / 快照 URL</label><input name="snapshot_url" inputmode="url" placeholder="https://... 可公開讀取的圖片 URL"></div>
       <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
     </div>
+    <div class="preview signal-preview warn" id="signalPreview">載入品種後可建立訊號。</div>
 	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
 	  </form>`;
 }
@@ -3933,7 +3974,7 @@ function renderTradingViewGeneratorHtml() {
       <div class="full"><label>Webhook URL</label><input class="readonly" id="tvWebhookUrl" readonly></div>
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
-    <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
+    <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
 }
@@ -3985,9 +4026,27 @@ var dockButtons = Array.prototype.slice.call(document.querySelectorAll('#mobileD
 var messageEl = document.getElementById('message');
 function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]); }); }
 function money(value) { return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
-function dateText(value) { return value ? new Date(value).toLocaleString('zh-TW', { hour12: false }) : '-'; }
+function parseDbDate(value) {
+  if (!value) return null;
+  var text = String(value).trim();
+  var normalized = /(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(text) ? text : text.replace(' ', 'T') + 'Z';
+  var parsed = new Date(normalized);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+function dateText(value) {
+  var parsed = parseDbDate(value);
+  return parsed ? parsed.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) : '-';
+}
+function priceText(value) {
+  var n = Number(value);
+  return isFinite(n) ? n.toFixed(2) : '-';
+}
 function chip(text, tone) { return '<span class="chip ' + (tone || '') + '">' + esc(text) + '</span>'; }
-function setMessage(text, tone) { messageEl.textContent = text || ''; messageEl.className = 'message ' + (tone || ''); }
+function setMessage(text, tone) {
+  messageEl.textContent = text || '';
+  messageEl.className = 'message ' + (tone || '');
+  if (text && tone === 'ok') setTimeout(function () { if (messageEl.textContent === text) setMessage(''); }, 4200);
+}
 function showView(view) {
   views.forEach(function (el) { el.classList.toggle('active', el.id === 'view-' + view); });
   navButtons.forEach(function (btn) { btn.classList.toggle('active', btn.dataset.view === view); });
@@ -4025,6 +4084,7 @@ function renderAll() {
   renderTvGateway();
   renderRevenueSummary();
   renderOverviewTvLogs();
+  updateSignalPreview();
   document.getElementById('serverTime').textContent = '最後同步 ' + state.data.serverTime;
   document.getElementById('dbPill').textContent = 'D1 dc-signals-v91-db';
 }
@@ -4100,24 +4160,62 @@ function signalMediaButtons(sig) {
   if (sig.snapshot_url) links.push('<a class="btn ghost mini" href="' + esc(sig.snapshot_url) + '" target="_blank" rel="noopener">截圖</a>');
   return links.length ? '<div class="actions">' + links.join('') + '</div>' : '<span class="muted">-</span>';
 }
+function actionText(action) {
+  return action === 'LONG' ? '做多' : action === 'SHORT' ? '做空' : (action || '-');
+}
+function statusTone(status) {
+  return status === 'active' ? 'green' : status === 'closed' ? '' : status === 'cancelled' ? 'red' : 'amber';
+}
+function statusText(sig) {
+  if (sig.status === 'active') return '已發送';
+  if (sig.status === 'pending') return '草稿';
+  if (sig.status === 'closed') return sig.result === 'loss' ? '止損' : sig.result === 'breakeven' ? '保本' : '結案';
+  if (sig.status === 'cancelled') return '取消';
+  return sig.status || '-';
+}
+function signalTargetHtml(sig) {
+  return '<div class="target-stack">' +
+    '<span>進場 ' + esc(priceText(sig.entry_price)) + '</span>' +
+    '<span>止損 ' + esc(priceText(sig.stop_loss)) + '</span>' +
+    '<span>TP1 ' + esc(priceText(sig.tp1)) + '</span>' +
+    '<span>TP2 ' + esc(priceText(sig.tp2)) + '</span>' +
+    '<span>TP3 ' + esc(priceText(sig.tp3)) + '</span>' +
+  '</div>';
+}
+function signalActionButtons(sig) {
+  if (sig.status === 'active') return '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>';
+  if (sig.status === 'pending') return '<button class="btn primary" data-send="' + esc(sig.signal_uid) + '">發送</button><button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>';
+  return '';
+}
 function signalRow(sig, compact) {
-  var statusTone = sig.status === 'active' ? 'green' : sig.status === 'closed' ? '' : sig.status === 'cancelled' ? 'red' : 'amber';
-  var price = esc(sig.entry_price) + ' / ' + esc(sig.stop_loss) + ' / ' + esc(sig.tp1 || '-');
+  var tone = statusTone(sig.status);
+  var targets = signalTargetHtml(sig);
   var media = signalMediaButtons(sig);
-  var action = sig.status === 'active'
-    ? '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>'
-    : sig.status === 'pending'
-      ? '<button class="btn primary" data-send="' + esc(sig.signal_uid) + '">發送</button><button class="btn danger" data-cancel="' + esc(sig.signal_uid) + '">取消</button>'
-      : '';
+  var action = signalActionButtons(sig);
   if (compact) {
-    return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + price + '</td><td>' + chip(sig.status, statusTone) + '</td><td>' + media + action + '</td></tr>';
+    return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(actionText(sig.action), sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + targets + '</td><td>' + chip(statusText(sig), tone) + '</td><td class="actions">' + media + action + '</td></tr>';
   }
-  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(sig.action, sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + price + '</td><td>' + media + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(sig.status, statusTone) + '</td><td class="actions">' + action + '</td></tr>';
+  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(actionText(sig.action), sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + targets + '</td><td>' + media + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(statusText(sig), tone) + '</td><td class="actions">' + action + '</td></tr>';
+}
+function signalCard(sig) {
+  return '<article class="signal-card">' +
+    '<div class="signal-card-head"><div><strong>' + esc(sig.ticker) + ' ' + esc(actionText(sig.action)) + '</strong><span>' + esc(dateText(sig.created_at)) + ' · ' + esc(sig.signal_type || '-') + '</span></div>' + chip(statusText(sig), statusTone(sig.status)) + '</div>' +
+    '<div class="signal-card-grid">' +
+      '<div><span>進場</span><strong>' + esc(priceText(sig.entry_price)) + '</strong></div>' +
+      '<div><span>止損</span><strong>' + esc(priceText(sig.stop_loss)) + '</strong></div>' +
+      '<div><span>TP1</span><strong>' + esc(priceText(sig.tp1)) + '</strong></div>' +
+      '<div><span>TP2 / TP3</span><strong>' + esc(priceText(sig.tp2)) + ' / ' + esc(priceText(sig.tp3)) + '</strong></div>' +
+      '<div><span>發送</span><strong>' + esc(sig.sent_count || 0) + ' 人</strong></div>' +
+      '<div><span>單號</span><strong>' + esc(String(sig.signal_uid || '').slice(0, 8)) + '</strong></div>' +
+    '</div>' +
+    '<div class="actions">' + signalMediaButtons(sig) + signalActionButtons(sig) + '</div>' +
+  '</article>';
 }
 function renderSignals() {
   var signals = filteredSignals();
   document.getElementById('recentSignals').innerHTML = signals.slice(0, 8).map(function (s) { return signalRow(s, true); }).join('') || '<tr><td colspan="6" class="muted">尚無訊號</td></tr>';
   document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="10" class="muted">尚無訊號</td></tr>';
+  document.getElementById('signalsCards').innerHTML = signals.map(signalCard).join('') || '<div class="muted">尚無訊號</div>';
 }
 function orderRow(order, compact) {
   var user = order.username ? '@' + order.username : (order.first_name || order.user_id);
@@ -4306,6 +4404,53 @@ function formPayload(form) {
   ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
   return data;
 }
+function currentSignalDraft() {
+  var form = document.getElementById('signalForm');
+  if (!form) return {};
+  var data = formPayload(form);
+  var select = document.getElementById('signalTicker');
+  if (!data.ticker && select && select.value) data.ticker = select.value;
+  return data;
+}
+function signalDraftError(data) {
+  if (!data.ticker) return '請先選擇品種';
+  if (!['LONG', 'SHORT'].includes(String(data.action || '').toUpperCase())) return '請選擇方向';
+  if (!data.entry_price || !data.stop_loss || !data.tp1) return '進場、止損、TP1 為必填';
+  if (data.action === 'LONG' && Number(data.stop_loss) >= Number(data.entry_price)) return '做多時止損應低於進場';
+  if (data.action === 'SHORT' && Number(data.stop_loss) <= Number(data.entry_price)) return '做空時止損應高於進場';
+  var targets = [data.tp1, data.tp2, data.tp3].filter(function (value) { return value !== undefined && value !== ''; }).map(Number);
+  if (data.action === 'LONG' && targets.some(function (value) { return value <= Number(data.entry_price); })) return '做多時 TP 應高於進場';
+  if (data.action === 'SHORT' && targets.some(function (value) { return value >= Number(data.entry_price); })) return '做空時 TP 應低於進場';
+  return '';
+}
+function updateSignalPreview() {
+  var preview = document.getElementById('signalPreview');
+  var button = document.getElementById('createSignalBtn');
+  var mode = document.getElementById('signalMode');
+  if (!preview || !button) return;
+  var data = currentSignalDraft();
+  var error = signalDraftError(data);
+  button.disabled = !!error;
+  var sendText = data.send === false ? '只存草稿' : '即時發送';
+  if (mode) {
+    mode.textContent = sendText;
+    mode.className = 'chip ' + (data.send === false ? 'amber' : 'green');
+  }
+  if (error) {
+    preview.className = 'preview signal-preview warn';
+    preview.innerHTML = '<b>待完成</b><div>' + esc(error) + '</div>';
+    return;
+  }
+  var risk = Math.abs(Number(data.entry_price) - Number(data.stop_loss));
+  var rr = risk > 0 ? (Math.abs(Number(data.tp1) - Number(data.entry_price)) / risk).toFixed(1) : '0.0';
+  preview.className = 'preview signal-preview';
+  preview.innerHTML =
+    '<div>' + chip(sendText, data.send === false ? 'amber' : 'green') + ' ' + chip(data.target_group || 'all', data.target_group === 'vip' ? 'amber' : 'green') + '</div>' +
+    '<b>' + esc(data.action + ' ' + data.ticker) + '</b>' +
+    '<div>進場 ' + esc(priceText(data.entry_price)) + ' / 止損 ' + esc(priceText(data.stop_loss)) + '</div>' +
+    '<div>TP ' + [data.tp1, data.tp2, data.tp3].filter(function (v) { return v !== undefined && v !== ''; }).map(priceText).join(' / ') + '</div>' +
+    '<div class="muted">風險 ' + esc(priceText(risk)) + ' 點 · RR 1:' + esc(rr) + '</div>';
+}
 function signalPayload(form) {
   var data = formPayload(form);
   var select = document.getElementById('signalTicker');
@@ -4316,15 +4461,84 @@ function signalPayload(form) {
 function showError(err, fallback) {
   setMessage((err && err.message) || fallback || '操作失敗', 'error');
 }
+function findSignal(uid) {
+  return (state.data.signals || []).find(function (sig) { return sig.signal_uid === uid; }) || {};
+}
+function dialogField(field) {
+  var label = '<label>' + esc(field.label || field.name) + '</label>';
+  var value = field.value == null ? '' : String(field.value);
+  if (field.type === 'select') {
+    return '<div>' + label + '<select name="' + esc(field.name) + '">' + (field.options || []).map(function (option) {
+      var optValue = typeof option === 'string' ? option : option.value;
+      var optLabel = typeof option === 'string' ? option : option.label;
+      var selected = String(optValue) === value ? ' selected' : '';
+      return '<option value="' + esc(optValue) + '"' + selected + '>' + esc(optLabel) + '</option>';
+    }).join('') + '</select></div>';
+  }
+  if (field.type === 'checkbox') {
+    return '<label class="check-row"><input type="checkbox" name="' + esc(field.name) + '"' + (field.checked === false ? '' : ' checked') + '> ' + esc(field.label || field.name) + '</label>';
+  }
+  if (field.type === 'textarea') {
+    return '<div>' + label + '<textarea name="' + esc(field.name) + '">' + esc(value) + '</textarea></div>';
+  }
+  return '<div>' + label + '<input name="' + esc(field.name) + '" inputmode="' + esc(field.inputmode || 'text') + '" value="' + esc(value) + '"></div>';
+}
+function adminDialog(options) {
+  var modal = document.getElementById('adminModal');
+  var fields = (options.fields || []).map(dialogField).join('');
+  modal.innerHTML =
+    '<form class="admin-modal-card">' +
+      '<header><h3>' + esc(options.title || '確認操作') + '</h3>' + (options.body ? '<p>' + esc(options.body) + '</p>' : '') + '</header>' +
+      '<div class="admin-modal-body">' + fields + '</div>' +
+      '<div class="admin-modal-actions"><button class="btn ghost" type="button" data-modal-cancel>取消</button><button class="btn ' + esc(options.tone || 'primary') + '" type="submit">' + esc(options.confirmText || '確認') + '</button></div>' +
+    '</form>';
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  return new Promise(function (resolve) {
+    var form = modal.querySelector('form');
+    function onBackdrop(event) {
+      if (event.target === modal) done(null);
+    }
+    function done(value) {
+      modal.removeEventListener('click', onBackdrop);
+      modal.classList.remove('open');
+      modal.setAttribute('aria-hidden', 'true');
+      modal.innerHTML = '';
+      resolve(value);
+    }
+    modal.querySelector('[data-modal-cancel]').addEventListener('click', function () { done(null); });
+    modal.addEventListener('click', onBackdrop);
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var data = {};
+      (options.fields || []).forEach(function (field) {
+        var el = form.elements[field.name];
+        data[field.name] = field.type === 'checkbox' ? !!(el && el.checked) : (el ? el.value : '');
+      });
+      done(data);
+    });
+    setTimeout(function () {
+      var focusTarget = form.querySelector('input:not([type="checkbox"]), select, textarea, button[type="submit"]');
+      if (focusTarget) focusTarget.focus();
+    }, 0);
+  });
+}
+function confirmAdminAction(title, body, confirmText, tone) {
+  return adminDialog({ title: title, body: body, confirmText: confirmText || '確認', tone: tone || 'primary' });
+}
 document.getElementById('nav').addEventListener('click', function (event) { var btn = event.target.closest('[data-view]'); if (btn) showView(btn.dataset.view); });
 document.body.addEventListener('click', async function (event) {
   try {
     var targetView = event.target.closest('[data-view-target]');
     if (targetView) showView(targetView.dataset.viewTarget);
-    var copyBtn = event.target.closest('[data-copy], [data-copy-value]');
+    var copyBtn = event.target.closest('[data-copy], [data-copy-value], [data-copy-input]');
     if (copyBtn) {
       var value = copyBtn.dataset.copyValue || '';
       if (copyBtn.dataset.copy === 'tv-current') value = document.getElementById('tvWebhookUrl').value;
+      if (copyBtn.dataset.copyInput) {
+        var copyInput = document.getElementById(copyBtn.dataset.copyInput);
+        value = copyInput ? copyInput.value : '';
+      }
       if (value && navigator.clipboard) {
         await navigator.clipboard.writeText(value);
         setMessage('已複製到剪貼簿', 'ok');
@@ -4332,30 +4546,47 @@ document.body.addEventListener('click', async function (event) {
     }
     var closeBtn = event.target.closest('[data-close]');
     if (closeBtn) {
-      var price = prompt('輸入結案價格');
-      if (!price) return;
-      var type = prompt('結案類型：CLOSE / TP1 / TP2 / TP3 / SL', 'CLOSE') || 'CLOSE';
-      await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(price), type: type, notify: true }) });
+      var closeSig = findSignal(closeBtn.dataset.close);
+      var closeResult = await adminDialog({
+        title: '結案訊號',
+        body: (closeSig.ticker || '') + ' ' + actionText(closeSig.action) + ' · 進場 ' + priceText(closeSig.entry_price),
+        confirmText: '送出結案',
+        tone: 'warn',
+        fields: [
+          { name: 'price', label: '結案價格', inputmode: 'decimal', value: closeSig.tp1 || closeSig.entry_price || '' },
+          { name: 'type', label: '結案類型', type: 'select', value: 'CLOSE', options: ['CLOSE', 'TP1', 'TP2', 'TP3', 'SL'] },
+          { name: 'reason', label: '原因備註', value: '手動平倉' },
+          { name: 'notify', label: '同步通知 Telegram 會員', type: 'checkbox', checked: true }
+        ]
+      });
+      if (!closeResult) return;
+      await api('/api/admin/signals/' + encodeURIComponent(closeBtn.dataset.close) + '/close', { method: 'POST', body: JSON.stringify({ price: Number(closeResult.price), type: closeResult.type, reason: closeResult.reason, notify: closeResult.notify }) });
       await load();
     }
     var sendBtn = event.target.closest('[data-send]');
-    if (sendBtn && confirm('確認發送此草稿訊號給符合條件的會員？')) {
+    if (sendBtn) {
+      var sendSig = findSignal(sendBtn.dataset.send);
+      var sendOk = await confirmAdminAction('發送草稿訊號', (sendSig.ticker || '') + ' ' + actionText(sendSig.action) + ' 將推送給符合訂閱條件的會員。', '發送', 'primary');
+      if (!sendOk) return;
       await api('/api/admin/signals/' + encodeURIComponent(sendBtn.dataset.send) + '/send', { method: 'POST', body: '{}' });
       await load();
     }
     var cancelBtn = event.target.closest('[data-cancel]');
-    if (cancelBtn && confirm('確定取消此草稿訊號？')) {
+    if (cancelBtn) {
+      var cancelSig = findSignal(cancelBtn.dataset.cancel);
+      var cancelOk = await confirmAdminAction('取消草稿訊號', (cancelSig.ticker || '') + ' ' + actionText(cancelSig.action) + ' 將標記為取消，不會推送會員。', '取消草稿', 'danger');
+      if (!cancelOk) return;
       await api('/api/admin/signals/' + encodeURIComponent(cancelBtn.dataset.cancel) + '/cancel', { method: 'POST', body: '{}' });
       await load();
     }
     var confirmOrder = event.target.closest('[data-confirm-order]');
-    if (confirmOrder) { await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
+    if (confirmOrder) { var orderOk = await confirmAdminAction('確認訂單', '確認後會延長會員期限並通知用戶。', '確認入帳', 'primary'); if (!orderOk) return; await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
     var rejectOrder = event.target.closest('[data-reject-order]');
-    if (rejectOrder) { var reason = prompt('拒絕原因', '付款未確認') || '付款未確認'; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) }); await load(); }
+    if (rejectOrder) { var reject = await adminDialog({ title: '拒絕訂單', body: '拒絕後會通知用戶原因。', confirmText: '拒絕訂單', tone: 'danger', fields: [{ name: 'reason', label: '拒絕原因', value: '付款未確認' }] }); if (!reject) return; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reject.reason }) }); await load(); }
     var userTier = event.target.closest('[data-user-tier]');
-    if (userTier) { var parts = userTier.dataset.userTier.split('|'); await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
+    if (userTier) { var parts = userTier.dataset.userTier.split('|'); var tierOk = await confirmAdminAction('調整會員等級', '將此用戶升級為 ' + parts[1].toUpperCase() + ' 並增加 30 天。', '套用', 'primary'); if (!tierOk) return; await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
     var userBan = event.target.closest('[data-user-ban]');
-    if (userBan) { var banParts = userBan.dataset.userBan.split('|'); await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
+    if (userBan) { var banParts = userBan.dataset.userBan.split('|'); var banOk = await confirmAdminAction(banParts[1] === '1' ? '封禁會員' : '解除封禁', '此操作會立即改變用戶狀態。', banParts[1] === '1' ? '封禁' : '解除', banParts[1] === '1' ? 'danger' : 'primary'); if (!banOk) return; await api('/api/admin/users/' + encodeURIComponent(banParts[0]), { method: 'POST', body: JSON.stringify({ is_banned: banParts[1] === '1' }) }); await load(); }
   } catch (err) {
     showError(err);
   }
@@ -4365,6 +4596,7 @@ function setSignalAction(action) {
   var actionInput = document.querySelector('#signalForm [name="action"]');
   if (actionInput) actionInput.value = state.action;
   Array.prototype.slice.call(document.querySelectorAll('#signalForm [data-action]')).forEach(function (el) { el.classList.toggle('active', el.dataset.action === state.action); });
+  updateSignalPreview();
 }
 document.querySelector('.seg').addEventListener('click', function (event) {
   var btn = event.target.closest('[data-action]');
@@ -4383,14 +4615,20 @@ document.getElementById('signalFilters').addEventListener('click', function (eve
 document.getElementById('signalForm').addEventListener('submit', async function (event) {
   event.preventDefault();
   try {
+    var submitButton = document.getElementById('createSignalBtn');
+    if (submitButton) submitButton.disabled = true;
     setMessage('建立訊號中...');
     await api('/api/admin/signals', { method: 'POST', body: JSON.stringify(signalPayload(event.target)) });
     event.target.reset();
     setSignalAction('LONG');
     await load();
+    setMessage('訊號已建立', 'ok');
   } catch (err) { showError(err, '建立訊號失敗'); }
+  updateSignalPreview();
 });
-document.getElementById('signalForm').addEventListener('reset', function () { setTimeout(function () { setSignalAction('LONG'); }, 0); });
+document.getElementById('signalForm').addEventListener('reset', function () { setTimeout(function () { setSignalAction('LONG'); updateSignalPreview(); }, 0); });
+document.getElementById('signalForm').addEventListener('input', updateSignalPreview);
+document.getElementById('signalForm').addEventListener('change', updateSignalPreview);
 document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); } catch (err) { showError(err, '儲存設定失敗'); } });
 document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存品種失敗'); } });
 document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存策略失敗'); } });
