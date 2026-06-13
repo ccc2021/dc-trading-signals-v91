@@ -4393,6 +4393,89 @@ function signalDto(sig, tier = 'free') {
   };
 }
 
+function normalizeMemberDateParam(value) {
+  const text = String(value || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
+}
+
+function taipeiDayToSqliteUtc(value, endOfDay = false) {
+  const date = normalizeMemberDateParam(value);
+  if (!date) return '';
+  const time = endOfDay ? '23:59:59' : '00:00:00';
+  const parsed = new Date(`${date}T${time}+08:00`);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function memberSignalFilters(params = {}) {
+  const read = (key) => typeof params.get === 'function' ? params.get(key) : params[key];
+  const rawLimit = Number(read('limit') || 60);
+  const status = String(read('status') || read('filter') || 'all').trim().toLowerCase();
+  return {
+    status: ['all', 'active', 'history', 'closed', 'cancelled'].includes(status) ? status : 'all',
+    start: normalizeMemberDateParam(read('start') || read('from') || ''),
+    end: normalizeMemberDateParam(read('end') || read('to') || ''),
+    limit: Math.min(120, Math.max(1, Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 60))
+  };
+}
+
+async function getMemberSignals(db, user, settings, filters = {}) {
+  const query = memberSignalFilters(filters);
+  if (!memberCanReceive(user)) {
+    return { signals: [], query: { ...query, canReceive: false, hasMore: false } };
+  }
+
+  const where = [];
+  const binds = [];
+  if (query.status === 'active') {
+    where.push("status = 'active'");
+  } else if (query.status === 'history') {
+    where.push("status IN ('closed','cancelled')");
+  } else if (query.status === 'closed') {
+    where.push("status = 'closed'");
+  } else if (query.status === 'cancelled') {
+    where.push("status = 'cancelled'");
+  } else {
+    where.push("status IN ('active','closed','cancelled')");
+  }
+
+  const start = taipeiDayToSqliteUtc(query.start, false);
+  const end = taipeiDayToSqliteUtc(query.end, true);
+  if (start) {
+    where.push('created_at >= ?');
+    binds.push(start);
+  }
+  if (end) {
+    where.push('created_at <= ?');
+    binds.push(end);
+  }
+
+  const subscribedSymbols = parseJSON(settings?.subscribed_symbols, []);
+  const signalTypes = parseJSON(settings?.signal_types, []);
+  const queryLimit = Math.min(420, Math.max(query.limit * 4, 80));
+  const rows = await db.prepare(`
+    SELECT * FROM signals
+    WHERE ${where.join(' AND ')}
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).bind(...binds, queryLimit).all();
+
+  const allowed = (rows.results || [])
+    .filter((sig) => (!subscribedSymbols.length || subscribedSymbols.includes(sig.ticker)))
+    .filter((sig) => (!signalTypes.length || signalTypes.includes(sig.signal_type)))
+    .filter((sig) => memberCanViewSignal(user, sig));
+
+  return {
+    signals: allowed.slice(0, query.limit).map((sig) => signalDto(sig, user.tier)),
+    query: {
+      ...query,
+      canReceive: true,
+      hasMore: allowed.length > query.limit,
+      resultCount: Math.min(allowed.length, query.limit)
+    }
+  };
+}
+
 async function getOrderEvents(db, orderIds, limit = 80) {
   const ids = Array.from(new Set((orderIds || []).map((id) => String(id || '').toUpperCase()).filter(Boolean)));
   if (!ids.length) return {};
@@ -4456,21 +4539,8 @@ async function getMemberBootstrap(db, userId, env = {}) {
   const subscribedSymbols = parseJSON(settings.subscribed_symbols, []);
   const signalTypes = parseJSON(settings.signal_types, []);
 
-  let signals = [];
-  if (memberCanReceive(user)) {
-    const rows = await db.prepare(`
-      SELECT * FROM signals
-      WHERE status IN ('active','closed','cancelled')
-      ORDER BY created_at DESC
-      LIMIT 60
-    `).all();
-    signals = (rows.results || [])
-      .filter((sig) => (!subscribedSymbols.length || subscribedSymbols.includes(sig.ticker)))
-      .filter((sig) => (!signalTypes.length || signalTypes.includes(sig.signal_type)))
-      .filter((sig) => memberCanViewSignal(user, sig))
-      .slice(0, 30)
-      .map((sig) => signalDto(sig, user.tier));
-  }
+  const signalPayload = await getMemberSignals(db, user, settings, { limit: 30 });
+  const signals = signalPayload.signals;
 
   const orders = (await db.prepare(`
     SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency,
@@ -4514,6 +4584,7 @@ async function getMemberBootstrap(db, userId, env = {}) {
     symbols,
     signalTypes: CONFIG.SIGNAL_TYPES,
     signals,
+    signalQuery: signalPayload.query,
     orders,
     security: await getMemberSecurity(db, userId),
     plans: await getMemberPlans(db),
@@ -4672,6 +4743,142 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
   throw new Error('不支援的訂單操作');
 }
 
+function memberOrderStatusLabel(status) {
+  const map = {
+    pending: '待付款',
+    paid: '待人工確認',
+    confirmed: '已確認',
+    rejected: '已拒絕',
+    cancelled: '已取消'
+  };
+  return map[status] || status || '-';
+}
+
+function memberOrderEventLabel(type) {
+  const map = {
+    created: '建立訂單',
+    terms_accepted: '同意條款',
+    stripe_session_created: '建立線上付款',
+    stripe_session_failed: '線上付款建立失敗',
+    paid_notice: '付款通知',
+    stripe_skipped: 'Stripe 尚未付款',
+    confirmed: '訂單確認',
+    rejected: '訂單拒絕',
+    cancelled: '訂單取消'
+  };
+  return map[type] || type || '紀錄';
+}
+
+function memberReceiptDate(value) {
+  const parsed = parseDbTime(value);
+  return parsed ? fmtDateTime(parsed) : '-';
+}
+
+function memberReceiptMoney(order) {
+  const currency = String(order.currency || 'TWD').toUpperCase();
+  return `${currency} ${fmtNum(Number(order.amount || 0))}`;
+}
+
+function memberReceiptPaymentMethod(order) {
+  const method = String(order.payment_provider || order.payment_method || 'manual').toLowerCase();
+  return method === 'stripe' ? '線上付款 Stripe Checkout' : '轉帳 / 人工確認';
+}
+
+async function getMemberOrderReceipt(db, userId, orderId) {
+  await ensureOrderPaymentSchema(db);
+  const normalizedOrderId = String(orderId || '').trim().toUpperCase();
+  if (!normalizedOrderId) return null;
+  const order = await db.prepare(`
+    SELECT o.*, u.username, u.first_name
+    FROM orders o
+    LEFT JOIN users u ON u.user_id = o.user_id
+    WHERE o.order_id = ? AND o.user_id = ?
+    LIMIT 1
+  `).bind(normalizedOrderId, userId).first();
+  if (!order) return null;
+  const grouped = await getOrderEvents(db, [normalizedOrderId], 100);
+  return { order, events: grouped[normalizedOrderId] || [] };
+}
+
+function receiptInfoRow(label, value) {
+  return `<div class="info-row"><span>${escHtml(label)}</span><b>${escHtml(value || '-')}</b></div>`;
+}
+
+function renderMemberReceiptShell(title, body, status = 200) {
+  return html(`<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escHtml(title)}</title>
+  <style>
+    :root{--bg:#f4f7f9;--panel:#fff;--ink:#101828;--muted:#667085;--line:#d9e3ea;--accent:#08a7b3;--green:#16845a;--amber:#b7791f;--red:#d1433f;--shadow:0 14px 34px rgba(15,23,42,.08)}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    main{max-width:860px;margin:0 auto;padding:22px 16px 46px}.receipt{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
+    header{padding:20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.brand{display:flex;gap:10px;align-items:center}.mark{width:38px;height:38px;border-radius:8px;background:linear-gradient(135deg,#12c6d0,#1796ff);display:grid;place-items:center;font-weight:900;color:#06111c}
+    h1,h2,p{margin:0} h1{font-size:22px;line-height:1.15}.muted{color:var(--muted)}.chip{display:inline-flex;align-items:center;min-height:28px;border-radius:999px;background:#eef6f8;color:#475569;padding:4px 10px;font-size:12px;font-weight:900}.chip.green{background:#e8f7ef;color:var(--green)}.chip.amber{background:#fff7e6;color:var(--amber)}.chip.red{background:#fff0ef;color:var(--red)}
+    .body{padding:20px;display:grid;gap:18px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.info-row{border:1px solid var(--line);border-radius:8px;background:#f8fafc;padding:11px;display:grid;gap:5px;min-width:0}.info-row span{color:var(--muted);font-size:12px;font-weight:900}.info-row b{font-size:15px;word-break:break-word}
+    .section{display:grid;gap:10px}.section h2{font-size:15px}.note{white-space:pre-wrap;border:1px solid var(--line);border-radius:8px;background:#f8fafc;padding:12px;color:#344054;line-height:1.55}.timeline{display:grid;gap:8px}.event{border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:4px;background:#fff}.event strong{font-size:13px}.event span{color:var(--muted);font-size:12px;line-height:1.45}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:1px solid var(--line);border-radius:7px;min-height:38px;padding:8px 12px;background:#fff;color:var(--ink);font-weight:900;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+    @media print{body{background:#fff}main{padding:0}.receipt{border:0;box-shadow:none}.actions{display:none}}@media(max-width:680px){header{display:grid}.summary{grid-template-columns:1fr}.body,header{padding:16px}}
+  </style>
+</head>
+<body><main>${body}</main></body>
+</html>`, status, { 'Cache-Control': 'no-store' });
+}
+
+function renderMemberReceiptPage(order, events = []) {
+  const statusTone = order.status === 'confirmed' ? 'green' : order.status === 'paid' || order.status === 'pending' ? 'amber' : 'red';
+  const title = order.status === 'confirmed' ? '付款收據' : '訂單明細';
+  const note = order.payment_note ? `<div class="section"><h2>付款備註</h2><div class="note">${escHtml(order.payment_note)}</div></div>` : '';
+  const timeline = events.length ? events.map((event) => `
+      <div class="event"><strong>${escHtml(memberOrderEventLabel(event.event_type))}</strong><span>${escHtml(memberReceiptDate(event.created_at))}${event.actor_id ? ` · ${escHtml(event.actor_id)}` : ''}${event.message ? `<br>${escHtml(event.message)}` : ''}</span></div>
+    `).join('') : '<div class="muted">尚無事件紀錄。</div>';
+
+  return renderMemberReceiptShell(`DC Signals ${title} ${order.order_id}`, `
+    <article class="receipt">
+      <header>
+        <div class="brand"><div class="mark">DC</div><div><h1>DC Trading Signals ${escHtml(title)}</h1><p class="muted">訂單 ${escHtml(order.order_id)}</p></div></div>
+        <span class="chip ${statusTone}">${escHtml(memberOrderStatusLabel(order.status))}</span>
+      </header>
+      <div class="body">
+        <section class="summary">
+          ${receiptInfoRow('會員', formatUserLabel(order, order.user_id))}
+          ${receiptInfoRow('方案', `${tierName(order.tier)} ${order.months || 0} 個月 / ${order.days || 0} 天`)}
+          ${receiptInfoRow('金額', memberReceiptMoney(order))}
+          ${receiptInfoRow('付款方式', memberReceiptPaymentMethod(order))}
+          ${receiptInfoRow('建立時間', memberReceiptDate(order.created_at))}
+          ${receiptInfoRow('確認時間', memberReceiptDate(order.confirmed_at || order.paid_at))}
+        </section>
+        <section class="summary">
+          ${receiptInfoRow('條款版本', order.terms_version || '-')}
+          ${receiptInfoRow('同意條款時間', memberReceiptDate(order.terms_accepted_at))}
+          ${receiptInfoRow('風險揭露時間', memberReceiptDate(order.risk_acknowledged_at))}
+        </section>
+        ${note}
+        <section class="section"><h2>訂單流程</h2><div class="timeline">${timeline}</div></section>
+        <div class="actions"><a class="btn primary" href="/member">返回會員中心</a><button class="btn" type="button" onclick="window.print()">列印 / 另存 PDF</button></div>
+      </div>
+    </article>
+  `);
+}
+
+async function handleMemberReceiptPage(request, env, orderId) {
+  const session = await readMemberSession(request, env);
+  if (!session) {
+    return renderMemberReceiptShell('請先登入', `
+      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>請先登入會員中心</h1><p class="muted">登入後才能查看訂單明細與收據。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="/member">前往登入</a></div></div></article>
+    `, 401);
+  }
+  const receipt = await getMemberOrderReceipt(env.DB, session.userId, orderId);
+  if (!receipt) {
+    return renderMemberReceiptShell('找不到訂單', `
+      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>找不到訂單</h1><p class="muted">此訂單不存在，或不屬於目前登入會員。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="/member">返回會員中心</a></div></div></article>
+    `, 404);
+  }
+  return renderMemberReceiptPage(receipt.order, receipt.events);
+}
+
 async function updateMemberSettings(db, userId, payload) {
   await getUserSettings(db, userId);
   const data = {};
@@ -4804,6 +5011,12 @@ async function handleMemberApi(request, env, pathname) {
 
     if (request.method === 'GET' && parts[0] === 'me') {
       return json({ ok: true, data: await getMemberBootstrap(db, session.userId, env) });
+    }
+
+    if (request.method === 'GET' && parts[0] === 'signals') {
+      const user = await getUser(db, session.userId);
+      const settings = await getUserSettings(db, session.userId);
+      return json({ ok: true, data: await getMemberSignals(db, user, settings, new URL(request.url).searchParams) });
     }
 
     if (request.method === 'PUT' && parts[0] === 'settings') {
@@ -5023,6 +5236,7 @@ function renderMemberPage() {
 var state = null;
 var memberSignalFilter = 'all';
 var checkoutNoticeShown = false;
+var signalLoadId = 0;
 var loginView = document.getElementById('loginView');
 var appView = document.getElementById('appView');
 var toast = document.getElementById('toast');
@@ -5125,6 +5339,22 @@ function signalTime(sig){
   var end = sig.closed_at ? dateText(sig.closed_at) : '尚未結束';
   return start + ' → ' + end;
 }
+function signalPlainText(sig){
+  var lines = [
+    'DC Trading Signals',
+    sig.ticker + ' ' + actionText(sig) + ' · ' + statusText(sig),
+    '時間 ' + signalTime(sig),
+    '進場 ' + price(sig.entry_price),
+    '止損 ' + price(sig.stop_loss),
+    'TP1 ' + price(sig.tp1),
+    'TP2 ' + price(sig.tp2)
+  ];
+  if(sig.tp3 != null) lines.push('TP3 ' + price(sig.tp3));
+  if(sig.exit_price != null) lines.push('結案價 ' + price(sig.exit_price));
+  if(sig.strategy_id) lines.push('策略 ' + sig.strategy_id);
+  lines.push('#' + sig.signal_uid);
+  return lines.join('\\n');
+}
 function parseMemberTime(value){
   if(!value) return 0;
   var text = String(value);
@@ -5160,6 +5390,7 @@ function renderSignal(sig){
   if(sig.chart_url) actions += '<a class="btn mini primary" target="_blank" rel="noopener" href="'+esc(sig.chart_url)+'">開啟 TV</a>';
   actions += '<a class="btn mini ghost" target="_blank" rel="noopener" href="'+esc(signalCardUrl(sig))+'">訊號卡圖</a>';
   if(sig.snapshot_url) actions += '<a class="btn mini ghost" target="_blank" rel="noopener" href="'+esc(sig.snapshot_url)+'">原始截圖</a>';
+  actions += '<button class="btn mini ghost" type="button" data-copy-signal="'+esc(sig.signal_uid)+'">複製文字</button>';
   actions += '</div>';
   var result = sig.pnl_points != null ? '<div class="signal-result">'+chip((Number(sig.pnl_points) >= 0 ? '+' : '') + price(sig.pnl_points) + ' 點', Number(sig.pnl_points) >= 0 ? 'green' : 'red')+(sig.exit_reason?'<span>'+esc(sig.exit_reason)+'</span>':'')+'</div>' : '';
   return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+actionText(sig))+'</strong><p class="signal-meta">'+esc(signalTime(sig))+'<br>'+esc(sig.signal_type || '-')+(sig.strategy_id?' · '+esc(sig.strategy_id):'')+'</p></div>'+chip(statusText(sig), statusTone(sig) || signalTone(sig))+'</div><div class="levels">'+levels+'</div>'+result+actions+'</article>';
@@ -5252,8 +5483,9 @@ function renderOrder(o){
   var actions = '';
   var method = o.payment_provider || o.payment_method || 'manual';
   var terms = o.terms_accepted_at ? '<div class="muted">條款版本 '+esc(o.terms_version || '-')+' · 同意 '+dateText(o.terms_accepted_at)+'</div>' : '';
+  var receipt = '<a class="btn ghost" target="_blank" rel="noopener" href="/member/receipt/'+encodeURIComponent(o.order_id)+'">訂單明細</a>';
   if(o.status === 'pending' && method === 'stripe') actions =
-    '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+    '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
   if(o.status === 'pending' && method !== 'stripe') actions =
     '<div class="proof-grid">'+
       '<div><label>付款人</label><input data-proof="payer_name" placeholder="轉帳戶名"></div>'+
@@ -5261,8 +5493,9 @@ function renderOrder(o){
       '<div><label>付款時間</label><input data-proof="paid_at" placeholder="例如 6/13 18:30"></div>'+
       '<div><label>備註</label><input data-proof="note" placeholder="可填銀行、截圖連結等"></div>'+
     '</div>'+
-    '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
-  if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button></div>';
+    '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
+  if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
+  if(!actions) actions = '<div class="order-actions">'+receipt+'</div>';
   return '<article class="order-card">'+
     '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
     '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+esc(method === 'stripe' ? '線上付款' : '轉帳')+' · '+dateText(o.created_at)+'</div>'+
@@ -5276,8 +5509,35 @@ function renderSignalsOnly(){
   if(!state) return;
   var list = filteredMemberSignals();
   var total = (state.signals || []).length;
-  document.getElementById('signalCount').textContent = list.length + ' / ' + total + ' 筆';
+  var query = state.signal_query || state.signalQuery || {};
+  document.getElementById('signalCount').textContent = list.length + ' / ' + total + ' 筆' + (query.hasMore ? ' +' : '');
   document.getElementById('signals').innerHTML = list.map(renderSignal).join('') || '<div class="muted">此條件下沒有可查看的訊號。</div>';
+}
+async function loadMemberSignals(){
+  if(!state) return;
+  if(!state.user || !state.user.can_receive){
+    renderSignalsOnly();
+    return;
+  }
+  var token = ++signalLoadId;
+  var params = new URLSearchParams();
+  params.set('status', memberSignalFilter);
+  params.set('limit', '80');
+  var start = document.getElementById('signalStart').value;
+  var end = document.getElementById('signalEnd').value;
+  if(start) params.set('start', start);
+  if(end) params.set('end', end);
+  document.getElementById('signals').innerHTML = '<div class="muted">載入訊號中...</div>';
+  try{
+    var data = await api('/api/member/signals?' + params.toString());
+    if(token !== signalLoadId) return;
+    state.signals = data.signals || [];
+    state.signal_query = data.query || {};
+    renderSignalsOnly();
+  }catch(err){
+    if(token !== signalLoadId) return;
+    document.getElementById('signals').innerHTML = '<div class="muted">訊號載入失敗：'+esc(err.message)+'</div>';
+  }
 }
 function render(){
   loginView.classList.add('hidden'); appView.classList.remove('hidden');
@@ -5325,17 +5585,28 @@ document.getElementById('signalTabs').addEventListener('click', function(event){
   if(!btn) return;
   memberSignalFilter = btn.dataset.memberSignalFilter;
   Array.prototype.slice.call(document.querySelectorAll('[data-member-signal-filter]')).forEach(function(el){ el.classList.toggle('active', el === btn); });
-  renderSignalsOnly();
+  loadMemberSignals();
 });
-document.getElementById('signalStart').addEventListener('change', renderSignalsOnly);
-document.getElementById('signalEnd').addEventListener('change', renderSignalsOnly);
+document.getElementById('signalStart').addEventListener('change', loadMemberSignals);
+document.getElementById('signalEnd').addEventListener('change', loadMemberSignals);
 document.getElementById('clearSignalDates').addEventListener('click', function(){
   document.getElementById('signalStart').value = '';
   document.getElementById('signalEnd').value = '';
-  renderSignalsOnly();
+  loadMemberSignals();
 });
 document.body.addEventListener('click', async function(event){
   try{
+    var copySignal = event.target.closest('[data-copy-signal]');
+    if(copySignal){
+      var sig = (state.signals || []).find(function(item){ return item.signal_uid === copySignal.dataset.copySignal; });
+      if(sig && navigator.clipboard){
+        await navigator.clipboard.writeText(signalPlainText(sig));
+        showToast('訊號文字已複製');
+      }else{
+        showToast('無法複製此訊號','error');
+      }
+      return;
+    }
     var buy = event.target.closest('[data-buy-tier]');
     if(buy){
       var accepted = !!document.getElementById('acceptOrderTerms')?.checked;
@@ -7352,6 +7623,11 @@ export default {
 
     if (url.pathname === '/terms' || url.pathname === '/terms/') {
       return html(renderTermsPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+
+    const memberReceiptMatch = url.pathname.match(/^\/member\/receipt\/([^/]+)$/);
+    if (memberReceiptMatch && request.method === 'GET') {
+      return handleMemberReceiptPage(request, env, decodeURIComponent(memberReceiptMatch[1]));
     }
 
     if (url.pathname === '/member' || url.pathname === '/member/' || url.pathname === '/login' || url.pathname === '/login/') {
