@@ -188,6 +188,22 @@ checkout.session.completed
 checkout.session.async_payment_succeeded
 ```
 
+### 3d. 選配手動 Cron 維運
+
+Cloudflare scheduled cron 會自動處理到期提醒、過期降級、待發訊號與限流清理，不需要額外設定。若要從外部手動觸發 `/cron/*` 維運端點，請設定：
+
+```bash
+wrangler secret put CRON_SECRET
+```
+
+手動呼叫時需使用後台 Basic Auth，或附上：
+
+```text
+X-Cron-Secret: 你的 CRON_SECRET
+```
+
+未設定 `CRON_SECRET` 時，手動 `/cron/*` 端點會拒絕外部呼叫；排程 cron 不受影響。
+
 ### 4. 部署 Worker
 ```bash
 wrangler deploy

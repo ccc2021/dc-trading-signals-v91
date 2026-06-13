@@ -258,6 +258,24 @@ https://api.telegram.org/bot1234567890:ABCDefGHI/setWebhook?url=https://dc-signa
 
 ---
 
+### 步驟 6.4：選配手動 Cron Secret
+
+系統排程會由 Cloudflare scheduled cron 自動執行，不需要手動呼叫網址。若之後要從瀏覽器、curl 或外部監控工具手動觸發 `/cron/expire`、`/cron/remind`、`/cron/queued`、`/cron/security-cleanup`，請設定：
+
+```bash
+wrangler secret put CRON_SECRET
+```
+
+手動呼叫時使用後台 Basic Auth，或在 request header 加上：
+
+```text
+X-Cron-Secret: 你的 CRON_SECRET
+```
+
+未設定 `CRON_SECRET` 時，手動 `/cron/*` 端點會拒絕外部呼叫；Cloudflare scheduled cron 不受影響。
+
+---
+
 ## 7. 測試系統
 
 ### 步驟 7.1：測試 Bot

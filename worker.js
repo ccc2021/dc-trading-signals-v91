@@ -2866,6 +2866,20 @@ function requireAdminHttp(request, env, wantsJson = false) {
   return null;
 }
 
+function requireCronHttp(request, env, url) {
+  if (isAdminHttpRequest(request, env)) return null;
+  const expected = String(env.CRON_SECRET || '').trim();
+  if (!expected) return json({ ok: false, error: 'CRON_SECRET secret is not configured' }, 503);
+  const provided = String(
+    request.headers.get('X-Cron-Secret') ||
+    request.headers.get('X-Webhook-Secret') ||
+    url.searchParams.get('secret') ||
+    ''
+  ).trim();
+  if (!timingSafeEqual(provided, expected)) return json({ ok: false, error: 'Unauthorized cron request' }, 401);
+  return null;
+}
+
 async function readJsonBody(request) {
   try {
     return await request.json();
@@ -3132,6 +3146,9 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
   }
   if (!integrations.telegram.botToken) {
     issues.push(opsIssue('critical', 'Telegram Bot Token 未設定', '會員登入碼與 Telegram 推播都無法使用。', '設定 BOT_TOKEN secret。', 'billing'));
+  }
+  if (!integrations.cron.manualSecret) {
+    issues.push(opsIssue('info', '手動 Cron 端點已鎖定', '尚未設定 CRON_SECRET，外部無法手動觸發維運端點；Cloudflare 排程仍會正常執行。', '如需手動測試 cron，設定 CRON_SECRET。', 'billing'));
   }
   if (Number(rateLimitStats?.hot || 0) > 0) {
     issues.push(opsIssue('info', '偵測到高頻會員操作', `${rateLimitStats.hot} 個登入或訂單操作已接近限制。`, '觀察會員登入與訂單建立是否有異常。', 'overview'));
@@ -3964,6 +3981,15 @@ function integrationReadiness(env = {}) {
       mode: stripeMode,
       currency: stripeCurrency(env).toUpperCase(),
       webhookUrl: `${baseUrl}/webhook/stripe`
+    },
+    cron: {
+      manualSecret: Boolean(env.CRON_SECRET),
+      endpoints: {
+        expire: `${baseUrl}/cron/expire`,
+        remind: `${baseUrl}/cron/remind`,
+        queued: `${baseUrl}/cron/queued`,
+        securityCleanup: `${baseUrl}/cron/security-cleanup`
+      }
     }
   };
 }
@@ -6011,6 +6037,7 @@ function renderOpsHealth() {
   var integrations = state.data.integrations || ops.integrations || {};
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || {};
+  var cron = integrations.cron || {};
   var badgeTone = ops.status === 'critical' ? 'red' : ops.status === 'warning' ? 'amber' : 'green';
   var badge = document.getElementById('opsHealthBadge');
   if (badge) badge.innerHTML = chip(ops.statusText || '正常', badgeTone);
@@ -6029,6 +6056,7 @@ function renderOpsHealth() {
   cards.push('<article class="health-card ' + (stripe.enabled ? 'info' : 'warning') + '"><strong>線上付款</strong><p>' + (stripe.enabled ? 'Stripe Checkout 與 webhook 已完整啟用。' : '線上付款尚未完整啟用，會員目前不會看到線上付款按鈕。') + '</p><small>' + esc(stripe.mode || 'off') + ' · ' + esc(stripe.currency || '-') + '</small></article>');
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
   cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>第三方登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google / LINE，會員仍可用 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/member') + '</small></article>');
+  cards.push('<article class="health-card ' + (cron.manualSecret ? 'info' : 'warning') + '"><strong>Cron 手動端點</strong><p>' + (cron.manualSecret ? '手動維運端點已由 CRON_SECRET 保護。' : '手動維運端點已鎖定；需設定 CRON_SECRET 才能外部觸發。') + '</p><small>Cloudflare scheduled cron 不受影響</small></article>');
   cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
   cards.push('<article class="health-card info"><strong>會員安全</strong><p>登入碼與訂單建立已啟用速率限制。</p><small>目前限制中 ' + esc((ops.securityStats && ops.securityStats.activeRateLimits) || 0) + '，高頻 ' + esc((ops.securityStats && ops.securityStats.hotRateLimits) || 0) + '</small></article>');
   cards.push('<article class="health-card info"><strong>後台效能</strong><p>Bootstrap ' + esc(ops.bootstrapMs || '-') + 'ms。</p><small>待發佇列 ' + esc((ops.queueStats && ops.queueStats.due) || 0) + '，付款待確認 ' + esc((ops.orderStats && ops.orderStats.paid) || 0) + '</small></article>');
@@ -6086,6 +6114,7 @@ function renderBillingReadiness() {
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || { providers: [] };
   var telegram = integrations.telegram || {};
+  var cron = integrations.cron || {};
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
   var cards = [];
   cards.push(readinessCard(
@@ -6115,6 +6144,13 @@ function renderBillingReadiness() {
     telegram.botToken ? 'Telegram 登入碼與推播可用。' : 'BOT_TOKEN 尚未設定，Telegram 推播與登入碼不可用。',
     'Bot ' + esc(telegram.botUsername || '-') + ' · 會員中心 ' + esc(integrations.memberUrl || '/member'),
     integrations.memberUrl || ''
+  ));
+  cards.push(readinessCard(
+    'Cron 手動觸發',
+    cron.manualSecret ? 'info' : 'warning',
+    cron.manualSecret ? '已設定 CRON_SECRET，可安全手動觸發維運端點。' : '尚未設定 CRON_SECRET，手動 cron 端點會拒絕外部呼叫；Cloudflare 排程仍正常。',
+    'Header: X-Cron-Secret',
+    (cron.endpoints && cron.endpoints.queued) || ''
   ));
   box.innerHTML = cards.join('');
 }
@@ -6877,23 +6913,31 @@ export default {
     
     // Cron - 過期檢查
     if (url.pathname === '/cron/expire') {
+      const auth = requireCronHttp(request, env, url);
+      if (auth) return auth;
       const result = await handleExpireCheck(env);
       return json({ ok: true, ...result });
     }
     
     // Cron - 到期提醒
     if (url.pathname === '/cron/remind') {
+      const auth = requireCronHttp(request, env, url);
+      if (auth) return auth;
       const result = await handleExpireReminder(env);
       return json({ ok: true, ...result });
     }
     
     // Cron - 待發訊號
     if (url.pathname === '/cron/queued') {
+      const auth = requireCronHttp(request, env, url);
+      if (auth) return auth;
       const result = await handleQueuedSignals(env);
       return json({ ok: true, ...result });
     }
 
     if (url.pathname === '/cron/security-cleanup') {
+      const auth = requireCronHttp(request, env, url);
+      if (auth) return auth;
       const result = await handleSecurityCleanup(env);
       return json({ ok: true, ...result });
     }
