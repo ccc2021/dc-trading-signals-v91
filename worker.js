@@ -2874,6 +2874,12 @@ async function readJsonBody(request) {
   }
 }
 
+function appError(message, status = 400) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
 function cleanListValue(value) {
   if (Array.isArray(value)) {
     return JSON.stringify(value.map(String).map((v) => v.trim()).filter(Boolean));
@@ -2903,6 +2909,54 @@ async function addColumnIfMissing(db, table, column, definition) {
   const info = await db.prepare(`PRAGMA table_info(${table})`).all();
   const exists = (info.results || []).some((row) => row.name === column);
   if (!exists) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+}
+
+async function ensureRateLimitSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS rate_limits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rate_key TEXT UNIQUE NOT NULL,
+      count INTEGER DEFAULT 0,
+      reset_at_ms INTEGER NOT NULL,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_rate_limits_reset ON rate_limits(reset_at_ms)').run();
+}
+
+function requestClientIp(request) {
+  const cf = String(request.headers.get('cf-connecting-ip') || '').trim();
+  if (cf) return cf;
+  const forwarded = String(request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  if (forwarded) return forwarded;
+  return String(request.headers.get('x-real-ip') || '').trim() || 'unknown';
+}
+
+async function rateKey(parts) {
+  const raw = parts.map((part) => String(part || '')).join(':');
+  return `${parts[0]}:${(await sha256Hex(raw)).slice(0, 32)}`;
+}
+
+async function enforceRateLimit(db, key, limit, windowSeconds, message) {
+  await ensureRateLimitSchema(db);
+  const now = Date.now();
+  const resetAt = now + Number(windowSeconds || 60) * 1000;
+  const row = await db.prepare('SELECT count, reset_at_ms FROM rate_limits WHERE rate_key = ?').bind(key).first();
+  if (!row || Number(row.reset_at_ms || 0) <= now) {
+    await db.prepare(`
+      INSERT INTO rate_limits (rate_key, count, reset_at_ms, updated_at)
+      VALUES (?, 1, ?, datetime('now'))
+      ON CONFLICT(rate_key) DO UPDATE SET count = 1, reset_at_ms = excluded.reset_at_ms, updated_at = datetime('now')
+    `).bind(key, resetAt).run();
+    return { allowed: true, remaining: Math.max(0, limit - 1), resetAt };
+  }
+  const current = Number(row.count || 0);
+  if (current >= limit) {
+    const retrySeconds = Math.max(1, Math.ceil((Number(row.reset_at_ms) - now) / 1000));
+    throw appError(`${message}（約 ${Math.ceil(retrySeconds / 60)} 分鐘後再試）`, 429);
+  }
+  await db.prepare('UPDATE rate_limits SET count = count + 1, updated_at = datetime("now") WHERE rate_key = ?').bind(key).run();
+  return { allowed: true, remaining: Math.max(0, limit - current - 1), resetAt: row.reset_at_ms };
 }
 
 async function ensureAdminSchema(db) {
@@ -2996,8 +3050,9 @@ function opsIssue(severity, title, detail, action, view = 'overview') {
 
 async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env = {}) {
   const integrations = integrationReadiness(env);
+  await ensureRateLimitSchema(db);
   const [
-    sourceStats, alertStats, latestAlert, signalStats, orderStats, queueStats
+    sourceStats, alertStats, latestAlert, signalStats, orderStats, queueStats, rateLimitStats
   ] = await Promise.all([
     db.prepare(`
       SELECT COUNT(*) as total,
@@ -3035,7 +3090,14 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
              MIN(scheduled_at) as oldest_due_at
       FROM queued_signals
       WHERE sent = 0 AND scheduled_at <= datetime('now')
-    `).first()
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) as active,
+             MAX(count) as max_count,
+             SUM(CASE WHEN count >= 6 THEN 1 ELSE 0 END) as hot
+      FROM rate_limits
+      WHERE reset_at_ms > ?
+    `).bind(Date.now()).first()
   ]);
 
   const issues = [];
@@ -3070,6 +3132,9 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
   }
   if (!integrations.telegram.botToken) {
     issues.push(opsIssue('critical', 'Telegram Bot Token 未設定', '會員登入碼與 Telegram 推播都無法使用。', '設定 BOT_TOKEN secret。', 'billing'));
+  }
+  if (Number(rateLimitStats?.hot || 0) > 0) {
+    issues.push(opsIssue('info', '偵測到高頻會員操作', `${rateLimitStats.hot} 個登入或訂單操作已接近限制。`, '觀察會員登入與訂單建立是否有異常。', 'overview'));
   }
 
   const hasCritical = issues.some((issue) => issue.severity === 'critical');
@@ -3110,6 +3175,11 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
       due: queueStats?.due || 0,
       oldestDueAt: queueStats?.oldest_due_at || null,
       oldestDueAgeHours: hoursSinceDbTime(queueStats?.oldest_due_at)
+    },
+    securityStats: {
+      activeRateLimits: rateLimitStats?.active || 0,
+      hotRateLimits: rateLimitStats?.hot || 0,
+      maxRateCount: rateLimitStats?.max_count || 0
     }
   };
 }
@@ -4394,6 +4464,13 @@ async function handleMemberApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'login-code') {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_login_code_ip', requestClientIp(request)]),
+        8,
+        10 * 60,
+        '登入嘗試過多，請稍後再試'
+      );
       const login = await loginMemberWithCode(db, env, await readJsonBody(request));
       return new Response(JSON.stringify({ ok: true, data: login.data }), {
         status: 200,
@@ -4426,6 +4503,13 @@ async function handleMemberApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'orders' && parts.length === 1) {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_order_create', session.userId]),
+        6,
+        60 * 60,
+        '訂單建立太頻繁，請稍後再試'
+      );
       return json({ ok: true, data: await createMemberOrder(db, env, session.userId, await readJsonBody(request)) });
     }
 
@@ -4435,7 +4519,7 @@ async function handleMemberApi(request, env, pathname) {
 
     return json({ ok: false, error: 'Not found' }, 404);
   } catch (e) {
-    return json({ ok: false, error: e.message }, 400);
+    return json({ ok: false, error: e.message }, e.status || 400);
   }
 }
 
@@ -5946,6 +6030,7 @@ function renderOpsHealth() {
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
   cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>第三方登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google / LINE，會員仍可用 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/member') + '</small></article>');
   cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
+  cards.push('<article class="health-card info"><strong>會員安全</strong><p>登入碼與訂單建立已啟用速率限制。</p><small>目前限制中 ' + esc((ops.securityStats && ops.securityStats.activeRateLimits) || 0) + '，高頻 ' + esc((ops.securityStats && ops.securityStats.hotRateLimits) || 0) + '</small></article>');
   cards.push('<article class="health-card info"><strong>後台效能</strong><p>Bootstrap ' + esc(ops.bootstrapMs || '-') + 'ms。</p><small>待發佇列 ' + esc((ops.queueStats && ops.queueStats.due) || 0) + '，付款待確認 ' + esc((ops.orderStats && ops.orderStats.paid) || 0) + '</small></article>');
   document.getElementById('opsHealthGrid').innerHTML = cards.join('');
 }
@@ -6648,6 +6733,14 @@ async function handleQueuedSignals(env) {
   return { sent: count };
 }
 
+async function handleSecurityCleanup(env) {
+  const db = env.DB;
+  await ensureRateLimitSchema(db);
+  const cutoff = Date.now() - 86400000;
+  const result = await db.prepare('DELETE FROM rate_limits WHERE reset_at_ms < ?').bind(cutoff).run();
+  return { rateLimitsDeleted: result?.meta?.changes || 0 };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 主處理器
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -6799,6 +6892,11 @@ export default {
       const result = await handleQueuedSignals(env);
       return json({ ok: true, ...result });
     }
+
+    if (url.pathname === '/cron/security-cleanup') {
+      const result = await handleSecurityCleanup(env);
+      return json({ ok: true, ...result });
+    }
     
     return json({ error: 'Not found' }, 404);
   },
@@ -6820,5 +6918,6 @@ export default {
     }
     
     await handleQueuedSignals(env);
+    await handleSecurityCleanup(env);
   }
 };

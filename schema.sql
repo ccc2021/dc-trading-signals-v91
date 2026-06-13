@@ -395,6 +395,18 @@ CREATE TABLE system_config (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- 13a. API 速率限制 (rate_limits)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS rate_limits;
+CREATE TABLE rate_limits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rate_key TEXT UNIQUE NOT NULL,
+  count INTEGER DEFAULT 0,
+  reset_at_ms INTEGER NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- 14. 廣播記錄 (broadcasts)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS broadcasts;
@@ -462,6 +474,7 @@ CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_
 CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
 CREATE INDEX idx_member_oauth_user ON member_oauth_identities(user_id);
 CREATE INDEX idx_member_oauth_provider ON member_oauth_identities(provider, provider_user_id);
+CREATE INDEX idx_rate_limits_reset ON rate_limits(reset_at_ms);
 
 CREATE INDEX idx_queued_user ON queued_signals(user_id);
 CREATE INDEX idx_queued_scheduled ON queued_signals(scheduled_at);

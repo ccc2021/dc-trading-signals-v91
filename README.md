@@ -215,6 +215,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `order_events` | 訂單狀態事件與客服追蹤紀錄 |
 | `member_login_codes` | 會員中心一次性登入碼 |
 | `member_oauth_identities` | Google / LINE 第三方登入身份 |
+| `rate_limits` | 會員登入與訂單建立速率限制 |
 | `queued_signals` | 待發訊號 |
 
 ## 📋 指令統計
