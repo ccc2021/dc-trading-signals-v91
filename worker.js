@@ -2152,6 +2152,39 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
   // 管理儀表板
   // ═══════════════════════════════════════════════════════════════════════════
   
+  if (cmd === '/ops') {
+    await ensureAdminSchema(db);
+    const configRows = await db.prepare(`SELECT key, value FROM system_config WHERE key IN (${ADMIN_CONFIG_KEYS.map(() => '?').join(',')})`).bind(...ADMIN_CONFIG_KEYS).all();
+    const config = {};
+    for (const row of configRows.results || []) config[row.key] = row.value;
+    const ops = await getOperationalHealth(db, config, Date.now());
+    const statusIcon = ops.status === 'critical' ? '🔴' : ops.status === 'warning' ? '🟡' : '🟢';
+    let m = `${statusIcon} <b>營運健康檢查</b>\n\n`;
+    m += `狀態：<b>${escHtml(ops.statusText)}</b>\n`;
+    m += `後台載入：${ops.bootstrapMs}ms\n`;
+    m += `TV來源：${ops.sourceStats.active}/${ops.sourceStats.total}\n`;
+    m += `24H Alert：${ops.alertStats.total24} 筆，錯誤 ${ops.alertStats.failed24} 筆\n`;
+    m += `訊號：進行中 ${ops.signalStats.active}，草稿 ${ops.signalStats.drafts}\n`;
+    m += `訂單：待處理 ${ops.orderStats.total}，已付款待確認 ${ops.orderStats.paid}\n`;
+    m += `待發佇列：${ops.queueStats.due}\n`;
+    if (ops.alertStats.latestAt) m += `最新 Alert：${fmtDateTime(ops.alertStats.latestAt)}\n`;
+    if (ops.issues.length) {
+      m += `\n<b>待處理</b>\n`;
+      for (const issue of ops.issues.slice(0, 6)) {
+        const icon = issue.severity === 'critical' ? '🔴' : issue.severity === 'warning' ? '🟡' : '🔵';
+        m += `${icon} ${escHtml(issue.title)}\n${escHtml(issue.action)}\n`;
+      }
+    } else {
+      m += `\n目前沒有需要處理的營運警示。`;
+    }
+    return sendTg(cid, m, {
+      inline_keyboard: [
+        [{ text: '開啟後台', url: 'https://dc-signals-v91.cc559773.workers.dev/admin' }],
+        [{ text: '訂單', callback_data: 'a_orders' }, { text: '設定', callback_data: 'a_config' }]
+      ]
+    });
+  }
+
   if (cmd === '/admin' || cmd === '/dash') {
     const totalUsers = await db.prepare('SELECT COUNT(*) as c FROM users').first();
     const proUsers = await db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro' AND is_active = 1").first();
@@ -2200,6 +2233,9 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
         ],
         [
           { text: '💰 訂單', callback_data: 'a_orders' },
+          { text: '🩺 營運', callback_data: 'a_ops' }
+        ],
+        [
           { text: '⚙️ 設定', callback_data: 'a_config' }
         ]
       ]
@@ -2515,7 +2551,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     m += `<b>管理</b>\n`;
     m += `/users /user /pro /vip /adddays\n`;
     m += `/orders /confirm /reject\n`;
-    m += `/dash /perf /config`;
+    m += `/dash /ops /perf /config`;
     
     return sendTg(cid, m);
   }
@@ -2555,6 +2591,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'a_users') return handleAdminCommand(cid, uid, '/users', [], '', env);
   if (data === 'a_perf') return handleAdminCommand(cid, uid, '/perf', ['7'], '', env);
   if (data === 'a_orders') return handleAdminCommand(cid, uid, '/orders', [], '', env);
+  if (data === 'a_ops') return handleAdminCommand(cid, uid, '/ops', [], '', env);
   if (data === 'a_config') return handleAdminCommand(cid, uid, '/config', [], '', env);
   
   // 用戶操作
@@ -2802,7 +2839,125 @@ async function ensureAdminSchema(db) {
   }
 }
 
+function hoursSinceDbTime(value) {
+  const parsed = parseDbTime(value);
+  if (!parsed) return null;
+  return Math.max(0, Math.round((Date.now() - parsed.getTime()) / 36e5));
+}
+
+function opsIssue(severity, title, detail, action, view = 'overview') {
+  return { severity, title, detail, action, view };
+}
+
+async function getOperationalHealth(db, config = {}, startedAt = Date.now()) {
+  const [
+    sourceStats, alertStats, latestAlert, signalStats, orderStats, queueStats
+  ] = await Promise.all([
+    db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active
+      FROM tradingview_sources
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) as total24,
+             SUM(CASE WHEN status = 'error' OR error IS NOT NULL THEN 1 ELSE 0 END) as failed24,
+             MAX(created_at) as latest_at
+      FROM tv_alert_logs
+      WHERE created_at > datetime('now', '-24 hours')
+    `).first(),
+    db.prepare(`
+      SELECT source_id, strategy_id, ticker, action, status, error, created_at
+      FROM tv_alert_logs
+      ORDER BY created_at DESC LIMIT 1
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as drafts,
+             SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+             MAX(created_at) as latest_at
+      FROM signals
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) as paid,
+             MIN(created_at) as oldest_at
+      FROM orders
+      WHERE status IN ('pending','paid')
+    `).first(),
+    db.prepare(`
+      SELECT COUNT(*) as due,
+             MIN(scheduled_at) as oldest_due_at
+      FROM queued_signals
+      WHERE sent = 0 AND scheduled_at <= datetime('now')
+    `).first()
+  ]);
+
+  const issues = [];
+  if (config.signals_paused === '1') {
+    issues.push(opsIssue('critical', '訊號目前暫停', '會員不會收到新訊號。', '到收費設定或 Telegram /resume 恢復發訊。', 'billing'));
+  }
+  if (!Number(sourceStats?.active || 0)) {
+    issues.push(opsIssue('warning', '沒有啟用的 TradingView 來源', '現有 TradingView alert 無法形成穩定訊號入口。', '到 TradingView 頁啟用或新增來源。', 'tradingview'));
+  }
+  if (Number(alertStats?.failed24 || 0) > 0) {
+    issues.push(opsIssue('warning', '近 24 小時有 Alert 錯誤', `${alertStats.failed24} 筆 alert 解析或驗證失敗。`, '檢查 TradingView 日誌與來源 Secret。', 'tradingview'));
+  }
+  if (Number(queueStats?.due || 0) > 0) {
+    issues.push(opsIssue('warning', '有逾時未發送佇列', `${queueStats.due} 筆通知已到發送時間但仍未送出。`, '檢查排程 cron 與 Telegram 發送狀態。', 'overview'));
+  }
+  if (Number(orderStats?.paid || 0) > 0) {
+    issues.push(opsIssue('warning', '有付款待確認', `${orderStats.paid} 筆會員已通知付款。`, '到訂單管理確認入帳或拒絕。', 'orders'));
+  }
+  if (Number(signalStats?.drafts || 0) > 0) {
+    issues.push(opsIssue('info', '有待審訊號草稿', `${signalStats.drafts} 筆訊號尚未發送。`, '到訊號工作台審核發送。', 'signals'));
+  }
+  if (Number(sourceStats?.active || 0) > 0 && !latestAlert) {
+    issues.push(opsIssue('info', '尚未收到 TradingView Alert', '來源已啟用，但還沒有 alert 紀錄。', '從 TradingView 送一筆測試 alert。', 'tradingview'));
+  }
+
+  const hasCritical = issues.some((issue) => issue.severity === 'critical');
+  const hasWarning = issues.some((issue) => issue.severity === 'warning');
+  const status = hasCritical ? 'critical' : hasWarning ? 'warning' : 'ok';
+
+  return {
+    status,
+    statusText: status === 'critical' ? '需要立即處理' : status === 'warning' ? '需要注意' : '正常',
+    bootstrapMs: Math.max(1, Date.now() - startedAt),
+    issues,
+    sourceStats: {
+      total: sourceStats?.total || 0,
+      active: sourceStats?.active || 0
+    },
+    alertStats: {
+      total24: alertStats?.total24 || 0,
+      failed24: alertStats?.failed24 || 0,
+      latestAt: latestAlert?.created_at || alertStats?.latest_at || null,
+      latestAgeHours: hoursSinceDbTime(latestAlert?.created_at || alertStats?.latest_at),
+      latest: latestAlert || null
+    },
+    signalStats: {
+      total: signalStats?.total || 0,
+      drafts: signalStats?.drafts || 0,
+      active: signalStats?.active || 0,
+      latestAt: signalStats?.latest_at || null,
+      latestAgeHours: hoursSinceDbTime(signalStats?.latest_at)
+    },
+    orderStats: {
+      total: orderStats?.total || 0,
+      paid: orderStats?.paid || 0,
+      oldestAt: orderStats?.oldest_at || null,
+      oldestAgeHours: hoursSinceDbTime(orderStats?.oldest_at)
+    },
+    queueStats: {
+      due: queueStats?.due || 0,
+      oldestDueAt: queueStats?.oldest_due_at || null,
+      oldestDueAgeHours: hoursSinceDbTime(queueStats?.oldest_due_at)
+    }
+  };
+}
+
 async function getAdminBootstrap(db) {
+  const startedAt = Date.now();
   await ensureAdminSchema(db);
 
   const [
@@ -2844,6 +2999,7 @@ async function getAdminBootstrap(db) {
   const config = {};
   for (const row of configRows.results || []) config[row.key] = row.value;
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
+  const ops = await getOperationalHealth(db, config, startedAt);
 
   return {
     stats: {
@@ -2867,6 +3023,7 @@ async function getAdminBootstrap(db) {
     users: users.results || [],
     tvSources: tvSources.results || [],
     tvLogs: tvLogs.results || [],
+    ops,
     serverTime: fmtTime()
   };
 }
@@ -4453,6 +4610,14 @@ function renderAdminPage() {
     .ops-tile { border: 1px solid rgba(8, 126, 144, .18); border-radius: 8px; background: rgba(255,255,255,.74); padding: 11px; }
     .ops-tile span { display:block; color: var(--muted); font-size: 11px; font-weight: 800; }
     .ops-tile strong { display:block; margin-top: 6px; font-size: 18px; }
+    .ops-health-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .health-card { border:1px solid var(--line); border-radius:8px; padding: 12px; background:#fff; display:grid; gap: 7px; border-left: 3px solid var(--accent); }
+    .health-card strong { font-size: 14px; }
+    .health-card p { margin:0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .health-card small { color: var(--muted); font-size: 11px; }
+    .health-card.critical { border-left-color: var(--red); background:#fffafa; }
+    .health-card.warning { border-left-color: var(--amber); background:#fffdf5; }
+    .health-card.info { border-left-color: var(--blue); }
     .panel-tools { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
     .filter-tabs { display:flex; gap: 6px; flex-wrap: wrap; }
     .filter-tabs button { border: 1px solid var(--line); border-radius: 999px; background:#fff; min-height: 30px; padding: 4px 10px; color: var(--muted); font-size: 12px; font-weight: 800; cursor:pointer; }
@@ -4520,6 +4685,7 @@ function renderAdminPage() {
       .content { padding: 16px; }
       .ops-hero { grid-template-columns: 1fr; }
       .ops-summary { min-width: 0; }
+      .ops-health-grid { grid-template-columns: 1fr; }
     }
 	    @media (max-width: 680px) {
 	      .main { width: 100vw; max-width: 100vw; overflow-x: hidden; }
@@ -4593,6 +4759,10 @@ function renderAdminPage() {
             <p>交易訊號、TradingView alert、會員收費與策略風控集中在同一個可行動工作台。</p>
           </div>
           <div class="ops-summary" id="opsSummary"></div>
+        </section>
+        <section class="panel">
+          <header><div><h2>營運健康檢查</h2><p>正式販售前後都要看的風險佇列</p></div><div id="opsHealthBadge"></div></header>
+          <div class="body"><div class="ops-health-grid" id="opsHealthGrid"></div></div>
         </section>
         <div class="kpis" id="kpis"></div>
         <div class="view active" id="view-overview">
@@ -4828,6 +4998,7 @@ async function load() {
 function renderAll() {
   renderSignalSymbolOptions();
   renderOpsSummary();
+  renderOpsHealth();
   renderKpis();
   renderConfigSummary();
   renderConfigForm();
@@ -4847,13 +5018,14 @@ function renderAll() {
 }
 function renderOpsSummary() {
   var s = state.data.stats;
+  var ops = state.data.ops || {};
   var sources = state.data.tvSources || [];
   var signals = state.data.signals || [];
   var activeSources = sources.filter(function (x) { return x.is_active; }).length;
   var drafts = signals.filter(function (x) { return x.status === 'pending'; }).length;
-  var paused = s.paused ? '暫停發訊' : '正常運行';
+  var paused = ops.statusText || (s.paused ? '暫停發訊' : '正常運行');
   document.getElementById('opsSummary').innerHTML = [
-    ['系統狀態', paused],
+    ['營運狀態', paused],
     ['待審草稿', drafts + ' 筆'],
     ['TV 來源', activeSources + '/' + sources.length],
     ['待處理訂單', s.pendingOrders + ' 筆']
@@ -4861,8 +5033,30 @@ function renderOpsSummary() {
     return '<div class="ops-tile"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>';
   }).join('');
 }
+function renderOpsHealth() {
+  var ops = state.data.ops || { status: 'ok', statusText: '正常', issues: [] };
+  var badgeTone = ops.status === 'critical' ? 'red' : ops.status === 'warning' ? 'amber' : 'green';
+  var badge = document.getElementById('opsHealthBadge');
+  if (badge) badge.innerHTML = chip(ops.statusText || '正常', badgeTone);
+  var cards = [];
+  if (ops.issues && ops.issues.length) {
+    cards = ops.issues.map(function (issue) {
+      return '<article class="health-card ' + esc(issue.severity || 'info') + '">' +
+        '<strong>' + esc(issue.title) + '</strong>' +
+        '<p>' + esc(issue.detail || '') + '</p>' +
+        '<small>' + esc(issue.action || '') + '</small>' +
+      '</article>';
+    });
+  } else {
+    cards.push('<article class="health-card"><strong>營運狀態正常</strong><p>目前沒有待處理的付款、發訊或 TradingView 錯誤。</p><small>最後同步 ' + esc(state.data.serverTime || '-') + '</small></article>');
+  }
+  cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
+  cards.push('<article class="health-card info"><strong>後台效能</strong><p>Bootstrap ' + esc(ops.bootstrapMs || '-') + 'ms。</p><small>待發佇列 ' + esc((ops.queueStats && ops.queueStats.due) || 0) + '，付款待確認 ' + esc((ops.orderStats && ops.orderStats.paid) || 0) + '</small></article>');
+  document.getElementById('opsHealthGrid').innerHTML = cards.join('');
+}
 function renderKpis() {
   var s = state.data.stats;
+  var ops = state.data.ops || {};
   var users = state.data.users || [];
   var revenue = users.reduce(function (sum, u) { return sum + Number(u.total_spent || 0); }, 0);
   var sentToday = (state.data.signals || []).filter(function (sig) { return sig.status === 'active' || sig.status === 'closed'; }).length;
@@ -4872,7 +5066,7 @@ function renderKpis() {
     ['◎', '會員總數', s.totalUsers, 'Pro ' + s.proUsers + ' / VIP ' + s.vipUsers],
     ['$', '營收累計', money(revenue), '可見會員統計'],
     ['%', '勝率', s.winRate + '%', '今日績效'],
-    ['⚡', '系統延遲', '128ms', s.paused ? '發訊暫停' : 'API 正常']
+    ['⚡', '系統延遲', (ops.bootstrapMs || '-') + 'ms', ops.statusText || (s.paused ? '發訊暫停' : 'API 正常')]
   ];
   document.getElementById('kpis').innerHTML = items.map(function (item) {
     return '<div class="kpi"><div class="kpi-icon">' + esc(item[0]) + '</div><span>' + esc(item[1]) + '</span><strong>' + esc(item[2]) + '</strong><small>' + esc(item[3]) + '</small></div>';
