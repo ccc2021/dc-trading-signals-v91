@@ -212,6 +212,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `tv_alert_logs` | TradingView alert 接收日誌 |
 | `performance` | 績效統計 |
 | `orders` | 訂單記錄 |
+| `order_events` | 訂單狀態事件與客服追蹤紀錄 |
 | `member_login_codes` | 會員中心一次性登入碼 |
 | `member_oauth_identities` | Google / LINE 第三方登入身份 |
 | `queued_signals` | 待發訊號 |

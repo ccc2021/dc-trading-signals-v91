@@ -309,6 +309,22 @@ CREATE TABLE orders (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- 10a. 訂單事件紀錄 (order_events)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS order_events;
+CREATE TABLE order_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id TEXT NOT NULL,
+  user_id TEXT,
+  event_type TEXT NOT NULL,
+  actor_id TEXT,
+  message TEXT,
+  metadata TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (order_id) REFERENCES orders(order_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- 10b. 會員中心一次性登入碼 (member_login_codes)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS member_login_codes;
@@ -440,6 +456,8 @@ CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_payment_provider ON orders(payment_provider);
 CREATE INDEX idx_orders_payment_session ON orders(payment_session_id);
+CREATE INDEX idx_order_events_order ON order_events(order_id, created_at);
+CREATE INDEX idx_order_events_created ON order_events(created_at);
 CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_at);
 CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
 CREATE INDEX idx_member_oauth_user ON member_oauth_identities(user_id);

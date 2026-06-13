@@ -1913,6 +1913,12 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
       INSERT INTO orders (order_id, user_id, tier, months, days, amount, created_at)
       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
     `).bind(orderId, uid, tier, months, days, price).run();
+    await recordOrderEvent(db, orderId, uid, 'created', uid, `Telegram 建立 ${tierName(tier)} ${months} 個月訂單`, {
+      tier,
+      months,
+      amount: price,
+      paymentProvider: 'manual'
+    });
     
     const bank = await getConfig(db, 'payment_bank');
     const account = await getConfig(db, 'payment_account');
@@ -1946,8 +1952,17 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   // 付款通知
   if (data.startsWith('paid_')) {
     const orderId = data.replace('paid_', '');
-    
+    const order = await db.prepare('SELECT * FROM orders WHERE order_id = ? AND user_id = ?').bind(orderId, uid).first();
+    if (!order) {
+      await answerCb(cbId, '找不到此訂單');
+      return;
+    }
+    if (!['pending', 'paid'].includes(order.status)) {
+      await answerCb(cbId, '此訂單狀態無法通知付款');
+      return;
+    }
     await db.prepare(`UPDATE orders SET status = 'paid', payment_note = '用戶已通知付款' WHERE order_id = ?`).bind(orderId).run();
+    await recordOrderEvent(db, orderId, uid, 'paid_notice', uid, 'Telegram 用戶已通知付款', { previousStatus: order.status });
     
     // 通知管理員
     for (const adminId of CONFIG.ADMIN_IDS) {
@@ -1967,7 +1982,17 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   // 取消訂單
   if (data.startsWith('cancel_')) {
     const orderId = data.replace('cancel_', '');
+    const order = await db.prepare('SELECT * FROM orders WHERE order_id = ? AND user_id = ?').bind(orderId, uid).first();
+    if (!order) {
+      await answerCb(cbId, '找不到此訂單');
+      return;
+    }
+    if (!['pending', 'paid'].includes(order.status)) {
+      await answerCb(cbId, '此訂單狀態無法取消');
+      return;
+    }
     await db.prepare(`UPDATE orders SET status = 'cancelled' WHERE order_id = ?`).bind(orderId).run();
+    await recordOrderEvent(db, orderId, uid, 'cancelled', uid, 'Telegram 用戶取消訂單', { previousStatus: order.status });
     await answerCb(cbId, '訂單已取消');
     return editTg(cid, msgId, `❌ 訂單已取消\n\n如需重新訂閱，請使用 /plans`, { inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]] });
   }
@@ -2577,13 +2602,12 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     const orderId = args[0].toUpperCase();
     const reason = args.slice(1).join(' ') || '未說明';
+    const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(orderId).first();
+    if (!order) return sendTg(cid, `❌ 找不到訂單 ${orderId}`);
     
     await db.prepare(`UPDATE orders SET status = 'rejected' WHERE order_id = ?`).bind(orderId).run();
-    
-    const order = await db.prepare('SELECT user_id FROM orders WHERE order_id = ?').bind(orderId).first();
-    if (order) {
-      await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
-    }
+    await recordOrderEvent(db, orderId, order.user_id, 'rejected', uid, reason, { source: 'telegram-admin' });
+    await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
     
     return sendTg(cid, `✅ 訂單 ${orderId} 已拒絕`);
   }
@@ -3093,10 +3117,11 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
 async function getAdminBootstrap(db, env = {}) {
   const startedAt = Date.now();
   await ensureAdminSchema(db);
+  await ensureOrderPaymentSchema(db);
 
   const [
     totalUsers, proUsers, vipUsers, todaySignals, activeSignals, pendingOrders,
-    todayPerf, configRows, symbols, strategies, signals, orders, users, tvSources, tvLogs
+    todayPerf, configRows, symbols, strategies, signals, orders, orderEvents, users, tvSources, tvLogs
   ] = await Promise.all([
     db.prepare('SELECT COUNT(*) as c FROM users').first(),
     db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro' AND is_active = 1").first(),
@@ -3120,6 +3145,11 @@ async function getAdminBootstrap(db, env = {}) {
       SELECT o.*, u.username, u.first_name FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id
       ORDER BY o.created_at DESC LIMIT 30
+    `).all(),
+    db.prepare(`
+      SELECT order_id, user_id, event_type, actor_id, message, metadata, created_at
+      FROM order_events
+      ORDER BY created_at DESC LIMIT 80
     `).all(),
     db.prepare(`
       SELECT user_id, username, first_name, tier, tier_expires_at, points, total_spent,
@@ -3154,6 +3184,7 @@ async function getAdminBootstrap(db, env = {}) {
     strategies: strategies.results || [],
     signals: signals.results || [],
     orders: orders.results || [],
+    orderEvents: orderEvents.results || [],
     users: users.results || [],
     tvSources: tvSources.results || [],
     tvLogs: tvLogs.results || [],
@@ -3386,6 +3417,7 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
   if (action === 'reject') {
     const reason = String(payload.reason || '未說明');
     await db.prepare("UPDATE orders SET status = 'rejected' WHERE order_id = ?").bind(normalizedOrderId).run();
+    await recordOrderEvent(db, normalizedOrderId, order.user_id, 'rejected', adminId, reason, { source: 'admin-web' });
     if (payload.notify !== false) await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
     await logAction(db, adminId, 'web_order_reject', normalizedOrderId, reason);
     return { orderId: normalizedOrderId, status: 'rejected' };
@@ -3456,6 +3488,34 @@ async function ensureOrderPaymentSchema(db) {
   await addColumnIfMissing(db, 'orders', 'paid_at', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_session ON orders(payment_session_id)').run();
+  await ensureOrderEventSchema(db);
+}
+
+async function ensureOrderEventSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS order_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL,
+      user_id TEXT,
+      event_type TEXT NOT NULL,
+      actor_id TEXT,
+      message TEXT,
+      metadata TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, created_at)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_order_events_created ON order_events(created_at)').run();
+}
+
+async function recordOrderEvent(db, orderId, userId, eventType, actorId, message = '', metadata = null) {
+  if (!orderId || !eventType) return;
+  await ensureOrderEventSchema(db);
+  const meta = metadata == null ? null : JSON.stringify(metadata);
+  await db.prepare(`
+    INSERT INTO order_events (order_id, user_id, event_type, actor_id, message, metadata, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(String(orderId).toUpperCase(), userId ? String(userId) : null, String(eventType), actorId ? String(actorId) : null, String(message || ''), meta).run();
 }
 
 async function createMemberLoginCode(db, userId) {
@@ -3921,6 +3981,12 @@ async function confirmOrderRecord(db, actorId, order, options = {}) {
   if (options.notify !== false) {
     await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
   }
+  await recordOrderEvent(db, orderId, order.user_id, 'confirmed', actorId, `訂單確認，會員到期日 ${fmtDate(newExpiry)}`, {
+    tier: order.tier,
+    days: order.days,
+    paymentProvider: options.paymentProvider || order.payment_provider || order.payment_method || 'manual',
+    sessionId: options.paymentSessionId || order.payment_session_id || ''
+  });
   await logAction(db, actorId, options.action || 'order_confirm', orderId, `${order.tier} ${order.days}d`);
   return { orderId, status: 'confirmed', tier: order.tier, expiresAt: newExpiry };
 }
@@ -3954,6 +4020,11 @@ async function confirmStripeSessionOrder(db, session, eventType) {
   const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(orderId).first();
   if (!order) throw new Error(`找不到訂單 ${orderId}`);
   if (session.payment_status && session.payment_status !== 'paid' && eventType !== 'checkout.session.async_payment_succeeded') {
+    await recordOrderEvent(db, orderId, order.user_id, 'stripe_skipped', 'stripe:webhook', `Stripe webhook 未確認付款：${session.payment_status}`, {
+      eventType,
+      sessionId: session.id || '',
+      paymentStatus: session.payment_status || ''
+    });
     return { orderId, status: order.status, skipped: true };
   }
   const paidNote = `Stripe ${eventType}\nSession：${session.id || '-'}\nPaymentIntent：${session.payment_intent || '-'}\nAmount：${session.amount_total || '-'} ${String(session.currency || order.currency || '').toUpperCase()}`;
@@ -4056,6 +4127,26 @@ function signalDto(sig, tier = 'free') {
   };
 }
 
+async function getOrderEvents(db, orderIds, limit = 80) {
+  const ids = Array.from(new Set((orderIds || []).map((id) => String(id || '').toUpperCase()).filter(Boolean)));
+  if (!ids.length) return {};
+  await ensureOrderEventSchema(db);
+  const rows = await db.prepare(`
+    SELECT order_id, event_type, actor_id, message, metadata, created_at
+    FROM order_events
+    WHERE order_id IN (${ids.map(() => '?').join(',')})
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).bind(...ids, limit).all();
+  const grouped = {};
+  for (const row of rows.results || []) {
+    const key = String(row.order_id || '').toUpperCase();
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(row);
+  }
+  return grouped;
+}
+
 async function getMemberBootstrap(db, userId, env = {}) {
   await ensureOrderPaymentSchema(db);
   const user = await getUser(db, userId);
@@ -4085,6 +4176,10 @@ async function getMemberBootstrap(db, userId, env = {}) {
     FROM orders WHERE user_id = ?
     ORDER BY created_at DESC LIMIT 10
   `).bind(userId).all()).results || [];
+  const orderEvents = await getOrderEvents(db, orders.map((order) => order.order_id), 80);
+  for (const order of orders) {
+    order.events = (orderEvents[String(order.order_id || '').toUpperCase()] || []).slice(0, 8);
+  }
 
   return {
     user: {
@@ -4151,6 +4246,12 @@ async function createMemberOrder(db, env, userId, payload) {
     INSERT INTO orders (order_id, user_id, tier, months, days, amount, payment_method, payment_provider, currency, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(orderId, userId, tier, months, plan.days, plan.amount, paymentProvider, paymentProvider, stripeCurrency(env).toUpperCase()).run();
+  await recordOrderEvent(db, orderId, userId, 'created', userId, `會員中心建立 ${tierName(tier)} ${months} 個月訂單`, {
+    tier,
+    months,
+    amount: plan.amount,
+    paymentProvider
+  });
 
   const user = await getUser(db, userId);
   let checkout = null;
@@ -4169,8 +4270,13 @@ async function createMemberOrder(db, env, userId, payload) {
         SET payment_session_id = ?, payment_url = ?, currency = ?
         WHERE order_id = ?
       `).bind(checkout.sessionId, checkout.checkoutUrl, checkout.currency.toUpperCase(), orderId).run();
+      await recordOrderEvent(db, orderId, userId, 'stripe_session_created', 'stripe', 'Stripe Checkout Session 已建立', {
+        sessionId: checkout.sessionId,
+        currency: checkout.currency.toUpperCase()
+      });
     } catch (e) {
       await db.prepare("UPDATE orders SET status = 'cancelled', payment_note = ? WHERE order_id = ?").bind(`Stripe 建立失敗：${e.message}`, orderId).run();
+      await recordOrderEvent(db, orderId, userId, 'stripe_session_failed', 'stripe', e.message, { paymentProvider });
       throw e;
     }
   }
@@ -4216,6 +4322,7 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
     if ((order.payment_provider || order.payment_method) === 'stripe') throw new Error('線上付款訂單請完成 Stripe Checkout');
     const paymentNote = memberPaymentNote(payload);
     await db.prepare("UPDATE orders SET status = 'paid', payment_note = ? WHERE order_id = ?").bind(paymentNote, normalizedOrderId).run();
+    await recordOrderEvent(db, normalizedOrderId, userId, 'paid_notice', userId, paymentNote, payload);
     for (const adminId of CONFIG.ADMIN_IDS) {
       await sendTg(adminId, `會員中心付款通知\n\n訂單：<code>${normalizedOrderId}</code>\n用戶：<code>${escHtml(userId)}</code>\n金額：NT$${fmtNum(order.amount)}\n\n${escHtml(paymentNote)}\n\n請至後台確認訂單。`);
     }
@@ -4226,6 +4333,7 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
   if (action === 'cancel') {
     if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法取消');
     await db.prepare("UPDATE orders SET status = 'cancelled' WHERE order_id = ?").bind(normalizedOrderId).run();
+    await recordOrderEvent(db, normalizedOrderId, userId, 'cancelled', userId, '會員取消訂單', { previousStatus: order.status });
     await logAction(db, userId, 'member_order_cancel', normalizedOrderId, '');
     return { orderId: normalizedOrderId, status: 'cancelled' };
   }
@@ -4385,6 +4493,9 @@ function renderMemberPage() {
     .payment-box { border:1px solid rgba(8,167,179,.24); background:#f4fbfc; border-radius:8px; padding:12px; display:grid; gap:7px; }
     .order-card { border:1px solid var(--line); border-radius:8px; padding:11px; display:grid; gap:8px; }
     .order-actions { display:flex; gap:7px; flex-wrap:wrap; }
+    .order-timeline { border-top:1px solid var(--line); padding-top:8px; display:grid; gap:5px; }
+    .order-timeline div { display:grid; grid-template-columns:auto minmax(0,1fr); gap:8px; align-items:start; color:var(--muted); font-size:12px; line-height:1.4; }
+    .order-timeline b { color:var(--ink); font-size:12px; white-space:nowrap; }
     .proof-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .chips { display:flex; gap:7px; flex-wrap:wrap; }
     .chip { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:4px 10px; border-radius:999px; background:var(--soft); color:#475569; font-size:12px; font-weight:800; }
@@ -4621,6 +4732,17 @@ function orderTone(status){ return status==='confirmed'?'green':status==='reject
 function orderStatusText(status){
   return status==='pending'?'待付款':status==='paid'?'待確認':status==='confirmed'?'已確認':status==='rejected'?'已拒絕':status==='cancelled'?'已取消':status;
 }
+function orderEventText(type){
+  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消' };
+  return map[type] || type || '紀錄';
+}
+function orderTimeline(events){
+  events = events || [];
+  if(!events.length) return '';
+  return '<div class="order-timeline">' + events.slice(0,3).map(function(event){
+    return '<div><b>'+esc(orderEventText(event.event_type))+'</b><span>'+esc(dateText(event.created_at))+(event.message?' · '+esc(event.message):'')+'</span></div>';
+  }).join('') + '</div>';
+}
 function paymentNoteHtml(note){
   if(!note) return '';
   return '<div class="muted">'+esc(note).replace(/\\n/g,'<br>')+'</div>';
@@ -4643,6 +4765,7 @@ function renderOrder(o){
     '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
     '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+esc(method === 'stripe' ? '線上付款' : '轉帳')+' · '+dateText(o.created_at)+'</div>'+
     paymentNoteHtml(o.payment_note)+
+    orderTimeline(o.events)+
     actions+
   '</article>';
 }
@@ -5401,6 +5524,8 @@ function renderAdminPage() {
     .source-meta div { background: var(--panel-2); border-radius: 6px; padding: 8px; font-size: 12px; }
     .source-meta span { display:block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
     .note-cell { min-width: 160px; white-space: normal; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .order-event { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .order-event b { color: var(--ink); }
     .copy-row { display:flex; gap: 8px; align-items:center; min-width:0; }
     .copy-row code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:8px; font-size: 12px; }
     .revenue-stack { display:grid; gap: 12px; }
@@ -5987,6 +6112,14 @@ function renderSignals() {
   document.getElementById('signalsTable').innerHTML = signals.map(function (s) { return signalRow(s, false); }).join('') || '<tr><td colspan="10" class="muted">尚無訊號</td></tr>';
   document.getElementById('signalsCards').innerHTML = signals.map(signalCard).join('') || '<div class="muted">尚無訊號</div>';
 }
+function orderEventLabel(type) {
+  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消' };
+  return map[type] || type || '紀錄';
+}
+function latestOrderEvent(orderId) {
+  var id = String(orderId || '').toUpperCase();
+  return (state.data.orderEvents || []).find(function (event) { return String(event.order_id || '').toUpperCase() === id; });
+}
 function orderRow(order, compact) {
   var user = order.username ? '@' + order.username : (order.first_name || order.user_id);
   var tone = order.status === 'paid' ? 'amber' : order.status === 'confirmed' ? 'green' : order.status === 'rejected' ? 'red' : '';
@@ -5995,7 +6128,10 @@ function orderRow(order, compact) {
     : '';
   var method = order.payment_provider || order.payment_method || 'manual';
   var session = order.payment_session_id ? '<div class="muted"><code>' + esc(order.payment_session_id) + '</code></div>' : '';
+  var lastEvent = latestOrderEvent(order.order_id);
+  var eventHtml = lastEvent ? '<div class="order-event"><b>' + esc(orderEventLabel(lastEvent.event_type)) + '</b> ' + esc(dateText(lastEvent.created_at)) + (lastEvent.message ? '<br>' + esc(lastEvent.message) : '') + '</div>' : '';
   var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
+  note += eventHtml;
   if (!note) note = '<span class="muted">-</span>';
   if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code><div class="note-cell">' + note + '</div></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
   return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
