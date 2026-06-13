@@ -318,6 +318,25 @@ CREATE TABLE member_login_codes (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- 10c. 會員中心第三方登入身份 (member_oauth_identities)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS member_oauth_identities;
+CREATE TABLE member_oauth_identities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider TEXT NOT NULL,
+  provider_user_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  email TEXT,
+  display_name TEXT,
+  avatar_url TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  last_login_at TEXT,
+  UNIQUE(provider, provider_user_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- 11. 積分歷史 (point_history)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS point_history;
@@ -416,6 +435,8 @@ CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_at);
 CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
+CREATE INDEX idx_member_oauth_user ON member_oauth_identities(user_id);
+CREATE INDEX idx_member_oauth_provider ON member_oauth_identities(provider, provider_user_id);
 
 CREATE INDEX idx_queued_user ON queued_signals(user_id);
 CREATE INDEX idx_queued_scheduled ON queued_signals(scheduled_at);

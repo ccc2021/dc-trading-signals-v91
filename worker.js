@@ -125,6 +125,10 @@ async function hmacHex(keyBytes, value) {
   return bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', key, textBytes(value))));
 }
 
+async function sha256Hex(value) {
+  return bytesToHex(await sha256Bytes(value));
+}
+
 function timingSafeEqual(a, b) {
   const left = String(a || '');
   const right = String(b || '');
@@ -154,6 +158,15 @@ async function sendTg(chatId, text, kb = null, options = {}) {
     });
     return res.json();
   } catch (e) { return { ok: false }; }
+}
+
+function isTelegramChatId(value) {
+  return /^-?\d+$/.test(String(value || '').trim());
+}
+
+async function sendMemberNotice(userId, text, kb = null, options = {}) {
+  if (!isTelegramChatId(userId)) return { ok: false, skipped: true };
+  return sendTg(userId, text, kb, options);
 }
 
 async function sendTgPhoto(chatId, photoUrl, caption = '', kb = null) {
@@ -888,6 +901,11 @@ async function broadcastSignal(db, signal, env = {}) {
   let sent = 0, queued = 0, skipped = 0;
   
   for (const user of users.results || []) {
+    if (!isTelegramChatId(user.user_id)) {
+      skipped++;
+      continue;
+    }
+
     // 檢查是否應該收到
     const shouldReceive = await shouldReceiveSignal(db, user.user_id, signal);
     if (!shouldReceive) {
@@ -2454,7 +2472,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await updateUser(db, userId, { tier, tier_expires_at: expires });
     await logAction(db, uid, `set_${tier}`, userId, `${days} days`);
     
-    await sendTg(userId, `🎉 恭喜！您已升級為 ${tierName(tier)}\n\n天數：${days} 天\n到期：${fmtDate(expires)}\n\n請使用 /subscribe 設定您想接收的品種`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ${tierName(tier)}\n\n天數：${days} 天\n到期：${fmtDate(expires)}\n\n請使用 /subscribe 設定您想接收的品種`);
     
     return sendTg(cid, `✅ 已將 <code>${userId}</code> 設為 ${tierName(tier)} (${days}天)`);
   }
@@ -2476,7 +2494,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, `${days} days`);
     
-    await sendTg(userId, `🎉 您的會員已延長 <b>${days}</b> 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 <b>${days}</b> 天！\n新到期日：${fmtDate(newExpiry)}`);
     
     return sendTg(cid, `✅ 已為 <code>${userId}</code> 延長 ${days} 天`);
   }
@@ -2499,7 +2517,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     if (args.length < 2) return sendTg(cid, `用法：/msg [用戶ID] [訊息]`);
     const userId = args[0];
     const message = args.slice(1).join(' ');
-    const result = await sendTg(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`);
+    const result = await sendMemberNotice(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`);
     return sendTg(cid, result?.ok ? `✅ 訊息已發送給 <code>${userId}</code>` : `❌ 發送失敗`);
   }
   
@@ -2565,7 +2583,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     await logAction(db, uid, 'confirm_order', orderId, `${order.tier} ${order.days}d`);
     
-    await sendTg(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}\n\n請使用 /subscribe 設定訂閱品種`);
+    await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${orderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}\n\n請使用 /subscribe 設定訂閱品種`);
     
     return sendTg(cid, `✅ 訂單 ${orderId} 已確認\n用戶已升級為 ${tierName(order.tier)}`);
   }
@@ -2580,7 +2598,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     
     const order = await db.prepare('SELECT user_id FROM orders WHERE order_id = ?').bind(orderId).first();
     if (order) {
-      await sendTg(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
+      await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
     }
     
     return sendTg(cid, `✅ 訂單 ${orderId} 已拒絕`);
@@ -2719,7 +2737,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     const expires = new Date(Date.now() + 30 * 86400000).toISOString();
     await updateUser(db, userId, { tier: 'pro', tier_expires_at: expires });
     await logAction(db, uid, 'set_pro', userId, '30 days');
-    await sendTg(userId, `🎉 恭喜！您已升級為 ⭐ Pro會員\n天數：30天\n到期：${fmtDate(expires)}`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 ⭐ Pro會員\n天數：30天\n到期：${fmtDate(expires)}`);
     await answerCb(cbId, '已設為Pro 30天');
     return;
   }
@@ -2729,7 +2747,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     const expires = new Date(Date.now() + 30 * 86400000).toISOString();
     await updateUser(db, userId, { tier: 'vip', tier_expires_at: expires });
     await logAction(db, uid, 'set_vip', userId, '30 days');
-    await sendTg(userId, `🎉 恭喜！您已升級為 👑 VIP會員\n天數：30天\n到期：${fmtDate(expires)}`);
+    await sendMemberNotice(userId, `🎉 恭喜！您已升級為 👑 VIP會員\n天數：30天\n到期：${fmtDate(expires)}`);
     await answerCb(cbId, '已設為VIP 30天');
     return;
   }
@@ -2745,7 +2763,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     }
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '7 days');
-    await sendTg(userId, `🎉 您的會員已延長 7 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 7 天！\n新到期日：${fmtDate(newExpiry)}`);
     await answerCb(cbId, '已延長7天');
     return;
   }
@@ -2761,7 +2779,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
     }
     await updateUser(db, userId, { tier_expires_at: newExpiry.toISOString() });
     await logAction(db, uid, 'adddays', userId, '30 days');
-    await sendTg(userId, `🎉 您的會員已延長 30 天！\n新到期日：${fmtDate(newExpiry)}`);
+    await sendMemberNotice(userId, `🎉 您的會員已延長 30 天！\n新到期日：${fmtDate(newExpiry)}`);
     await answerCb(cbId, '已延長30天');
     return;
   }
@@ -3368,7 +3386,7 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
     }
     await updateUser(db, order.user_id, { tier: order.tier, tier_expires_at: newExpiry, total_spent: (user.total_spent || 0) + order.amount });
     await db.prepare("UPDATE orders SET status = 'confirmed', confirmed_by = ?, confirmed_at = datetime('now') WHERE order_id = ?").bind(adminId, normalizedOrderId).run();
-    if (payload.notify !== false) await sendTg(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${normalizedOrderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
+    if (payload.notify !== false) await sendMemberNotice(order.user_id, `🎉 <b>訂單已確認！</b>\n\n訂單：${normalizedOrderId}\n方案：${tierName(order.tier)}\n天數：${order.days} 天\n到期：${fmtDate(newExpiry)}`);
     await logAction(db, adminId, 'web_order_confirm', normalizedOrderId, `${order.tier} ${order.days}d`);
     return { orderId: normalizedOrderId, status: 'confirmed' };
   }
@@ -3376,7 +3394,7 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
   if (action === 'reject') {
     const reason = String(payload.reason || '未說明');
     await db.prepare("UPDATE orders SET status = 'rejected' WHERE order_id = ?").bind(normalizedOrderId).run();
-    if (payload.notify !== false) await sendTg(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
+    if (payload.notify !== false) await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
     await logAction(db, adminId, 'web_order_reject', normalizedOrderId, reason);
     return { orderId: normalizedOrderId, status: 'rejected' };
   }
@@ -3389,7 +3407,9 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const MEMBER_SESSION_COOKIE = 'dc_member_session';
+const MEMBER_OAUTH_COOKIE = 'dc_oauth_state';
 const MEMBER_SESSION_TTL = 30 * 86400;
+const MEMBER_OAUTH_TTL = 10 * 60;
 
 function memberPortalUrl(env = {}) {
   return `${publicBaseUrl(env)}/member`;
@@ -3414,6 +3434,26 @@ async function ensureMemberLoginSchema(db) {
   `).run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_login_codes_user ON member_login_codes(user_id, created_at)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_login_codes_expires ON member_login_codes(expires_at)').run();
+}
+
+async function ensureMemberOAuthSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS member_oauth_identities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      provider TEXT NOT NULL,
+      provider_user_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      email TEXT,
+      display_name TEXT,
+      avatar_url TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      last_login_at TEXT,
+      UNIQUE(provider, provider_user_id)
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_oauth_user ON member_oauth_identities(user_id)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_member_oauth_provider ON member_oauth_identities(provider, provider_user_id)').run();
 }
 
 async function createMemberLoginCode(db, userId) {
@@ -3515,6 +3555,227 @@ async function readMemberSession(request, env) {
 
 function memberCookie(value, maxAge = MEMBER_SESSION_TTL) {
   return `${MEMBER_SESSION_COOKIE}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function oauthCookie(value, maxAge = MEMBER_OAUTH_TTL) {
+  return `${MEMBER_OAUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function oauthProviders(env = {}) {
+  const providers = [
+    {
+      id: 'google',
+      name: 'Google',
+      clientId: env.GOOGLE_CLIENT_ID || env.OAUTH_GOOGLE_CLIENT_ID || '',
+      clientSecret: env.GOOGLE_CLIENT_SECRET || env.OAUTH_GOOGLE_CLIENT_SECRET || '',
+      authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+      tokenUrl: 'https://oauth2.googleapis.com/token',
+      userInfoUrl: 'https://www.googleapis.com/oauth2/v3/userinfo',
+      scope: 'openid email profile'
+    },
+    {
+      id: 'line',
+      name: 'LINE',
+      clientId: env.LINE_CLIENT_ID || env.OAUTH_LINE_CLIENT_ID || '',
+      clientSecret: env.LINE_CLIENT_SECRET || env.OAUTH_LINE_CLIENT_SECRET || '',
+      authUrl: 'https://access.line.me/oauth2/v2.1/authorize',
+      tokenUrl: 'https://api.line.me/oauth2/v2.1/token',
+      userInfoUrl: 'https://api.line.me/v2/profile',
+      scope: 'profile openid email'
+    }
+  ];
+  return providers.map((provider) => ({
+    ...provider,
+    enabled: Boolean(provider.clientId && provider.clientSecret)
+  }));
+}
+
+function oauthPublicProviders(env = {}) {
+  return oauthProviders(env).map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    enabled: provider.enabled
+  }));
+}
+
+function getOAuthProvider(env, id) {
+  const provider = oauthProviders(env).find((item) => item.id === String(id || '').toLowerCase());
+  if (!provider || !provider.enabled) throw new Error('此第三方登入尚未設定');
+  return provider;
+}
+
+async function createOAuthState(provider, env) {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const payload = {
+    provider,
+    nonce: bytesToHex(bytes),
+    exp: Math.floor(Date.now() / 1000) + MEMBER_OAUTH_TTL
+  };
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  const sig = await hmacHex(await memberSessionSecret(env), encoded);
+  return `${encoded}.${sig}`;
+}
+
+async function verifyOAuthState(request, provider, state, env) {
+  const cookieState = readCookie(request, MEMBER_OAUTH_COOKIE);
+  if (!state || !cookieState || state !== cookieState) throw new Error('第三方登入驗證逾時，請重新登入');
+  const [payload, sig] = String(state).split('.');
+  if (!payload || !sig) throw new Error('第三方登入狀態無效');
+  const expected = await hmacHex(await memberSessionSecret(env), payload);
+  if (!timingSafeEqual(expected, sig)) throw new Error('第三方登入狀態驗證失敗');
+  const data = JSON.parse(base64UrlDecode(payload));
+  if (data.provider !== provider || Number(data.exp || 0) < Math.floor(Date.now() / 1000)) throw new Error('第三方登入狀態已過期');
+  return data;
+}
+
+function oauthErrorPage(message) {
+  return html(`<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登入失敗</title><style>body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f7f9;color:#101828;display:grid;place-items:center;min-height:100vh;padding:24px}.card{max-width:420px;background:#fff;border:1px solid #d9e3ea;border-radius:12px;padding:22px;box-shadow:0 14px 34px rgba(15,23,42,.08)}a{color:#087e90;font-weight:800}</style></head><body><main class="card"><h1>登入失敗</h1><p>${escHtml(message)}</p><p><a href="/member">返回會員中心</a></p></main></body></html>`, 400, { 'Cache-Control': 'no-store' });
+}
+
+async function exchangeOAuthCode(provider, code, redirectUri) {
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    client_id: provider.clientId,
+    client_secret: provider.clientSecret
+  });
+  const res = await fetch(provider.tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) throw new Error(data.error_description || data.error || '第三方授權交換失敗');
+  return data;
+}
+
+async function fetchOAuthProfile(provider, tokenData) {
+  const res = await fetch(provider.userInfoUrl, {
+    headers: { Authorization: `Bearer ${tokenData.access_token}` }
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error_description || data.message || '第三方會員資料讀取失敗');
+  if (provider.id === 'google') {
+    return {
+      provider: provider.id,
+      providerUserId: String(data.sub || ''),
+      email: String(data.email || ''),
+      displayName: String(data.name || data.given_name || data.email || 'Google 會員'),
+      avatarUrl: String(data.picture || '')
+    };
+  }
+  if (provider.id === 'line') {
+    return {
+      provider: provider.id,
+      providerUserId: String(data.userId || ''),
+      email: '',
+      displayName: String(data.displayName || 'LINE 會員'),
+      avatarUrl: String(data.pictureUrl || '')
+    };
+  }
+  throw new Error('不支援的第三方登入');
+}
+
+function safeWebUserLabel(profile) {
+  const email = String(profile.email || '').trim();
+  if (email) return email.slice(0, 64);
+  return `${profile.provider}:${String(profile.displayName || profile.providerUserId || 'member').slice(0, 48)}`;
+}
+
+async function webUserIdForProfile(profile) {
+  const digest = await sha256Hex(`${profile.provider}:${profile.providerUserId}`);
+  return `web_${profile.provider}_${digest.slice(0, 18)}`;
+}
+
+async function loginMemberWithOAuth(db, env, profile) {
+  if (!profile.providerUserId) throw new Error('第三方帳號缺少識別碼');
+  await ensureMemberOAuthSchema(db);
+  const existing = await db.prepare(`
+    SELECT user_id FROM member_oauth_identities
+    WHERE provider = ? AND provider_user_id = ?
+    LIMIT 1
+  `).bind(profile.provider, profile.providerUserId).first();
+
+  const userId = existing?.user_id || await webUserIdForProfile(profile);
+  await getUser(db, userId);
+  await saveUserInfo(db, userId, safeWebUserLabel(profile), profile.displayName);
+
+  if (existing?.user_id) {
+    await db.prepare(`
+      UPDATE member_oauth_identities
+      SET email = ?, display_name = ?, avatar_url = ?, updated_at = datetime('now'), last_login_at = datetime('now')
+      WHERE provider = ? AND provider_user_id = ?
+    `).bind(profile.email || null, profile.displayName || null, profile.avatarUrl || null, profile.provider, profile.providerUserId).run();
+  } else {
+    await db.prepare(`
+      INSERT INTO member_oauth_identities (provider, provider_user_id, user_id, email, display_name, avatar_url, last_login_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind(profile.provider, profile.providerUserId, userId, profile.email || null, profile.displayName || null, profile.avatarUrl || null).run();
+  }
+
+  await logAction(db, userId, 'member_oauth_login', profile.provider, profile.email || profile.displayName || '');
+  const session = await createMemberSession(userId, env);
+  return { session, userId };
+}
+
+async function handleOAuthStart(request, env, providerId) {
+  try {
+    const provider = getOAuthProvider(env, providerId);
+    const state = await createOAuthState(provider.id, env);
+    const redirectUri = `${publicBaseUrl(env)}/auth/${provider.id}/callback`;
+    const url = new URL(provider.authUrl);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', provider.clientId);
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('scope', provider.scope);
+    url.searchParams.set('state', state);
+    if (provider.id === 'google') url.searchParams.set('prompt', 'select_account');
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: url.toString(),
+        'Set-Cookie': oauthCookie(state),
+        'Cache-Control': 'no-store'
+      }
+    });
+  } catch (e) {
+    return oauthErrorPage(e.message);
+  }
+}
+
+async function handleOAuthCallback(request, env, providerId, url) {
+  try {
+    const provider = getOAuthProvider(env, providerId);
+    const error = url.searchParams.get('error');
+    if (error) throw new Error(url.searchParams.get('error_description') || error);
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+    if (!code) throw new Error('第三方登入缺少授權碼');
+    await verifyOAuthState(request, provider.id, state, env);
+    const redirectUri = `${publicBaseUrl(env)}/auth/${provider.id}/callback`;
+    const tokenData = await exchangeOAuthCode(provider, code, redirectUri);
+    const profile = await fetchOAuthProfile(provider, tokenData);
+    const login = await loginMemberWithOAuth(env.DB, env, profile);
+    const headers = new Headers({
+      Location: `${memberPortalUrl(env)}?login=${encodeURIComponent(provider.id)}`,
+      'Cache-Control': 'no-store'
+    });
+    headers.append('Set-Cookie', memberCookie(login.session));
+    headers.append('Set-Cookie', oauthCookie('', 0));
+    return new Response(null, { status: 302, headers });
+  } catch (e) {
+    const errorResponse = oauthErrorPage(e.message);
+    return new Response(await errorResponse.text(), {
+      status: 400,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Set-Cookie': oauthCookie('', 0),
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
 }
 
 function memberCanReceive(user) {
@@ -3764,6 +4025,10 @@ async function handleMemberApi(request, env, pathname) {
   const parts = pathname.split('/').filter(Boolean).slice(2);
 
   try {
+    if (request.method === 'GET' && parts[0] === 'oauth' && parts[1] === 'providers') {
+      return json({ ok: true, data: { providers: oauthPublicProviders(env) } });
+    }
+
     if (request.method === 'POST' && parts[0] === 'login') {
       const verified = await verifyTelegramLoginPayload(await readJsonBody(request), env);
       await getUser(db, verified.userId);
@@ -3905,6 +4170,11 @@ function renderMemberPage() {
     .login-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; font-weight:800; }
     .login-divider:before, .login-divider:after { content:""; height:1px; background:var(--line); flex:1; }
     .login-hint { font-size:13px; line-height:1.55; }
+    .oauth-grid { display:grid; gap:8px; }
+    .oauth-grid:empty { display:none; }
+    .oauth-btn { width:100%; min-height:42px; }
+    .oauth-btn.google { border-color:#d6dee8; }
+    .oauth-btn.line { background:#06c755; border-color:#06c755; color:#fff; }
     .login-widget { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; }
     .login-widget summary { cursor:pointer; font-weight:900; list-style:none; }
     .login-widget summary::-webkit-details-marker { display:none; }
@@ -3927,7 +4197,8 @@ function renderMemberPage() {
         <button class="btn primary" type="submit">登入會員中心</button>
       </form>
       <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b> 取得登入碼。</p>
-      <div class="login-divider"><span>或</span></div>
+      <div class="oauth-grid" id="oauthLogin"></div>
+      <div class="login-divider"><span>Telegram</span></div>
       <details class="login-widget">
         <summary>Telegram 一鍵登入</summary>
         <div class="widget-box">
@@ -3966,6 +4237,7 @@ var appView = document.getElementById('appView');
 var toast = document.getElementById('toast');
 var loginCodeForm = document.getElementById('loginCodeForm');
 var loginCodeInput = document.getElementById('loginCodeInput');
+var oauthLogin = document.getElementById('oauthLogin');
 function esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function money(value){ return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
 function price(value){ var n = Number(value); return isFinite(n) ? n.toFixed(2) : '-'; }
@@ -3973,6 +4245,17 @@ function dateText(value){ if(!value) return '-'; var text=String(value); var d=n
 function chip(text,tone){ return '<span class="chip '+(tone||'')+'">'+esc(text)+'</span>'; }
 function showToast(text,tone){ toast.textContent=text||''; toast.style.color=tone==='error'?'#d1433f':'#667085'; if(text) setTimeout(function(){ if(toast.textContent===text) toast.textContent=''; },3600); }
 async function api(path, options){ var res=await fetch(path,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},options||{})); var data=await res.json().catch(function(){return{};}); if(!res.ok||!data.ok) throw new Error(data.error||('HTTP '+res.status)); return data.data; }
+async function loadOAuthProviders(){
+  if(!oauthLogin) return;
+  try{
+    var data = await api('/api/member/oauth/providers');
+    var providers = (data.providers || []).filter(function(provider){ return provider.enabled; });
+    oauthLogin.innerHTML = providers.map(function(provider){
+      var cls = provider.id === 'line' ? 'line' : 'google';
+      return '<a class="btn oauth-btn '+esc(cls)+'" href="/auth/'+esc(provider.id)+'/start">使用 '+esc(provider.name)+' 登入</a>';
+    }).join('');
+  }catch(err){ oauthLogin.innerHTML = ''; }
+}
 window.onTelegramAuth = async function(user){ try{ state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); render(); }catch(err){ showToast(err.message,'error'); } };
 loginCodeForm.addEventListener('submit', async function(event){
   event.preventDefault();
@@ -4179,6 +4462,7 @@ document.body.addEventListener('click', async function(event){
   }catch(err){ showToast(err.message,'error'); }
 });
 load();
+loadOAuthProviders();
   </script>
 </body>
 </html>`;
@@ -5841,7 +6125,7 @@ async function handleExpireCheck(env) {
   let count = 0;
   for (const user of expired.results || []) {
     await updateUser(db, user.user_id, { tier: 'free', tier_expires_at: null });
-    await sendTg(user.user_id, `⚠️ 您的會員已到期\n\n已降為免費會員\n使用 /plans 續費`);
+    await sendMemberNotice(user.user_id, `⚠️ 您的會員已到期\n\n已降為免費會員\n使用 /plans 續費`);
     count++;
   }
   
@@ -5863,7 +6147,7 @@ async function handleExpireReminder(env) {
   let count = 0;
   for (const user of expiring.results || []) {
     const days = daysLeft(user.tier_expires_at);
-    await sendTg(user.user_id, `⏰ <b>會員即將到期</b>\n\n您的 ${tierName(user.tier)} 將在 <b>${days}</b> 天後到期\n\n👉 /renew 立即續費`);
+    await sendMemberNotice(user.user_id, `⏰ <b>會員即將到期</b>\n\n您的 ${tierName(user.tier)} 將在 <b>${days}</b> 天後到期\n\n👉 /renew 立即續費`);
     count++;
   }
   
@@ -5882,6 +6166,10 @@ async function handleQueuedSignals(env) {
   
   let count = 0;
   for (const q of queued.results || []) {
+    if (!isTelegramChatId(q.user_id)) {
+      await db.prepare(`UPDATE queued_signals SET sent = 1 WHERE id = ?`).bind(q.id).run();
+      continue;
+    }
     let result = null;
     if (q.photo_url) {
       result = await sendTgPhoto(q.user_id, q.photo_url, q.message);
@@ -5975,6 +6263,13 @@ export default {
     const cardMatch = url.pathname.match(/^\/signal-card\/([^/]+)\.svg$/);
     if (cardMatch) {
       return renderSignalCardResponse(env.DB, decodeURIComponent(cardMatch[1]));
+    }
+
+    const oauthMatch = url.pathname.match(/^\/auth\/(google|line)\/(start|callback)$/);
+    if (oauthMatch && request.method === 'GET') {
+      return oauthMatch[2] === 'start'
+        ? handleOAuthStart(request, env, oauthMatch[1])
+        : handleOAuthCallback(request, env, oauthMatch[1], url);
     }
 
     if (url.pathname === '/admin/logout') {

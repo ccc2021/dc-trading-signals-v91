@@ -15,6 +15,8 @@
 - **📊 個人績效** - 追蹤自己的執行績效
 - **📝 執行記錄** - 記錄已執行/跳過的訊號
 - **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
+- **🌐 會員中心** - 會員可直接在網站查看訊號、歷史、訂閱設定與續費
+- **🔐 第三方登入** - 支援 Telegram 登入碼，並可選配 Google / LINE OAuth
 - **🔗 TradingView 綁定** - 多來源 webhook、策略自動選擇與點位推算
 
 ## 💎 會員等級
@@ -137,6 +139,26 @@ wrangler secret put ADMIN_WEB_PASSWORD
 
 `ADMIN_IDS` 與 `BOT_USERNAME` 由 `wrangler.toml` 的 `[vars]` 設定。
 
+### 3b. 選配第三方登入
+
+會員中心預設可用 Telegram `/login` 一次性登入碼。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
+
+```bash
+wrangler secret put GOOGLE_CLIENT_ID
+wrangler secret put GOOGLE_CLIENT_SECRET
+wrangler secret put LINE_CLIENT_ID
+wrangler secret put LINE_CLIENT_SECRET
+```
+
+OAuth callback URL：
+
+```text
+https://your-worker.workers.dev/auth/google/callback
+https://your-worker.workers.dev/auth/line/callback
+```
+
+若有自訂網域，請設定 `PUBLIC_BASE_URL`，讓登入回呼與會員中心網址一致。
+
 ### 4. 部署 Worker
 ```bash
 wrangler deploy
@@ -161,6 +183,8 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `tv_alert_logs` | TradingView alert 接收日誌 |
 | `performance` | 績效統計 |
 | `orders` | 訂單記錄 |
+| `member_login_codes` | 會員中心一次性登入碼 |
+| `member_oauth_identities` | Google / LINE 第三方登入身份 |
 | `queued_signals` | 待發訊號 |
 
 ## 📋 指令統計
