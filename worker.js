@@ -680,7 +680,8 @@ async function getTelegramUserOrders(db, userId, limit = 8) {
   await ensureOrderPaymentSchema(db);
   const rows = await db.prepare(`
     SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency,
-           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, created_at, confirmed_at
+           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, refunded_at, refund_amount, refund_note,
+           created_at, confirmed_at
     FROM orders
     WHERE user_id = ?
     ORDER BY created_at DESC
@@ -695,6 +696,8 @@ async function getTelegramUserOrders(db, userId, limit = 8) {
 }
 
 function telegramOrderStatusIcon(status) {
+  if (status && typeof status === 'object' && status.refunded_at) return '💸';
+  status = status && typeof status === 'object' ? status.status : status;
   if (status === 'confirmed') return '✅';
   if (status === 'paid') return '💰';
   if (status === 'pending') return '⏳';
@@ -702,12 +705,18 @@ function telegramOrderStatusIcon(status) {
   return '📋';
 }
 
+function memberOrderDisplayStatus(order) {
+  if (order && typeof order === 'object' && order.refunded_at) return '已退款';
+  return memberOrderStatusLabel(order && typeof order === 'object' ? order.status : order);
+}
+
 function telegramOrderLine(order) {
   const method = String(order.payment_provider || order.payment_method || 'manual').toLowerCase() === 'stripe' ? '線上付款' : '轉帳';
-  return `${telegramOrderStatusIcon(order.status)} <code>${escHtml(order.order_id)}</code>\n` +
+  const refund = order.refunded_at ? `\n退款：${escHtml(orderRefundMoney(order))} · ${escHtml(memberReceiptDate(order.refunded_at))}` : '';
+  return `${telegramOrderStatusIcon(order)} <code>${escHtml(order.order_id)}</code>\n` +
     `${tierName(order.tier)} ${order.months || 0}個月 · ${escHtml(memberReceiptMoney(order))}\n` +
-    `狀態：${escHtml(memberOrderStatusLabel(order.status))} · ${escHtml(method)}\n` +
-    `建立：${escHtml(memberReceiptDate(order.created_at))}`;
+    `狀態：${escHtml(memberOrderDisplayStatus(order))} · ${escHtml(method)}\n` +
+    `建立：${escHtml(memberReceiptDate(order.created_at))}${refund}`;
 }
 
 function renderTelegramOrdersText(orders) {
@@ -725,7 +734,7 @@ function renderTelegramOrdersText(orders) {
 
 function renderTelegramOrdersKeyboard(orders, env) {
   const rows = orders.slice(0, 6).map((order) => ([{
-    text: `${telegramOrderStatusIcon(order.status)} ${order.order_id}`,
+    text: `${telegramOrderStatusIcon(order)} ${order.order_id}`,
     callback_data: `u_order_${order.order_id}`
   }]));
   rows.push([{ text: '會員中心', url: memberPortalUrl(env) }]);
@@ -735,14 +744,20 @@ function renderTelegramOrdersKeyboard(orders, env) {
 }
 
 function renderTelegramOrderReceipt(order, events = [], env = {}) {
-  let m = `<b>${order.status === 'confirmed' ? '付款收據' : '訂單明細'}</b>\n\n`;
+  let m = `<b>${order.refunded_at ? '退款收據' : order.status === 'confirmed' ? '付款收據' : '訂單明細'}</b>\n\n`;
   m += `訂單：<code>${escHtml(order.order_id)}</code>\n`;
-  m += `狀態：${telegramOrderStatusIcon(order.status)} ${escHtml(memberOrderStatusLabel(order.status))}\n`;
+  m += `狀態：${telegramOrderStatusIcon(order)} ${escHtml(memberOrderDisplayStatus(order))}\n`;
   m += `方案：${tierName(order.tier)} ${order.months || 0}個月 / ${order.days || 0}天\n`;
   m += `金額：<b>${escHtml(memberReceiptMoney(order))}</b>\n`;
   m += `付款：${escHtml(memberReceiptPaymentMethod(order))}\n`;
   m += `建立：${escHtml(memberReceiptDate(order.created_at))}\n`;
   if (order.paid_at || order.confirmed_at) m += `付款/確認：${escHtml(memberReceiptDate(order.confirmed_at || order.paid_at))}\n`;
+  if (order.refunded_at) {
+    m += `\n<b>退款紀錄</b>\n`;
+    m += `金額：${escHtml(orderRefundMoney(order))}\n`;
+    m += `時間：${escHtml(memberReceiptDate(order.refunded_at))}\n`;
+    if (order.refund_note) m += `原因：${escHtml(order.refund_note)}\n`;
+  }
   if (order.terms_accepted_at) {
     m += `\n<b>條款紀錄</b>\n`;
     m += `版本：${escHtml(order.terms_version || '-')}\n`;
@@ -2754,7 +2769,8 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     }
     
     m += `確認：/confirm [訂單ID]\n`;
-    m += `拒絕：/reject [訂單ID]`;
+    m += `拒絕：/reject [訂單ID]\n`;
+    m += `退款：/refund [訂單ID] [金額] [原因]`;
     
     return sendTg(cid, m);
   }
@@ -2789,6 +2805,26 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${orderId}\n原因：${reason}`);
     
     return sendTg(cid, `✅ 訂單 ${orderId} 已拒絕`);
+  }
+
+  if (cmd === '/refund') {
+    if (!args[0]) return sendTg(cid, `用法：/refund [訂單ID] [金額] [原因]\n金額可省略，預設為訂單全額。`);
+
+    const orderId = args[0].toUpperCase();
+    const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(orderId).first();
+    if (!order) return sendTg(cid, `❌ 找不到訂單 ${orderId}`);
+
+    const maybeAmount = asNumber(args[1], null);
+    const amount = maybeAmount == null ? Number(order.amount || 0) : maybeAmount;
+    const reason = (maybeAmount == null ? args.slice(1) : args.slice(2)).join(' ') || '人工退款';
+    const result = await refundOrderRecord(db, uid, order, {
+      amount,
+      reason,
+      revoke_access: true,
+      notify: true,
+      action: 'telegram_order_refund'
+    });
+    return sendTg(cid, `✅ 已記錄退款 ${orderId}\n金額：${orderRefundMoney({ ...order, refund_amount: result.refundAmount })}\n${escHtml(result.note || '')}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2874,7 +2910,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     m += `/bc /announce /update /alert\n\n`;
     m += `<b>管理</b>\n`;
     m += `/users /user /pro /vip /adddays\n`;
-    m += `/orders /confirm /reject\n`;
+    m += `/orders /confirm /reject /refund\n`;
     m += `/dash /ops /perf /config`;
     
     return sendTg(cid, m);
@@ -3666,12 +3702,112 @@ async function updateAdminUser(db, adminId, userId, payload) {
   return { userId };
 }
 
+function isOrderRefunded(order) {
+  return !!(order && order.refunded_at);
+}
+
+function orderRefundMoney(order) {
+  const currency = String(order?.currency || 'TWD').toUpperCase();
+  return `${currency} ${fmtNum(Number(order?.refund_amount || order?.amount || 0))}`;
+}
+
+async function refundOrderRecord(db, actorId, order, payload = {}) {
+  await ensureOrderPaymentSchema(db);
+  const orderId = String(order?.order_id || '').toUpperCase();
+  if (!orderId) throw new Error('找不到訂單');
+  if (isOrderRefunded(order)) throw new Error('此訂單已記錄退款');
+  if (!['paid', 'confirmed'].includes(order.status)) throw new Error('只有已付款或已確認訂單可記錄退款');
+
+  const orderAmount = Number(order.amount || 0);
+  const requestedAmount = asNumber(payload.amount ?? payload.refund_amount ?? payload.refundAmount, null);
+  const refundAmount = requestedAmount == null ? orderAmount : requestedAmount;
+  if (!Number.isFinite(refundAmount) || refundAmount <= 0) throw new Error('退款金額不正確');
+  if (orderAmount > 0 && refundAmount > orderAmount + 0.01) throw new Error('退款金額不可大於訂單金額');
+
+  const reason = String(payload.reason || payload.note || payload.refund_note || '人工退款').trim() || '人工退款';
+  const revokeAccess = boolAccepted(payload.revoke_access ?? payload.revokeAccess ?? payload.revoke ?? true);
+  const notify = payload.notify !== false;
+  const existingNote = String(order.payment_note || '').trim();
+  const refundLine = `退款：${orderRefundMoney({ ...order, refund_amount: refundAmount })}｜${reason}`;
+  const paymentNote = existingNote ? `${existingNote}\n${refundLine}` : refundLine;
+
+  const user = await getUser(db, order.user_id);
+  const userPatch = {};
+  if (order.status === 'confirmed') {
+    userPatch.total_spent = Math.max(0, Number(user.total_spent || 0) - refundAmount);
+  }
+
+  let accessRevoked = false;
+  let revokeNote = '既有會員權限未異動';
+  if (revokeAccess && order.status === 'confirmed') {
+    const laterOrder = order.created_at ? await db.prepare(`
+      SELECT order_id FROM orders
+      WHERE user_id = ?
+        AND order_id <> ?
+        AND status = 'confirmed'
+        AND refunded_at IS NULL
+        AND datetime(created_at) > datetime(?)
+      ORDER BY created_at DESC LIMIT 1
+    `).bind(order.user_id, orderId, order.created_at).first() : null;
+    if (!laterOrder && String(user.tier || '') === String(order.tier || '')) {
+      userPatch.tier = 'free';
+      userPatch.tier_expires_at = null;
+      accessRevoked = true;
+      revokeNote = '會員權限已同步停用';
+    } else if (laterOrder) {
+      revokeNote = `偵測到較新的已確認訂單 ${laterOrder.order_id}，會員權限保留`;
+    } else {
+      revokeNote = '會員目前方案不同，權限保留';
+    }
+  }
+  if (Object.keys(userPatch).length) await updateUser(db, order.user_id, userPatch);
+
+  await db.prepare(`
+    UPDATE orders
+    SET status = 'cancelled',
+        refunded_at = datetime('now'),
+        refund_amount = ?,
+        refund_note = ?,
+        refunded_by = ?,
+        payment_note = ?
+    WHERE order_id = ?
+  `).bind(refundAmount, reason, String(actorId || ''), paymentNote, orderId).run();
+
+  await recordOrderEvent(db, orderId, order.user_id, 'refunded', actorId, `退款 ${orderRefundMoney({ ...order, refund_amount: refundAmount })}｜${reason}`, {
+    amount: refundAmount,
+    currency: String(order.currency || 'TWD').toUpperCase(),
+    previousStatus: order.status,
+    revokeAccess,
+    accessRevoked
+  });
+
+  if (notify) {
+    await sendMemberNotice(order.user_id, [
+      '💸 <b>訂單已記錄退款</b>',
+      '',
+      `訂單：<code>${escHtml(orderId)}</code>`,
+      `金額：<b>${escHtml(orderRefundMoney({ ...order, refund_amount: refundAmount }))}</b>`,
+      `原因：${escHtml(reason)}`,
+      `會員權限：${escHtml(revokeNote)}`
+    ].join('\n'), {
+      inline_keyboard: [
+        [{ text: '查看訂單', callback_data: `u_order_${orderId}` }],
+        [{ text: '我的訂單', callback_data: 'u_orders' }]
+      ]
+    });
+  }
+
+  await logAction(db, actorId, payload.action || 'order_refund', orderId, `${refundAmount} ${reason}`);
+  return { orderId, status: 'refunded', refundAmount, accessRevoked, note: revokeNote };
+}
+
 async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}) {
   const normalizedOrderId = String(orderId || '').toUpperCase();
   const order = await db.prepare('SELECT * FROM orders WHERE order_id = ?').bind(normalizedOrderId).first();
   if (!order) throw new Error('找不到訂單');
 
   if (action === 'confirm') {
+    if (isOrderRefunded(order)) throw new Error('此訂單已退款，無法確認');
     return confirmOrderRecord(db, adminId, order, {
       notify: payload.notify,
       paymentMethod: order.payment_method || 'manual',
@@ -3687,6 +3823,13 @@ async function handleAdminOrderAction(db, adminId, orderId, action, payload = {}
     if (payload.notify !== false) await sendMemberNotice(order.user_id, `❌ <b>訂單已取消</b>\n\n訂單：${normalizedOrderId}\n原因：${reason}`);
     await logAction(db, adminId, 'web_order_reject', normalizedOrderId, reason);
     return { orderId: normalizedOrderId, status: 'rejected' };
+  }
+
+  if (action === 'refund') {
+    return refundOrderRecord(db, adminId, order, {
+      ...payload,
+      action: 'web_order_refund'
+    });
   }
 
   throw new Error('不支援的訂單操作');
@@ -3777,12 +3920,17 @@ async function ensureOrderPaymentSchema(db) {
   await addColumnIfMissing(db, 'orders', 'payment_url', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'currency', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'paid_at', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'refunded_at', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'refund_amount', 'REAL');
+  await addColumnIfMissing(db, 'orders', 'refund_note', 'TEXT');
+  await addColumnIfMissing(db, 'orders', 'refunded_by', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'terms_version', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'terms_accepted_at', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'risk_acknowledged_at', 'TEXT');
   await addColumnIfMissing(db, 'orders', 'terms_client_hash', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_payment_session ON orders(payment_session_id)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_orders_refunded_at ON orders(refunded_at)').run();
   await ensureOrderEventSchema(db);
 }
 
@@ -4357,6 +4505,7 @@ async function confirmOrderRecord(db, actorId, order, options = {}) {
   if (!order) throw new Error('找不到訂單');
   const orderId = String(order.order_id || order.orderId || '').toUpperCase();
   if (!orderId) throw new Error('訂單缺少編號');
+  if (isOrderRefunded(order)) throw new Error('此訂單已退款，無法確認');
   if (order.status === 'confirmed') return { orderId, status: 'confirmed' };
 
   const expires = new Date(Date.now() + Number(order.days || 0) * 86400000).toISOString();
@@ -4705,7 +4854,8 @@ async function getMemberBootstrap(db, userId, env = {}) {
 
   const orders = (await db.prepare(`
     SELECT order_id, tier, months, days, amount, status, payment_method, payment_provider, payment_url, payment_note, currency,
-           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, created_at, confirmed_at
+           terms_version, terms_accepted_at, risk_acknowledged_at, paid_at, refunded_at, refund_amount, refund_note,
+           created_at, confirmed_at
     FROM orders WHERE user_id = ?
     ORDER BY created_at DESC LIMIT 10
   `).bind(userId).all()).results || [];
@@ -4879,6 +5029,7 @@ async function updateMemberOrderStatus(db, userId, orderId, action, payload = {}
   const normalizedOrderId = String(orderId || '').trim().toUpperCase();
   const order = await db.prepare('SELECT * FROM orders WHERE order_id = ? AND user_id = ?').bind(normalizedOrderId, userId).first();
   if (!order) throw new Error('找不到訂單');
+  if (isOrderRefunded(order)) throw new Error('此訂單已退款，無法再操作');
 
   if (action === 'paid') {
     if (!['pending', 'paid'].includes(order.status)) throw new Error('此訂單狀態無法通知付款');
@@ -4925,7 +5076,8 @@ function memberOrderEventLabel(type) {
     stripe_skipped: 'Stripe 尚未付款',
     confirmed: '訂單確認',
     rejected: '訂單拒絕',
-    cancelled: '訂單取消'
+    cancelled: '訂單取消',
+    refunded: '訂單退款'
   };
   return map[type] || type || '紀錄';
 }
@@ -4989,9 +5141,17 @@ function renderMemberReceiptShell(title, body, status = 200) {
 }
 
 function renderMemberReceiptPage(order, events = []) {
-  const statusTone = order.status === 'confirmed' ? 'green' : order.status === 'paid' || order.status === 'pending' ? 'amber' : 'red';
-  const title = order.status === 'confirmed' ? '付款收據' : '訂單明細';
+  const statusTone = order.refunded_at ? 'red' : order.status === 'confirmed' ? 'green' : order.status === 'paid' || order.status === 'pending' ? 'amber' : 'red';
+  const title = order.refunded_at ? '退款收據' : order.status === 'confirmed' ? '付款收據' : '訂單明細';
   const note = order.payment_note ? `<div class="section"><h2>付款備註</h2><div class="note">${escHtml(order.payment_note)}</div></div>` : '';
+  const refund = order.refunded_at ? `
+        <section class="summary">
+          ${receiptInfoRow('退款金額', orderRefundMoney(order))}
+          ${receiptInfoRow('退款時間', memberReceiptDate(order.refunded_at))}
+          ${receiptInfoRow('退款處理人', order.refunded_by || '-')}
+        </section>
+        <section class="section"><h2>退款原因</h2><div class="note">${escHtml(order.refund_note || '人工退款')}</div></section>
+  ` : '';
   const timeline = events.length ? events.map((event) => `
       <div class="event"><strong>${escHtml(memberOrderEventLabel(event.event_type))}</strong><span>${escHtml(memberReceiptDate(event.created_at))}${event.actor_id ? ` · ${escHtml(event.actor_id)}` : ''}${event.message ? `<br>${escHtml(event.message)}` : ''}</span></div>
     `).join('') : '<div class="muted">尚無事件紀錄。</div>';
@@ -5000,7 +5160,7 @@ function renderMemberReceiptPage(order, events = []) {
     <article class="receipt">
       <header>
         <div class="brand"><div class="mark">DC</div><div><h1>DC Trading Signals ${escHtml(title)}</h1><p class="muted">訂單 ${escHtml(order.order_id)}</p></div></div>
-        <span class="chip ${statusTone}">${escHtml(memberOrderStatusLabel(order.status))}</span>
+        <span class="chip ${statusTone}">${escHtml(memberOrderDisplayStatus(order))}</span>
       </header>
       <div class="body">
         <section class="summary">
@@ -5016,6 +5176,7 @@ function renderMemberReceiptPage(order, events = []) {
           ${receiptInfoRow('同意條款時間', memberReceiptDate(order.terms_accepted_at))}
           ${receiptInfoRow('風險揭露時間', memberReceiptDate(order.risk_acknowledged_at))}
         </section>
+        ${refund}
         ${note}
         <section class="section"><h2>訂單流程</h2><div class="timeline">${timeline}</div></section>
         <div class="actions"><a class="btn primary" href="/member">返回會員中心</a><button class="btn" type="button" onclick="window.print()">列印 / 另存 PDF</button></div>
@@ -5626,7 +5787,7 @@ function orderStatusText(status){
   return status==='pending'?'待付款':status==='paid'?'待確認':status==='confirmed'?'已確認':status==='rejected'?'已拒絕':status==='cancelled'?'已取消':status;
 }
 function orderEventText(type){
-  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消' };
+  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消', refunded:'已退款' };
   return map[type] || type || '紀錄';
 }
 function orderTimeline(events){
@@ -5643,11 +5804,13 @@ function paymentNoteHtml(note){
 function renderOrder(o){
   var actions = '';
   var method = o.payment_provider || o.payment_method || 'manual';
+  var refunded = !!o.refunded_at;
   var terms = o.terms_accepted_at ? '<div class="muted">條款版本 '+esc(o.terms_version || '-')+' · 同意 '+dateText(o.terms_accepted_at)+'</div>' : '';
+  var refund = refunded ? '<div class="muted">退款 '+money(o.refund_amount || o.amount)+' · '+dateText(o.refunded_at)+(o.refund_note?' · '+esc(o.refund_note):'')+'</div>' : '';
   var receipt = '<a class="btn ghost" target="_blank" rel="noopener" href="/member/receipt/'+encodeURIComponent(o.order_id)+'">訂單明細</a>';
-  if(o.status === 'pending' && method === 'stripe') actions =
+  if(!refunded && o.status === 'pending' && method === 'stripe') actions =
     '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
-  if(o.status === 'pending' && method !== 'stripe') actions =
+  if(!refunded && o.status === 'pending' && method !== 'stripe') actions =
     '<div class="proof-grid">'+
       '<div><label>付款人</label><input data-proof="payer_name" placeholder="轉帳戶名"></div>'+
       '<div><label>帳號後五碼</label><input data-proof="transfer_last5" inputmode="numeric" placeholder="例如 12345"></div>'+
@@ -5655,12 +5818,13 @@ function renderOrder(o){
       '<div><label>備註</label><input data-proof="note" placeholder="可填銀行、截圖連結等"></div>'+
     '</div>'+
     '<div class="order-actions"><button class="btn primary" data-order-paid="'+esc(o.order_id)+'">我已付款</button><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
-  if(o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
+  if(!refunded && o.status === 'paid') actions = '<div class="order-actions"><button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
   if(!actions) actions = '<div class="order-actions">'+receipt+'</div>';
   return '<article class="order-card">'+
-    '<div>'+chip(orderStatusText(o.status), orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
+    '<div>'+chip(refunded ? '已退款' : orderStatusText(o.status), refunded ? 'red' : orderTone(o.status))+' <b>'+esc(o.order_id)+'</b></div>'+
     '<div class="muted">'+esc(String(o.tier || '').toUpperCase())+' '+esc(o.months)+' 月 · '+money(o.amount)+' · '+esc(method === 'stripe' ? '線上付款' : '轉帳')+' · '+dateText(o.created_at)+'</div>'+
     terms+
+    refund+
     paymentNoteHtml(o.payment_note)+
     orderTimeline(o.events)+
     actions+
@@ -7131,7 +7295,7 @@ function renderSignals() {
   document.getElementById('signalsCards').innerHTML = signals.map(signalCard).join('') || '<div class="muted">尚無訊號</div>';
 }
 function orderEventLabel(type) {
-  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消' };
+  var map = { created:'建立', stripe_session_created:'Checkout', stripe_session_failed:'Checkout 失敗', paid_notice:'付款通知', stripe_skipped:'Stripe 待付款', confirmed:'已確認', rejected:'已拒絕', cancelled:'已取消', refunded:'已退款' };
   return map[type] || type || '紀錄';
 }
 function latestOrderEvent(orderId) {
@@ -7145,20 +7309,22 @@ function adminUserName(user) {
 }
 function orderRow(order, compact) {
   var user = adminUserName(order);
-  var tone = order.status === 'paid' ? 'amber' : order.status === 'confirmed' ? 'green' : order.status === 'rejected' ? 'red' : '';
-  var actions = order.status === 'pending' || order.status === 'paid'
-    ? '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>'
-    : '';
+  var refunded = !!order.refunded_at;
+  var tone = refunded ? 'red' : order.status === 'paid' ? 'amber' : order.status === 'confirmed' ? 'green' : order.status === 'rejected' || order.status === 'cancelled' ? 'red' : '';
+  var actions = '';
+  if (!refunded && (order.status === 'pending' || order.status === 'paid')) actions += '<button class="btn primary" data-confirm-order="' + esc(order.order_id) + '">確認</button><button class="btn danger" data-reject-order="' + esc(order.order_id) + '">拒絕</button>';
+  if (!refunded && (order.status === 'paid' || order.status === 'confirmed')) actions += '<button class="btn danger" data-refund-order="' + esc(order.order_id) + '">退款</button>';
   var method = order.payment_provider || order.payment_method || 'manual';
   var session = order.payment_session_id ? '<div class="muted"><code>' + esc(order.payment_session_id) + '</code></div>' : '';
   var lastEvent = latestOrderEvent(order.order_id);
   var eventHtml = lastEvent ? '<div class="order-event"><b>' + esc(orderEventLabel(lastEvent.event_type)) + '</b> ' + esc(dateText(lastEvent.created_at)) + (lastEvent.message ? '<br>' + esc(lastEvent.message) : '') + '</div>' : '';
   var terms = order.terms_accepted_at ? '<div class="muted">條款 ' + esc(order.terms_version || '-') + ' · ' + esc(dateText(order.terms_accepted_at)) + '</div>' : '<div class="muted">條款：未記錄</div>';
-  var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + terms + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
+  var refund = refunded ? '<div><b>退款</b> ' + money(order.refund_amount || order.amount) + ' · ' + esc(dateText(order.refunded_at)) + (order.refund_note ? '<br>' + esc(order.refund_note) : '') + '</div>' : '';
+  var note = (method === 'stripe' ? '<b>Stripe</b>' + session : '') + terms + refund + (order.payment_note ? '<div>' + esc(order.payment_note).replace(/\\n/g, '<br>') + '</div>' : '');
   note += eventHtml;
   if (!note) note = '<span class="muted">-</span>';
   if (compact) return '<tr><td><code>' + esc(order.order_id) + '</code><div class="note-cell">' + note + '</div></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="actions">' + actions + '</td></tr>';
-  return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
+  return '<tr><td>' + esc(dateText(order.created_at)) + '</td><td><code>' + esc(order.order_id) + '</code></td><td>' + esc(user) + '</td><td>' + esc(order.tier) + ' ' + esc(order.months) + '月</td><td>' + money(order.amount) + '</td><td class="note-cell">' + note + '</td><td>' + chip(refunded ? '已退款' : order.status, tone) + '</td><td class="actions">' + actions + '</td></tr>';
 }
 function renderOrders() {
   var orders = state.data.orders || [];
@@ -7517,6 +7683,26 @@ document.body.addEventListener('click', async function (event) {
     if (confirmOrder) { var orderOk = await confirmAdminAction('確認訂單', '確認後會延長會員期限並通知用戶。', '確認入帳', 'primary'); if (!orderOk) return; await api('/api/admin/orders/' + encodeURIComponent(confirmOrder.dataset.confirmOrder) + '/confirm', { method: 'POST', body: '{}' }); await load(); }
     var rejectOrder = event.target.closest('[data-reject-order]');
     if (rejectOrder) { var reject = await adminDialog({ title: '拒絕訂單', body: '拒絕後會通知用戶原因。', confirmText: '拒絕訂單', tone: 'danger', fields: [{ name: 'reason', label: '拒絕原因', value: '付款未確認' }] }); if (!reject) return; await api('/api/admin/orders/' + encodeURIComponent(rejectOrder.dataset.rejectOrder) + '/reject', { method: 'POST', body: JSON.stringify({ reason: reject.reason }) }); await load(); }
+    var refundOrder = event.target.closest('[data-refund-order]');
+    if (refundOrder) {
+      var refundId = refundOrder.dataset.refundOrder;
+      var refundTarget = (state.data.orders || []).find(function (order) { return String(order.order_id || '') === String(refundId || ''); }) || {};
+      var refund = await adminDialog({
+        title: '記錄退款',
+        body: '退款會留下訂單事件與會員通知，可選擇是否同步停用會員權限。',
+        confirmText: '記錄退款',
+        tone: 'danger',
+        fields: [
+          { name: 'amount', label: '退款金額', inputmode: 'decimal', value: refundTarget.amount || '' },
+          { name: 'reason', label: '退款原因', type: 'textarea', value: '人工退款' },
+          { name: 'revoke_access', label: '同步停用此訂單會員權限', type: 'checkbox', checked: true },
+          { name: 'notify', label: '通知 Telegram 會員', type: 'checkbox', checked: true }
+        ]
+      });
+      if (!refund) return;
+      await api('/api/admin/orders/' + encodeURIComponent(refundId) + '/refund', { method: 'POST', body: JSON.stringify({ amount: Number(refund.amount), reason: refund.reason, revoke_access: refund.revoke_access, notify: refund.notify }) });
+      await load();
+    }
     var userTier = event.target.closest('[data-user-tier]');
     if (userTier) { var parts = userTier.dataset.userTier.split('|'); var tierOk = await confirmAdminAction('調整會員等級', '將此用戶升級為 ' + parts[1].toUpperCase() + ' 並增加 30 天。', '套用', 'primary'); if (!tierOk) return; await api('/api/admin/users/' + encodeURIComponent(parts[0]), { method: 'POST', body: JSON.stringify({ tier: parts[1], days: 30 }) }); await load(); }
     var userBan = event.target.closest('[data-user-ban]');

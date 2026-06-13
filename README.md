@@ -19,6 +19,7 @@
 - **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊、登入與修改密碼，並保留 Telegram 登入碼與 Google / LINE OAuth
 - **🧾 訂單明細與條款紀錄** - 付費下單前記錄條款與風險揭露版本，會員可回看訂單明細/收據
 - **💳 Telegram 訂單查詢** - 會員可用 `/myorders` 與 `/receipt` 查詢付款狀態、流程與收據入口
+- **💸 售後退款紀錄** - 後台與 Telegram 管理指令可記錄人工退款、同步會員權限並留下事件軌跡
 - **🔗 TradingView 綁定** - 多來源 webhook、策略自動選擇與點位推算
 
 ## 💎 會員等級
@@ -163,7 +164,7 @@ https://your-worker.workers.dev/auth/line/callback
 
 ### 3c. 選配 Stripe 線上付款
 
-會員中心會保留轉帳付款；`STRIPE_SECRET_KEY` 與 `STRIPE_WEBHOOK_SECRET` 都設定完成後，才會額外顯示「線上付款」並透過 Checkout 自動確認訂單。
+會員中心會保留轉帳付款；`STRIPE_SECRET_KEY` 與 `STRIPE_WEBHOOK_SECRET` 都設定完成後，才會額外顯示「線上付款」並透過 Checkout 自動確認訂單。退款目前是人工退款紀錄與會員權限同步，不會自動呼叫 Stripe Refund API。
 
 ```bash
 wrangler secret put STRIPE_SECRET_KEY
