@@ -333,7 +333,38 @@ CREATE TABLE order_events (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 10b. 會員中心一次性登入碼 (member_login_codes)
+-- 10b. 客服工單 (support_tickets)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS support_tickets;
+CREATE TABLE support_tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT UNIQUE NOT NULL,
+  user_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  message TEXT NOT NULL,
+  status TEXT DEFAULT 'open' CHECK(status IN ('open', 'pending', 'closed')),
+  priority TEXT DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
+  last_reply TEXT,
+  last_actor_id TEXT,
+  closed_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+DROP TABLE IF EXISTS support_replies;
+CREATE TABLE support_replies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT NOT NULL,
+  actor_type TEXT NOT NULL CHECK(actor_type IN ('user', 'admin', 'system')),
+  actor_id TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (ticket_id) REFERENCES support_tickets(ticket_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 10c. 會員中心一次性登入碼 (member_login_codes)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS member_login_codes;
 CREATE TABLE member_login_codes (
@@ -347,7 +378,7 @@ CREATE TABLE member_login_codes (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 10c. 會員中心第三方登入身份 (member_oauth_identities)
+-- 10d. 會員中心第三方登入身份 (member_oauth_identities)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS member_oauth_identities;
 CREATE TABLE member_oauth_identities (
@@ -366,7 +397,7 @@ CREATE TABLE member_oauth_identities (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 10d. 會員中心網站帳號 (member_password_accounts)
+-- 10e. 會員中心網站帳號 (member_password_accounts)
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS member_password_accounts;
 CREATE TABLE member_password_accounts (
@@ -496,6 +527,9 @@ CREATE INDEX idx_orders_payment_provider ON orders(payment_provider);
 CREATE INDEX idx_orders_payment_session ON orders(payment_session_id);
 CREATE INDEX idx_order_events_order ON order_events(order_id, created_at);
 CREATE INDEX idx_order_events_created ON order_events(created_at);
+CREATE INDEX idx_support_tickets_user ON support_tickets(user_id, created_at);
+CREATE INDEX idx_support_tickets_status ON support_tickets(status, updated_at);
+CREATE INDEX idx_support_replies_ticket ON support_replies(ticket_id, created_at);
 CREATE INDEX idx_member_login_codes_user ON member_login_codes(user_id, created_at);
 CREATE INDEX idx_member_login_codes_expires ON member_login_codes(expires_at);
 CREATE INDEX idx_member_oauth_user ON member_oauth_identities(user_id);

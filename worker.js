@@ -71,6 +71,7 @@ const html = (body, status = 200, headers = {}) => new Response(body, {
 const genUID = () => Date.now().toString(36).toUpperCase() + Math.random().toString(36).substr(2, 4).toUpperCase();
 const genRef = () => 'DC' + Math.random().toString(36).substr(2, 6).toUpperCase();
 const genOrderId = () => 'ORD' + Date.now().toString(36).toUpperCase();
+const genTicketId = () => 'TKT' + Date.now().toString(36).toUpperCase();
 const isAdmin = (id) => CONFIG.ADMIN_IDS.includes(String(id));
 const tierName = (t) => (CONFIG.TIERS[t]?.emoji || '👤') + ' ' + (CONFIG.TIERS[t]?.name || '免費會員');
 const tierEmoji = (t) => CONFIG.TIERS[t]?.emoji || '👤';
@@ -1764,9 +1765,43 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     let m = `<b>聯繫客服</b>\n\n`;
     m += `Telegram：${tg}\n`;
     if (line) m += `LINE：${line}\n`;
-    m += `\n我們會盡快回覆您！`;
+    m += `\n也可直接使用：\n<code>/support 你的問題</code>\n系統會建立客服工單並通知管理員。`;
     
-    return sendTg(cid, m);
+    return sendTg(cid, m, {
+      inline_keyboard: [[{ text: '我的工單', callback_data: 'u_tickets' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+    });
+  }
+
+  if (cmd === '/support') {
+    const message = args.join(' ').trim();
+    if (!message) {
+      return sendTg(cid, `<b>客服工單</b>\n\n用法：\n<code>/support 我遇到的問題...</code>\n\n提交後管理員會收到通知，並可直接回覆您。`, {
+        inline_keyboard: [[{ text: '我的工單', callback_data: 'u_tickets' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+      });
+    }
+    const ticket = await createSupportTicket(db, env, uid, { message }, 'telegram');
+    return sendTg(cid, `✅ <b>客服工單已建立</b>\n\n工單：<code>${ticket.ticketId}</code>\n主旨：${escHtml(ticket.subject)}\n狀態：${supportStatusLabel(ticket.status)}\n\n管理員回覆後會通知您。`, {
+      inline_keyboard: [[{ text: '我的工單', callback_data: 'u_tickets' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+    });
+  }
+
+  if (cmd === '/mytickets' || cmd === '/tickets') {
+    const tickets = await getMemberSupportTickets(db, uid, 8);
+    let m = `<b>我的客服工單</b>\n\n`;
+    if (!tickets.length) {
+      m += `目前沒有工單。\n\n使用 <code>/support 你的問題</code> 建立客服工單。`;
+    } else {
+      for (const ticket of tickets) {
+        m += `${ticket.status === 'closed' ? '✅' : ticket.status === 'pending' ? '💬' : '📨'} <code>${ticket.ticket_id}</code> · ${escHtml(supportStatusLabel(ticket.status))}\n`;
+        m += `${escHtml(ticket.subject)}\n`;
+        m += `更新：${escHtml(memberReceiptDate(ticket.updated_at))}\n`;
+        if (ticket.last_reply) m += `${escHtml(ticket.last_reply).slice(0, 120)}\n`;
+        m += `\n`;
+      }
+    }
+    return sendTg(cid, m.trim(), {
+      inline_keyboard: [[{ text: '聯繫客服', callback_data: 'u_contact' }], [{ text: '« 返回', callback_data: 'u_menu' }]]
+    });
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1780,7 +1815,9 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     m += `/login - 會員中心登入碼\n`;
     m += `/status - 會員狀態\n`;
     m += `/plans - 方案介紹\n`;
-    m += `/contact - 聯繫客服\n\n`;
+    m += `/contact - 聯繫客服\n`;
+    m += `/support [問題] - 建立客服工單\n`;
+    m += `/mytickets - 我的客服工單\n\n`;
     
     m += `🎯 <b>訂閱設定</b>\n`;
     m += `/subscribe - 選擇訂閱品種\n`;
@@ -2046,6 +2083,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'u_invite') return handleUserCommand(cid, uid, '/invite', [], env);
   if (data === 'u_contact') return handleUserCommand(cid, uid, '/contact', [], env);
   if (data === 'u_help') return handleUserCommand(cid, uid, '/help', [], env);
+  if (data === 'u_tickets') return handleUserCommand(cid, uid, '/mytickets', [], env);
   if (data === 'u_checkin') return handleUserCommand(cid, uid, '/checkin', [], env);
   if (data === 'u_trial') return handleUserCommand(cid, uid, '/trial', [], env);
   if (data === 'u_points') return handleUserCommand(cid, uid, '/points', [], env);
@@ -2589,9 +2627,10 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
         ],
         [
           { text: '💰 訂單', callback_data: 'a_orders' },
-          { text: '🩺 營運', callback_data: 'a_ops' }
+          { text: '客服', callback_data: 'a_tickets' }
         ],
         [
+          { text: '🩺 營運', callback_data: 'a_ops' },
           { text: '⚙️ 設定', callback_data: 'a_config' }
         ]
       ]
@@ -2738,6 +2777,42 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const message = args.slice(1).join(' ');
     const result = await sendMemberNotice(userId, `<b>管理員訊息</b>\n\n${escHtml(message)}`);
     return sendTg(cid, result?.ok ? `✅ 訊息已發送給 <code>${userId}</code>` : `❌ 發送失敗`);
+  }
+
+  if (cmd === '/tickets') {
+    const tickets = await getAdminSupportTickets(db, 12);
+    let m = `<b>客服工單</b>\n\n`;
+    if (!tickets.length) {
+      m += `目前沒有客服工單。`;
+    } else {
+      for (const ticket of tickets) {
+        const name = ticket.username ? `@${ticket.username}` : ticket.first_name || ticket.user_id;
+        const icon = ticket.status === 'closed' ? '✅' : ticket.status === 'pending' ? '💬' : '📨';
+        m += `${icon} <code>${ticket.ticket_id}</code> · ${escHtml(supportStatusLabel(ticket.status))} · ${escHtml(ticket.priority)}\n`;
+        m += `會員：${escHtml(name)} (${escHtml(ticket.tier || 'free')})\n`;
+        m += `主旨：${escHtml(ticket.subject)}\n`;
+        m += `更新：${escHtml(memberReceiptDate(ticket.updated_at))}\n\n`;
+      }
+      m += `回覆：/reply [工單ID] [內容]\n`;
+      m += `結案：/closeticket [工單ID] [原因]`;
+    }
+    return sendTg(cid, m);
+  }
+
+  if (cmd === '/reply') {
+    if (args.length < 2) return sendTg(cid, `用法：/reply [工單ID] [回覆內容]`);
+    const ticketId = args[0].toUpperCase();
+    const message = args.slice(1).join(' ');
+    await replySupportTicket(db, env, uid, ticketId, message);
+    return sendTg(cid, `✅ 已回覆工單 <code>${ticketId}</code>`);
+  }
+
+  if (cmd === '/closeticket') {
+    if (!args[0]) return sendTg(cid, `用法：/closeticket [工單ID] [原因]`);
+    const ticketId = args[0].toUpperCase();
+    const reason = args.slice(1).join(' ') || '客服已結案';
+    await closeSupportTicket(db, env, uid, ticketId, reason);
+    return sendTg(cid, `✅ 已結案工單 <code>${ticketId}</code>`);
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2915,6 +2990,7 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     m += `/bc /announce /update /alert\n\n`;
     m += `<b>管理</b>\n`;
     m += `/users /user /pro /vip /adddays\n`;
+    m += `/tickets /reply /closeticket\n`;
     m += `/orders /confirm /reject /refund\n`;
     m += `/revenue /arpu /churn /lifetime\n`;
     m += `/dash /ops /perf /config`;
@@ -2957,6 +3033,7 @@ async function handleAdminCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'a_users') return handleAdminCommand(cid, uid, '/users', [], '', env);
   if (data === 'a_perf') return handleAdminCommand(cid, uid, '/perf', ['7'], '', env);
   if (data === 'a_orders') return handleAdminCommand(cid, uid, '/orders', [], '', env);
+  if (data === 'a_tickets') return handleAdminCommand(cid, uid, '/tickets', [], '', env);
   if (data === 'a_ops') return handleAdminCommand(cid, uid, '/ops', [], '', env);
   if (data === 'a_config') return handleAdminCommand(cid, uid, '/config', [], '', env);
   
@@ -3591,10 +3668,11 @@ async function getAdminBootstrap(db, env = {}) {
   const startedAt = Date.now();
   await ensureAdminSchema(db);
   await ensureOrderPaymentSchema(db);
+  await ensureSupportSchema(db);
 
   const [
     totalUsers, proUsers, vipUsers, todaySignals, activeSignals, pendingOrders,
-    todayPerf, configRows, symbols, strategies, signals, orders, orderEvents, users, tvSources, tvLogs, finance
+    todayPerf, configRows, symbols, strategies, signals, orders, orderEvents, users, tvSources, tvLogs, finance, supportTickets, supportStats
   ] = await Promise.all([
     db.prepare('SELECT COUNT(*) as c FROM users').first(),
     db.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro' AND is_active = 1").first(),
@@ -3631,7 +3709,16 @@ async function getAdminBootstrap(db, env = {}) {
     `).all(),
     db.prepare('SELECT * FROM tradingview_sources ORDER BY created_at DESC').all(),
     db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT 30').all(),
-    getFinanceMetrics(db)
+    getFinanceMetrics(db),
+    getAdminSupportTickets(db, 40),
+    db.prepare(`
+      SELECT
+        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+        COUNT(*) AS total
+      FROM support_tickets
+    `).first()
   ]);
 
   const config = {};
@@ -3665,6 +3752,13 @@ async function getAdminBootstrap(db, env = {}) {
     integrations: ops.integrations,
     ops,
     finance,
+    supportTickets,
+    supportStats: {
+      open: Number(supportStats?.open || 0),
+      pending: Number(supportStats?.pending || 0),
+      closed: Number(supportStats?.closed || 0),
+      total: Number(supportStats?.total || 0)
+    },
     serverTime: fmtTime()
   };
 }
@@ -4160,6 +4254,38 @@ async function ensureOrderEventSchema(db) {
   `).run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, created_at)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_order_events_created ON order_events(created_at)').run();
+}
+
+async function ensureSupportSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id TEXT UNIQUE NOT NULL,
+      user_id TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      message TEXT NOT NULL,
+      status TEXT DEFAULT 'open' CHECK(status IN ('open', 'pending', 'closed')),
+      priority TEXT DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
+      last_reply TEXT,
+      last_actor_id TEXT,
+      closed_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS support_replies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id TEXT NOT NULL,
+      actor_type TEXT NOT NULL CHECK(actor_type IN ('user', 'admin', 'system')),
+      actor_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id, created_at)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status, updated_at)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_support_replies_ticket ON support_replies(ticket_id, created_at)').run();
 }
 
 async function recordOrderEvent(db, orderId, userId, eventType, actorId, message = '', metadata = null) {
@@ -5054,6 +5180,7 @@ async function getMemberSecurity(db, userId) {
 
 async function getMemberBootstrap(db, userId, env = {}) {
   await ensureOrderPaymentSchema(db);
+  await ensureSupportSchema(db);
   const user = await getUser(db, userId);
   const settings = await getUserSettings(db, userId);
   const symbols = (await db.prepare('SELECT * FROM symbols WHERE is_active = 1 ORDER BY sort_order, symbol').all()).results || [];
@@ -5108,6 +5235,7 @@ async function getMemberBootstrap(db, userId, env = {}) {
     signals,
     signalQuery: signalPayload.query,
     orders,
+    supportTickets: await getMemberSupportTickets(db, userId, 8),
     security: await getMemberSecurity(db, userId),
     plans: await getMemberPlans(db),
     payment: await getMemberPaymentInfo(db, env),
@@ -5441,6 +5569,203 @@ async function updateMemberSettings(db, userId, payload) {
   return { updated: Object.keys(data) };
 }
 
+function supportStatusLabel(status) {
+  const map = { open: '待回覆', pending: '已回覆', closed: '已結案' };
+  return map[status] || status || '-';
+}
+
+function supportPriority(value) {
+  const priority = String(value || 'normal').toLowerCase();
+  return ['low', 'normal', 'high', 'urgent'].includes(priority) ? priority : 'normal';
+}
+
+async function getMemberSupportTickets(db, userId, limit = 8) {
+  await ensureSupportSchema(db);
+  const rows = await db.prepare(`
+    SELECT ticket_id, subject, message, status, priority, last_reply, last_actor_id, closed_at, created_at, updated_at
+    FROM support_tickets
+    WHERE user_id = ?
+    ORDER BY datetime(updated_at) DESC
+    LIMIT ?
+  `).bind(userId, limit).all();
+  return attachSupportReplies(db, rows.results || [], 8);
+}
+
+async function getAdminSupportTickets(db, limit = 40) {
+  await ensureSupportSchema(db);
+  const rows = await db.prepare(`
+    SELECT t.*, u.username, u.first_name, u.tier
+    FROM support_tickets t
+    LEFT JOIN users u ON u.user_id = t.user_id
+    ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+             datetime(t.updated_at) DESC
+    LIMIT ?
+  `).bind(limit).all();
+  return attachSupportReplies(db, rows.results || [], 6);
+}
+
+async function attachSupportReplies(db, tickets, perTicket = 6) {
+  const ids = Array.from(new Set((tickets || []).map((ticket) => String(ticket.ticket_id || '').toUpperCase()).filter(Boolean)));
+  if (!ids.length) return tickets || [];
+  const rows = await db.prepare(`
+    SELECT ticket_id, actor_type, actor_id, message, created_at
+    FROM support_replies
+    WHERE ticket_id IN (${ids.map(() => '?').join(',')})
+    ORDER BY datetime(created_at) ASC
+    LIMIT ?
+  `).bind(...ids, Math.max(ids.length * perTicket, perTicket)).all();
+  const grouped = {};
+  for (const row of rows.results || []) {
+    const id = String(row.ticket_id || '').toUpperCase();
+    if (!grouped[id]) grouped[id] = [];
+    grouped[id].push(row);
+  }
+  return (tickets || []).map((ticket) => ({
+    ...ticket,
+    replies: (grouped[String(ticket.ticket_id || '').toUpperCase()] || []).slice(-perTicket)
+  }));
+}
+
+function supportSubjectFromMessage(message) {
+  return String(message || '').replace(/\s+/g, ' ').trim().slice(0, 42) || '客服問題';
+}
+
+async function createSupportTicket(db, env, userId, payload = {}, source = 'member-web') {
+  await ensureSupportSchema(db);
+  const message = String(payload.message || payload.text || payload.body || '').trim();
+  if (message.length < 4) throw new Error('請輸入客服問題內容');
+  if (message.length > 3000) throw new Error('客服問題最多 3000 字');
+  const subject = String(payload.subject || '').trim().slice(0, 80) || supportSubjectFromMessage(message);
+  const priority = supportPriority(payload.priority);
+  const ticketId = genTicketId();
+  await db.prepare(`
+    INSERT INTO support_tickets (ticket_id, user_id, subject, message, status, priority, last_reply, last_actor_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'open', ?, ?, ?, datetime('now'), datetime('now'))
+  `).bind(ticketId, userId, subject, message, priority, message, userId).run();
+  await db.prepare(`
+    INSERT INTO support_replies (ticket_id, actor_type, actor_id, message, created_at)
+    VALUES (?, 'user', ?, ?, datetime('now'))
+  `).bind(ticketId, userId, message).run();
+  const user = await getUser(db, userId);
+  for (const adminId of CONFIG.ADMIN_IDS) {
+    await sendTg(adminId, [
+      '📨 <b>新客服工單</b>',
+      '',
+      `工單：<code>${ticketId}</code>`,
+      `會員：${escHtml(formatUserLabel(user, userId))}`,
+      `等級：${tierName(user.tier || 'free')}`,
+      `主旨：${escHtml(subject)}`,
+      '',
+      escHtml(message),
+      '',
+      `回覆：/reply ${ticketId} 你的回覆`,
+      `結案：/closeticket ${ticketId} 原因`
+    ].join('\n'));
+  }
+  await logAction(db, userId, 'support_ticket_create', ticketId, source);
+  return { ticketId, subject, status: 'open', priority, created_at: fmtTime() };
+}
+
+async function replySupportTicket(db, env, adminId, ticketId, message) {
+  await ensureSupportSchema(db);
+  const id = String(ticketId || '').trim().toUpperCase();
+  const reply = String(message || '').trim();
+  if (!id) throw new Error('請輸入工單 ID');
+  if (reply.length < 2) throw new Error('請輸入回覆內容');
+  const ticket = await db.prepare('SELECT * FROM support_tickets WHERE ticket_id = ?').bind(id).first();
+  if (!ticket) throw new Error('找不到工單');
+  if (ticket.status === 'closed') throw new Error('工單已結案');
+  await db.prepare(`
+    INSERT INTO support_replies (ticket_id, actor_type, actor_id, message, created_at)
+    VALUES (?, 'admin', ?, ?, datetime('now'))
+  `).bind(id, String(adminId), reply).run();
+  await db.prepare(`
+    UPDATE support_tickets
+    SET status = 'pending',
+        last_reply = ?,
+        last_actor_id = ?,
+        updated_at = datetime('now')
+    WHERE ticket_id = ?
+  `).bind(reply, String(adminId), id).run();
+  await sendMemberNotice(ticket.user_id, [
+    '💬 <b>客服已回覆</b>',
+    '',
+    `工單：<code>${escHtml(id)}</code>`,
+    `主旨：${escHtml(ticket.subject)}`,
+    '',
+    escHtml(reply),
+    '',
+    '若仍需協助，請再次使用 /support 留下補充問題。'
+  ].join('\n'));
+  await logAction(db, adminId, 'support_ticket_reply', id, reply.slice(0, 200));
+  return { ticketId: id, status: 'pending' };
+}
+
+async function replyMemberSupportTicket(db, env, userId, ticketId, payload = {}) {
+  await ensureSupportSchema(db);
+  const id = String(ticketId || '').trim().toUpperCase();
+  const message = String(payload.message || payload.text || payload.body || '').trim();
+  if (!id) throw new Error('請輸入工單 ID');
+  if (message.length < 2) throw new Error('請輸入補充內容');
+  if (message.length > 3000) throw new Error('補充內容最多 3000 字');
+  const ticket = await db.prepare('SELECT * FROM support_tickets WHERE ticket_id = ? AND user_id = ?').bind(id, userId).first();
+  if (!ticket) throw new Error('找不到工單');
+  if (ticket.status === 'closed') throw new Error('工單已結案，請建立新工單');
+  await db.prepare(`
+    INSERT INTO support_replies (ticket_id, actor_type, actor_id, message, created_at)
+    VALUES (?, 'user', ?, ?, datetime('now'))
+  `).bind(id, userId, message).run();
+  await db.prepare(`
+    UPDATE support_tickets
+    SET status = 'open',
+        last_reply = ?,
+        last_actor_id = ?,
+        updated_at = datetime('now')
+    WHERE ticket_id = ?
+  `).bind(message, userId, id).run();
+  const user = await getUser(db, userId);
+  for (const adminId of CONFIG.ADMIN_IDS) {
+    await sendTg(adminId, [
+      '📨 <b>會員補充客服工單</b>',
+      '',
+      `工單：<code>${id}</code>`,
+      `會員：${escHtml(formatUserLabel(user, userId))}`,
+      `主旨：${escHtml(ticket.subject)}`,
+      '',
+      escHtml(message),
+      '',
+      `回覆：/reply ${id} 你的回覆`
+    ].join('\n'));
+  }
+  await logAction(db, userId, 'support_ticket_followup', id, message.slice(0, 200));
+  return { ticketId: id, status: 'open' };
+}
+
+async function closeSupportTicket(db, env, adminId, ticketId, reason = '') {
+  await ensureSupportSchema(db);
+  const id = String(ticketId || '').trim().toUpperCase();
+  if (!id) throw new Error('請輸入工單 ID');
+  const note = String(reason || '客服已結案').trim() || '客服已結案';
+  const ticket = await db.prepare('SELECT * FROM support_tickets WHERE ticket_id = ?').bind(id).first();
+  if (!ticket) throw new Error('找不到工單');
+  await db.prepare(`
+    UPDATE support_tickets
+    SET status = 'closed',
+        last_reply = ?,
+        last_actor_id = ?,
+        closed_at = COALESCE(closed_at, datetime('now')),
+        updated_at = datetime('now')
+    WHERE ticket_id = ?
+  `).bind(note, String(adminId), id).run();
+  await db.prepare(`
+    INSERT INTO support_replies (ticket_id, actor_type, actor_id, message, created_at)
+    VALUES (?, 'system', ?, ?, datetime('now'))
+  `).bind(id, String(adminId), note).run();
+  await sendMemberNotice(ticket.user_id, `✅ <b>客服工單已結案</b>\n\n工單：<code>${escHtml(id)}</code>\n原因：${escHtml(note)}`);
+  await logAction(db, adminId, 'support_ticket_close', id, note.slice(0, 200));
+  return { ticketId: id, status: 'closed' };
+}
+
 async function handleMemberApi(request, env, pathname) {
   const db = env.DB;
   const parts = pathname.split('/').filter(Boolean).slice(2);
@@ -5567,6 +5892,28 @@ async function handleMemberApi(request, env, pathname) {
       return json({ ok: true, data: await changeMemberPassword(db, session.userId, await readJsonBody(request)) });
     }
 
+    if (request.method === 'POST' && parts[0] === 'support' && parts.length === 1) {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_support_create', session.userId, requestClientIp(request)]),
+        5,
+        60 * 60,
+        '客服工單建立太頻繁，請稍後再試'
+      );
+      return json({ ok: true, data: await createSupportTicket(db, env, session.userId, await readJsonBody(request), 'member-web') });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'support' && parts[1] && parts[2] === 'reply') {
+      await enforceRateLimit(
+        db,
+        await rateKey(['member_support_reply', session.userId, requestClientIp(request)]),
+        12,
+        60 * 60,
+        '客服工單回覆太頻繁，請稍後再試'
+      );
+      return json({ ok: true, data: await replyMemberSupportTicket(db, env, session.userId, parts[1], await readJsonBody(request)) });
+    }
+
     if (request.method === 'POST' && parts[0] === 'orders' && parts.length === 1) {
       await enforceRateLimit(
         db,
@@ -5645,6 +5992,14 @@ function renderMemberPage() {
     .order-timeline { border-top:1px solid var(--line); padding-top:8px; display:grid; gap:5px; }
     .order-timeline div { display:grid; grid-template-columns:auto minmax(0,1fr); gap:8px; align-items:start; color:var(--muted); font-size:12px; line-height:1.4; }
     .order-timeline b { color:var(--ink); font-size:12px; white-space:nowrap; }
+    .support-thread { border-top:1px solid var(--line); padding-top:8px; display:grid; gap:7px; }
+    .support-msg { border:1px solid var(--line); border-radius:7px; padding:8px; background:#f8fafc; font-size:13px; line-height:1.45; }
+    .support-msg b { display:block; font-size:12px; margin-bottom:3px; color:var(--ink); }
+    .support-msg.admin { border-color:rgba(8,167,179,.28); background:#f4fbfc; }
+    .support-msg.system { border-color:rgba(183,121,31,.24); background:#fffdf5; }
+    .support-followup { border:1px solid var(--line); border-radius:8px; padding:9px; background:#fff; }
+    .support-followup summary { cursor:pointer; font-weight:900; }
+    .support-followup form { display:grid; gap:8px; margin-top:8px; }
     .proof-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .security-grid { display:grid; gap:9px; }
     .security-meta { display:grid; gap:6px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; font-size:13px; }
@@ -5666,7 +6021,8 @@ function renderMemberPage() {
     .signal-result { display:flex; gap:7px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:13px; }
     .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
     .full { grid-column:1/-1; }
-    input { width:100%; border:1px solid var(--line); border-radius:7px; min-height:40px; padding:8px 10px; }
+    input, textarea { width:100%; border:1px solid var(--line); border-radius:7px; min-height:40px; padding:8px 10px; }
+    textarea { min-height:92px; resize:vertical; }
     .check { display:flex; align-items:center; gap:8px; min-height:34px; color:var(--ink); font-size:14px; }
     .check input { width:auto; min-height:unset; }
     .login { min-height:70vh; display:grid; place-items:center; padding:20px; }
@@ -5761,6 +6117,7 @@ function renderMemberPage() {
         <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
         <section class="panel"><header><h3>帳號安全</h3></header><div class="body"><div id="securityBox" class="security-grid"></div></div></section>
         <section class="panel"><header><h3>訂單紀錄</h3></header><div class="body"><div class="stack" id="orders"></div></div></section>
+        <section class="panel"><header><h3>客服支援</h3></header><div class="body"><form id="supportForm" class="stack"><div><label>問題主旨</label><input name="subject" placeholder="例如：付款確認、訊號設定、帳號問題"></div><div><label>問題內容</label><textarea name="message" placeholder="請描述您遇到的狀況，客服會從後台或 Telegram 回覆。"></textarea></div><button class="btn primary" type="submit">送出客服工單</button></form><div class="stack" id="supportTickets"></div></div></section>
       </aside>
     </section>
   </main>
@@ -5964,6 +6321,35 @@ function renderSecurity(){
       '<div class="muted">此會員尚未設定網站密碼，請使用原本的 Telegram 登入碼或第三方登入。</div>'+
     '</div>';
 }
+function supportStatusText(status){
+  return status === 'open' ? '待回覆' : status === 'pending' ? '已回覆' : status === 'closed' ? '已結案' : (status || '-');
+}
+function supportTone(status){
+  return status === 'open' ? 'amber' : status === 'pending' ? 'green' : status === 'closed' ? '' : '';
+}
+function supportActorText(reply){
+  if(reply.actor_type === 'admin') return '客服';
+  if(reply.actor_type === 'system') return '系統';
+  return '我';
+}
+function renderSupport(){
+  var list = state.supportTickets || [];
+  document.getElementById('supportTickets').innerHTML = list.map(function(ticket){
+    var thread = (ticket.replies || []).map(function(reply){
+      return '<div class="support-msg '+esc(reply.actor_type || '')+'"><b>'+esc(supportActorText(reply))+' · '+dateText(reply.created_at)+'</b>'+esc(reply.message || '').replace(/\\n/g,'<br>')+'</div>';
+    }).join('');
+    var followup = ticket.status !== 'closed'
+      ? '<details class="support-followup"><summary>補充內容</summary><form data-ticket-followup="'+esc(ticket.ticket_id)+'"><textarea name="message" placeholder="補充目前狀況或付款資訊"></textarea><button class="btn primary" type="submit">送出補充</button></form></details>'
+      : '';
+    return '<article class="order-card">'+
+      '<div>'+chip(supportStatusText(ticket.status), supportTone(ticket.status))+' <b>'+esc(ticket.ticket_id)+'</b></div>'+
+      '<div><b>'+esc(ticket.subject || '客服問題')+'</b></div>'+
+      '<div class="muted">更新 '+dateText(ticket.updated_at)+' · '+esc(ticket.priority || 'normal')+'</div>'+
+      (thread ? '<div class="support-thread">'+thread+'</div>' : (ticket.last_reply ? '<div class="muted">'+esc(ticket.last_reply)+'</div>' : ''))+
+      followup+
+    '</article>';
+  }).join('') || '<div class="muted">尚無客服工單。</div>';
+}
 function renderPlans(){
   var plans = state.plans || {};
   var stripeEnabled = !!(state.payment && state.payment.stripeEnabled);
@@ -6087,6 +6473,7 @@ function render(){
   renderPlans();
   renderSettings();
   renderSecurity();
+  renderSupport();
   showCheckoutReturnToast();
 }
 document.getElementById('saveBtn').addEventListener('click', async function(){
@@ -6113,6 +6500,30 @@ document.getElementById('securityBox').addEventListener('submit', async function
     })});
     form.reset();
     showToast('密碼已更新');
+    await load();
+  }catch(err){ showToast(err.message,'error'); }
+});
+document.getElementById('supportForm').addEventListener('submit', async function(event){
+  event.preventDefault();
+  try{
+    var form = event.target;
+    var subject = form.elements.subject.value;
+    var message = form.elements.message.value;
+    await api('/api/member/support',{method:'POST',body:JSON.stringify({subject:subject,message:message})});
+    form.reset();
+    showToast('客服工單已送出');
+    await load();
+  }catch(err){ showToast(err.message,'error'); }
+});
+document.getElementById('supportTickets').addEventListener('submit', async function(event){
+  var form = event.target.closest('[data-ticket-followup]');
+  if(!form) return;
+  event.preventDefault();
+  try{
+    var message = form.elements.message.value;
+    await api('/api/member/support/'+encodeURIComponent(form.dataset.ticketFollowup)+'/reply',{method:'POST',body:JSON.stringify({message:message})});
+    form.reset();
+    showToast('補充內容已送出');
     await load();
   }catch(err){ showToast(err.message,'error'); }
 });
@@ -6740,6 +7151,16 @@ async function handleAdminApi(request, env, pathname) {
       return json({ ok: true, data: await handleAdminOrderAction(db, adminId, parts[1], parts[2], await readJsonBody(request)) });
     }
 
+    if (request.method === 'POST' && parts[0] === 'support' && parts[1] && parts[2] === 'reply') {
+      const body = await readJsonBody(request);
+      return json({ ok: true, data: await replySupportTicket(db, env, adminId, parts[1], body.message || body.reply || '') });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'support' && parts[1] && parts[2] === 'close') {
+      const body = await readJsonBody(request);
+      return json({ ok: true, data: await closeSupportTicket(db, env, adminId, parts[1], body.reason || body.message || '') });
+    }
+
     return json({ ok: false, error: 'Not found' }, 404);
   } catch (e) {
     return json({ ok: false, error: e.message }, 400);
@@ -6897,6 +7318,11 @@ function renderAdminPage() {
     .source-meta span { display:block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
     .note-cell { min-width: 160px; white-space: normal; color: var(--muted); font-size: 12px; line-height: 1.45; }
     .order-event { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .ticket-thread { display:grid; gap: 5px; min-width: 180px; max-width: 340px; }
+    .ticket-msg { border:1px solid var(--line); border-radius:6px; background:#f8fafc; padding:7px; color:var(--muted); font-size:12px; line-height:1.45; }
+    .ticket-msg b { display:block; color:var(--ink); font-size:11px; margin-bottom:2px; }
+    .ticket-msg.admin { border-color:rgba(18,198,208,.28); background:#f4fbfc; }
+    .ticket-msg.system { border-color:rgba(183,121,31,.22); background:#fffdf5; }
     .order-event b { color: var(--ink); }
     .copy-row { display:flex; gap: 8px; align-items:center; min-width:0; }
     .copy-row code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:8px; font-size: 12px; }
@@ -6995,6 +7421,7 @@ function renderAdminPage() {
         <button data-view="symbols" data-icon="▦">品種管理</button>
         <button data-view="users" data-icon="◎">會員管理</button>
         <button data-view="orders" data-icon="$">訂單管理</button>
+        <button data-view="support" data-icon="?">客服工單</button>
         <button data-view="billing" data-icon="⚙">收費設定</button>
       </nav>
       <div class="admin-foot"><strong>Dan_mix</strong><span>超級管理員</span></div>
@@ -7042,6 +7469,7 @@ function renderAdminPage() {
         <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
         <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 50 位用戶</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
         <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>付款備註</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
+        <div class="view" id="view-support"><section class="panel"><header><div><h2>客服工單</h2><p>會員問題、付款協助與售後追蹤</p></div><div id="supportBadge"></div></header><div class="table-wrap"><table><thead><tr><th>更新</th><th>工單</th><th>會員</th><th>主旨</th><th>最近內容</th><th>狀態</th><th></th></tr></thead><tbody id="supportTable"></tbody></table></div></section></div>
         <div class="view" id="view-billing"><section class="panel"><header><h2>收費、付款與系統設定</h2></header><div class="body">${renderConfigFormHtml()}</div></section></div>
         <div class="message" id="message"></div>
       </section>
@@ -7056,6 +7484,7 @@ function renderAdminPage() {
 	    <button data-view-target="symbols" data-icon="▦">品種</button>
 	    <button data-view-target="users" data-icon="◎">會員</button>
 	    <button data-view-target="orders" data-icon="$">訂單</button>
+	    <button data-view-target="support" data-icon="?">客服</button>
 	    <button data-view-target="billing" data-icon="⚙">收費</button>
 	  </nav>
   <script>${renderAdminScript()}</script>
@@ -7267,6 +7696,7 @@ function renderAll() {
   renderFinanceDashboard();
   renderSignals();
   renderOrders();
+  renderSupport();
   renderUsers();
   renderSymbols();
   renderStrategies();
@@ -7284,6 +7714,7 @@ function renderOpsSummary() {
   var ops = state.data.ops || {};
   var sources = state.data.tvSources || [];
   var signals = state.data.signals || [];
+  var supportStats = state.data.supportStats || {};
   var activeSources = sources.filter(function (x) { return x.is_active; }).length;
   var drafts = signals.filter(function (x) { return x.status === 'pending'; }).length;
   var paused = ops.statusText || (s.paused ? '暫停發訊' : '正常運行');
@@ -7291,7 +7722,8 @@ function renderOpsSummary() {
     ['營運狀態', paused],
     ['待審草稿', drafts + ' 筆'],
     ['TV 來源', activeSources + '/' + sources.length],
-    ['待處理訂單', s.pendingOrders + ' 筆']
+    ['待處理訂單', s.pendingOrders + ' 筆'],
+    ['客服待回覆', (supportStats.open || 0) + ' 件']
   ].map(function (item) {
     return '<div class="ops-tile"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>';
   }).join('');
@@ -7543,6 +7975,35 @@ function renderOrders() {
   var pending = orders.filter(function (o) { return o.status === 'pending' || o.status === 'paid'; });
   document.getElementById('pendingOrders').innerHTML = pending.slice(0, 8).map(function (o) { return orderRow(o, true); }).join('') || '<tr><td colspan="5" class="muted">沒有待處理訂單</td></tr>';
   document.getElementById('ordersTable').innerHTML = orders.map(function (o) { return orderRow(o, false); }).join('') || '<tr><td colspan="8" class="muted">尚無訂單</td></tr>';
+}
+function supportStatusLabel(status) {
+  return status === 'open' ? '待回覆' : status === 'pending' ? '已回覆' : status === 'closed' ? '已結案' : (status || '-');
+}
+function supportStatusTone(status) {
+  return status === 'open' ? 'amber' : status === 'pending' ? 'green' : status === 'closed' ? '' : '';
+}
+function supportActorText(reply) {
+  if (reply.actor_type === 'admin') return '客服';
+  if (reply.actor_type === 'system') return '系統';
+  return '會員';
+}
+function supportRow(ticket) {
+  var user = adminUserName(ticket);
+  var actions = ticket.status !== 'closed'
+    ? '<button class="btn primary" data-support-reply="' + esc(ticket.ticket_id) + '">回覆</button><button class="btn ghost" data-support-close="' + esc(ticket.ticket_id) + '">結案</button>'
+    : '';
+  var thread = (ticket.replies || []).slice(-4).map(function (reply) {
+    return '<div class="ticket-msg ' + esc(reply.actor_type || '') + '"><b>' + esc(supportActorText(reply)) + ' · ' + esc(dateText(reply.created_at)) + '</b>' + esc(reply.message || '').replace(/\\n/g, '<br>') + '</div>';
+  }).join('');
+  if (!thread) thread = '<span class="muted">' + esc(ticket.last_reply || ticket.message || '-') + '</span>';
+  return '<tr><td>' + esc(dateText(ticket.updated_at)) + '</td><td><code>' + esc(ticket.ticket_id) + '</code><div class="muted">' + esc(ticket.priority || 'normal') + '</div></td><td>' + esc(user) + '<div class="muted"><code>' + esc(ticket.user_id) + '</code></div></td><td>' + esc(ticket.subject || '-') + '</td><td class="note-cell"><div class="ticket-thread">' + thread + '</div></td><td>' + chip(supportStatusLabel(ticket.status), supportStatusTone(ticket.status)) + '</td><td class="actions">' + actions + '</td></tr>';
+}
+function renderSupport() {
+  var tickets = state.data.supportTickets || [];
+  var stats = state.data.supportStats || {};
+  var badge = document.getElementById('supportBadge');
+  if (badge) badge.innerHTML = chip((stats.open || 0) + ' 待回覆', stats.open ? 'amber' : 'green') + ' ' + chip((stats.pending || 0) + ' 已回覆', '');
+  document.getElementById('supportTable').innerHTML = tickets.map(supportRow).join('') || '<tr><td colspan="7" class="muted">尚無客服工單</td></tr>';
 }
 function renderUsers() {
   var users = state.data.users || [];
@@ -7955,6 +8416,34 @@ document.body.addEventListener('click', async function (event) {
       });
       if (!refund) return;
       await api('/api/admin/orders/' + encodeURIComponent(refundId) + '/refund', { method: 'POST', body: JSON.stringify({ amount: Number(refund.amount), reason: refund.reason, revoke_access: refund.revoke_access, notify: refund.notify }) });
+      await load();
+    }
+    var supportReply = event.target.closest('[data-support-reply]');
+    if (supportReply) {
+      var replyId = supportReply.dataset.supportReply;
+      var reply = await adminDialog({
+        title: '回覆客服工單',
+        body: '回覆會同步通知可接收 Telegram 的會員，並保留在工單紀錄。',
+        confirmText: '送出回覆',
+        tone: 'primary',
+        fields: [{ name: 'message', label: '回覆內容', type: 'textarea', value: '' }]
+      });
+      if (!reply) return;
+      await api('/api/admin/support/' + encodeURIComponent(replyId) + '/reply', { method: 'POST', body: JSON.stringify({ message: reply.message }) });
+      await load();
+    }
+    var supportClose = event.target.closest('[data-support-close]');
+    if (supportClose) {
+      var closeTicketId = supportClose.dataset.supportClose;
+      var closeTicket = await adminDialog({
+        title: '結案客服工單',
+        body: '結案後會保留歷史紀錄，會員仍可重新建立新工單。',
+        confirmText: '結案',
+        tone: 'warn',
+        fields: [{ name: 'reason', label: '結案原因', value: '客服已結案' }]
+      });
+      if (!closeTicket) return;
+      await api('/api/admin/support/' + encodeURIComponent(closeTicketId) + '/close', { method: 'POST', body: JSON.stringify({ reason: closeTicket.reason }) });
       await load();
     }
     var userTier = event.target.closest('[data-user-tier]');

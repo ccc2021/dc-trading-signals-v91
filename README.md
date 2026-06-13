@@ -1,6 +1,6 @@
 # DC Trading Signals Pro v9.1
 
-> 用戶自主訂閱系統 - 手機完成所有操作
+> 用戶自主訂閱系統 - Telegram 與網站會員中心皆可手機操作
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-blue)](https://telegram.org/)
@@ -8,7 +8,7 @@
 
 ## 🎯 核心特色
 
-- **📱 全手機操作** - 所有功能都在 Telegram 完成
+- **📱 全手機操作** - Telegram Bot 與網站會員中心都支援手機操作
 - **🎯 自選品種** - 用戶選擇要接收哪些品種訊號
 - **⚙️ 個人化設定** - 資金、風險、時區全可調
 - **🌙 安靜時段** - 設定不接收通知的時間
@@ -17,6 +17,7 @@
 - **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
 - **🌐 會員中心** - 會員可直接在網站查看最新/歷史訊號、依起訖時間查詢、維護訂閱設定與續費
 - **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊、登入與修改密碼，並保留 Telegram 登入碼與 Google / LINE OAuth
+- **🎧 線上客服工單** - 會員可在網站或 Telegram 建立工單、補充內容，後台可回覆與結案
 - **🧾 訂單明細與條款紀錄** - 付費下單前記錄條款與風險揭露版本，會員可回看訂單明細/收據
 - **💳 Telegram 訂單查詢** - 會員可用 `/myorders` 與 `/receipt` 查詢付款狀態、流程與收據入口
 - **💸 售後退款紀錄** - 後台與 Telegram 管理指令可記錄人工退款、同步會員權限並留下事件軌跡
@@ -241,6 +242,8 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `performance` | 績效統計 |
 | `orders` | 訂單記錄 |
 | `order_events` | 訂單狀態事件與客服追蹤紀錄 |
+| `support_tickets` | 會員客服工單 |
+| `support_replies` | 客服工單對話紀錄 |
 | `member_login_codes` | 會員中心一次性登入碼 |
 | `member_oauth_identities` | Google / LINE 第三方登入身份 |
 | `member_password_accounts` | Email + 密碼網站會員帳號 |
@@ -249,9 +252,9 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 
 ## 📋 指令統計
 
-- **用戶指令**: 56 個
-- **管理員指令**: 85 個
-- **總計**: 141 個
+- **用戶指令**: 58 個
+- **管理員指令**: 88 個
+- **總計**: 146 個
 
 ## 📄 License
 
