@@ -557,6 +557,9 @@ function renderUserMenuKeyboard() {
         { text: '邀請好友', callback_data: 'u_invite' }
       ],
       [
+        { text: '會員中心', callback_data: 'u_login' }
+      ],
+      [
         { text: '聯繫客服', callback_data: 'u_contact' },
         { text: '幫助說明', callback_data: 'u_help' }
       ]
@@ -1733,6 +1736,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   if (data === 'u_active') return handleUserCommand(cid, uid, '/active', [], env);
   if (data === 'u_mystats') return handleUserCommand(cid, uid, '/mystats', [], env);
   if (data === 'u_plans') return handleUserCommand(cid, uid, '/plans', [], env);
+  if (data === 'u_login') return handleUserCommand(cid, uid, '/login', [], env);
   if (data === 'u_status') return handleUserCommand(cid, uid, '/status', [], env);
   if (data === 'u_invite') return handleUserCommand(cid, uid, '/invite', [], env);
   if (data === 'u_contact') return handleUserCommand(cid, uid, '/contact', [], env);
@@ -3610,6 +3614,10 @@ function renderMemberPage() {
     .login-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; font-weight:800; }
     .login-divider:before, .login-divider:after { content:""; height:1px; background:var(--line); flex:1; }
     .login-hint { font-size:13px; line-height:1.55; }
+    .login-widget { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; }
+    .login-widget summary { cursor:pointer; font-weight:900; list-style:none; }
+    .login-widget summary::-webkit-details-marker { display:none; }
+    .widget-box { margin-top:12px; display:grid; justify-items:center; gap:8px; }
     .hidden { display:none !important; }
     .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
     .toast:empty { display:none; }
@@ -3621,15 +3629,20 @@ function renderMemberPage() {
     <div class="login-card">
       <div class="mark" style="margin:0 auto">DC</div>
       <h1>DC Signals 會員中心</h1>
-      <p class="muted">使用 Telegram 登入後，可線上查看訊號與維護訂閱設定。</p>
-      ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
-      <div class="login-divider"><span>備援登入</span></div>
+      <p class="muted">登入後可線上查看訊號、維護訂閱品種與處理續費。</p>
       <form class="login-code" id="loginCodeForm">
         <label for="loginCodeInput">一次性登入碼</label>
         <input id="loginCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="輸入 6 位碼">
         <button class="btn primary" type="submit">登入會員中心</button>
       </form>
       <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b> 取得登入碼。</p>
+      <div class="login-divider"><span>或</span></div>
+      <details class="login-widget">
+        <summary>Telegram 一鍵登入</summary>
+        <div class="widget-box">
+          ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
+        </div>
+      </details>
     </div>
   </section>
   <main class="wrap hidden" id="appView">
