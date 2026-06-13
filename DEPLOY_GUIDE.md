@@ -320,6 +320,8 @@ https://你的Worker網址/member
 
 若會員是先用網站帳號註冊，請到 Telegram 對 Bot 輸入 `/login`，再把 6 位碼填入會員中心「帳號安全」的 Telegram 綁定欄位。綁定後，該網站會員仍可直接線上查看訊號，同時也會在 Telegram 收到付費訊號、訂單狀態與客服回覆。
 
+正式販售前也要確認公開政策頁可開啟：`/terms`、`/risk-disclosure`、`/refund`、`/privacy`。會員下單同意區會連到這些頁面，訂單會記錄當下條款版本。
+
 Telegram 會員也可用 `/myorders` 查詢最近訂單、用 `/receipt 訂單ID` 取得單筆訂單明細，或用 `/support 問題內容` 建立客服工單。建立訂單、付款通知、取消、確認與退款後都會提供對應的訂單明細按鈕。管理員可在後台按「退款」或「客服工單」處理售後，也可用 `/refund 訂單ID 金額 原因`、`/tickets`、`/reply`、`/closeticket` 維護紀錄。
 
 ### 步驟 7.4：綁定 TradingView

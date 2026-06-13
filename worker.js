@@ -4210,6 +4210,10 @@ function memberTermsUrl(env = {}) {
   return `${publicBaseUrl(env)}/terms`;
 }
 
+function memberPolicyUrl(env = {}, path = '/terms') {
+  return `${publicBaseUrl(env)}${path}`;
+}
+
 function genLoginCode() {
   const bytes = new Uint32Array(1);
   crypto.getRandomValues(bytes);
@@ -5218,7 +5222,10 @@ async function getMemberPaymentInfo(db, env = {}) {
     stripeEnabled: stripeEnabledPublic(env),
     stripeCurrency: stripeCurrency(env).toUpperCase(),
     termsVersion: ORDER_TERMS_VERSION,
-    termsUrl: memberTermsUrl(env)
+    termsUrl: memberTermsUrl(env),
+    riskUrl: memberPolicyUrl(env, '/risk-disclosure'),
+    privacyUrl: memberPolicyUrl(env, '/privacy'),
+    refundUrl: memberPolicyUrl(env, '/refund')
   };
 }
 
@@ -6355,7 +6362,7 @@ function renderMemberPage() {
         <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
         <section class="panel"><header><h3>帳號安全</h3></header><div class="body"><div id="securityBox" class="security-grid"></div></div></section>
         <section class="panel"><header><h3>訂單紀錄</h3></header><div class="body"><div class="stack" id="orders"></div></div></section>
-        <section class="panel"><header><h3>客服支援</h3></header><div class="body"><form id="supportForm" class="stack"><div><label>問題主旨</label><input name="subject" placeholder="例如：付款確認、訊號設定、帳號問題"></div><div><label>問題內容</label><textarea name="message" placeholder="請描述您遇到的狀況，客服會從後台或 Telegram 回覆。"></textarea></div><button class="btn primary" type="submit">送出客服工單</button></form><div class="stack" id="supportTickets"></div></div></section>
+        <section class="panel" id="support"><header><h3>客服支援</h3></header><div class="body"><form id="supportForm" class="stack"><div><label>問題主旨</label><input name="subject" placeholder="例如：付款確認、訊號設定、帳號問題"></div><div><label>問題內容</label><textarea name="message" placeholder="請描述您遇到的狀況，客服會從後台或 Telegram 回覆。"></textarea></div><button class="btn primary" type="submit">送出客服工單</button></form><div class="stack" id="supportTickets"></div></div></section>
       </aside>
     </section>
   </main>
@@ -6627,7 +6634,7 @@ function renderPlans(){
     '<div class="terms-box">'+
       '<b>交易風險與服務條款</b>'+
       '<div>訊號僅供交易參考，不保證獲利；交易可能造成本金損失，請自行控管風險。</div>'+
-      '<label class="check"><input id="acceptOrderTerms" type="checkbox"> 我已閱讀並同意 <a href="'+esc(pay.termsUrl || '/terms')+'" target="_blank" rel="noopener">服務條款與風險揭露</a>（版本 '+esc(pay.termsVersion || '-')+'）</label>'+
+      '<label class="check"><input id="acceptOrderTerms" type="checkbox"> 我已閱讀並同意 <a href="'+esc(pay.termsUrl || '/terms')+'" target="_blank" rel="noopener">服務條款</a>、<a href="'+esc(pay.riskUrl || '/risk-disclosure')+'" target="_blank" rel="noopener">風險揭露</a>、<a href="'+esc(pay.refundUrl || '/refund')+'" target="_blank" rel="noopener">退款政策</a> 與 <a href="'+esc(pay.privacyUrl || '/privacy')+'" target="_blank" rel="noopener">隱私權政策</a>（版本 '+esc(pay.termsVersion || '-')+'）</label>'+
     '</div>'+
     '<div class="muted">建立訂單後付款，再點「我已付款」通知客服確認。</div>';
 }
@@ -6859,46 +6866,90 @@ loadOAuthProviders();
 </html>`;
 }
 
-function renderTermsPage() {
+function legalSectionsHtml(sections) {
+  return sections.map((section, index) => {
+    const body = Array.isArray(section.body)
+      ? `<ul>${section.body.map((item) => `<li>${escHtml(item)}</li>`).join('')}</ul>`
+      : `<p>${escHtml(section.body)}</p>`;
+    return `<h2>${index + 1}. ${escHtml(section.title)}</h2>${body}`;
+  }).join('');
+}
+
+function renderLegalPage(title, subtitle, active, sections) {
+  const nav = [
+    ['/terms', '服務條款'],
+    ['/risk-disclosure', '風險揭露'],
+    ['/privacy', '隱私權'],
+    ['/refund', '退款政策']
+  ].map(([href, label]) => `<a class="${active === href ? 'active' : ''}" href="${href}">${label}</a>`).join('');
   return `<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>服務條款與交易風險揭露</title>
+  <title>${escHtml(title)}</title>
   <style>
     body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f7f9;color:#101828;line-height:1.7}
     main{max-width:820px;margin:0 auto;padding:28px 18px 48px}
     article{background:#fff;border:1px solid #d9e3ea;border-radius:10px;padding:22px;box-shadow:0 14px 34px rgba(15,23,42,.08)}
     h1{font-size:28px;line-height:1.15;margin:0 0 8px} h2{font-size:18px;margin:22px 0 8px} p,li{color:#475467} a{color:#087e90;font-weight:800}
+    nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}nav a{border:1px solid #d9e3ea;border-radius:8px;padding:7px 10px;background:#fff;text-decoration:none;font-size:13px}nav a.active{background:#0f766e;color:#fff;border-color:#0f766e}
     .meta{color:#667085;font-size:13px;margin-bottom:18px}.notice{border:1px solid rgba(183,121,31,.28);background:#fffdf5;border-radius:8px;padding:12px;margin:14px 0}
+    .foot{display:flex;gap:12px;flex-wrap:wrap;margin-top:22px}
   </style>
 </head>
 <body>
   <main>
+    <nav>${nav}</nav>
     <article>
-      <h1>服務條款與交易風險揭露</h1>
+      <h1>${escHtml(title)}</h1>
       <div class="meta">版本 ${escHtml(ORDER_TERMS_VERSION)} · DC Trading Signals</div>
-      <div class="notice"><b>重要提醒：</b>本服務提供交易訊號、策略資訊與會員工具，內容僅供參考，不構成投資建議、保證獲利或代客操作承諾。</div>
-      <h2>1. 服務內容</h2>
-      <p>會員可依訂閱等級查看訊號、歷史紀錄、訂閱品種、通知設定與付款紀錄。訊號可能透過網站、Telegram 或其他系統管道提供。</p>
-      <h2>2. 交易風險</h2>
-      <ul>
-        <li>金融商品交易具有高風險，可能發生虧損，包含本金損失。</li>
-        <li>任何訊號、價格、停損、停利或績效紀錄都不保證未來結果。</li>
-        <li>會員應自行評估資金、槓桿、口數、風險承受度與交易適合性。</li>
-      </ul>
-      <h2>3. 會員責任</h2>
-      <p>會員需自行保管帳號密碼，不得轉售、公開散布或與未授權第三方分享訊號內容。若發現異常登入或帳號外流，應立即修改密碼或聯繫客服。</p>
-      <h2>4. 付款與訂閱</h2>
-      <p>建立訂單前，會員需同意本條款與風險揭露。轉帳訂單需由客服確認入帳；線上付款訂單依第三方支付 webhook 結果自動或人工確認。</p>
-      <h2>5. 系統限制</h2>
-      <p>TradingView、Telegram、支付服務、網路連線或雲端平台可能發生延遲或中斷。系統會盡力保存紀錄與狀態，但不保證所有通知即時送達。</p>
-      <p><a href="/member">返回會員中心</a></p>
+      <div class="notice"><b>重要提醒：</b>${escHtml(subtitle)}</div>
+      ${legalSectionsHtml(sections)}
+      <div class="foot"><a href="/member">返回會員中心</a><a href="/terms">查看服務條款</a><a href="/member#support">聯繫客服</a></div>
     </article>
   </main>
 </body>
 </html>`;
+}
+
+function renderTermsPage() {
+  return renderLegalPage('服務條款', '本服務提供交易訊號、策略資訊與會員工具，內容僅供參考，不構成投資建議、保證獲利或代客操作承諾。', '/terms', [
+    { title: '服務內容', body: '會員可依訂閱等級查看訊號、歷史紀錄、訂閱品種、通知設定、付款紀錄與客服工單。訊號可能透過網站、Telegram 或其他系統管道提供。' },
+    { title: '交易風險', body: ['金融商品交易具有高風險，可能發生虧損，包含本金損失。', '任何訊號、價格、停損、停利或績效紀錄都不保證未來結果。', '會員應自行評估資金、槓桿、口數、風險承受度與交易適合性。'] },
+    { title: '會員責任', body: '會員需自行保管帳號密碼，不得轉售、公開散布或與未授權第三方分享訊號內容。若發現異常登入或帳號外流，應立即修改密碼或聯繫客服。' },
+    { title: '付款與訂閱', body: '建立訂單前，會員需同意本條款、風險揭露、退款政策與隱私權政策。轉帳訂單需由客服確認入帳；線上付款訂單依第三方支付 webhook 結果自動或人工確認。' },
+    { title: '系統限制', body: 'TradingView、Telegram、支付服務、網路連線或雲端平台可能發生延遲或中斷。系統會盡力保存紀錄與狀態，但不保證所有通知即時送達。' }
+  ]);
+}
+
+function renderRiskDisclosurePage() {
+  return renderLegalPage('交易風險揭露', '下單與使用訊號前，請確認您理解交易可能造成虧損，且平台不承諾獲利。', '/risk-disclosure', [
+    { title: '非投資建議', body: '本服務提供的訊號、策略、圖表與價格資訊僅供研究與參考，不代表個人化投資建議、保證收益、代客操作或資產管理服務。' },
+    { title: '市場與執行風險', body: ['行情快速波動、跳空、滑價、流動性不足或交易所規則可能造成實際成交與訊號點位不同。', '會員應自行確認交易商品、槓桿、保證金、手續費與平台規則。', '停損與停利不保證一定成交於指定價格。'] },
+    { title: '資金控管', body: '會員應依自身財務狀況設定單筆風險、最大虧損與可承受槓桿。本系統提供的口數或風險試算僅為工具，不應取代會員自身判斷。' },
+    { title: '歷史績效限制', body: '歷史訊號、回測或績效統計不代表未來結果。不同會員的進出場時間、商品合約、交易成本與執行紀律會導致不同結果。' }
+  ]);
+}
+
+function renderPrivacyPage() {
+  return renderLegalPage('隱私權政策', '本頁說明會員中心、Telegram Bot、付款與客服流程會處理哪些資料，以及資料如何被使用與保護。', '/privacy', [
+    { title: '蒐集資料', body: ['帳號資料：Email、顯示名稱、Telegram ID、OAuth 識別碼與登入紀錄。', '會員資料：訂閱等級、到期日、訂閱品種、通知設定、客服工單與訊號執行紀錄。', '付款資料：訂單編號、付款狀態、金額、幣別、轉帳備註、Stripe session 或 webhook 狀態。平台不保存完整信用卡資料。'] },
+    { title: '使用目的', body: '資料會用於會員登入、權限控管、訊號推播、付款確認、客服回覆、退款紀錄、系統安全、營運分析與法令或爭議處理。' },
+    { title: '第三方服務', body: '系統可能使用 Cloudflare、Telegram、TradingView、Stripe、Google OAuth、LINE OAuth 等第三方服務。第三方會依其服務條款與隱私政策處理必要資料。' },
+    { title: '保存與刪除', body: '訂單、條款同意、退款與客服紀錄會保留作為售後、稽核與爭議處理依據。會員可聯繫客服申請更正或刪除不再必要的帳號資料；依法或營運必要需保留者除外。' },
+    { title: '安全措施', body: '系統以 Cloudflare Worker 與 D1 保存資料，密碼以 PBKDF2 雜湊保存；管理端需授權登入。會員仍應妥善保管 Email、Telegram 與密碼。' }
+  ]);
+}
+
+function renderRefundPolicyPage() {
+  return renderLegalPage('退款政策', '退款規則用於處理重複付款、付款錯誤、服務異常與售後爭議，實際處理會保留訂單事件紀錄。', '/refund', [
+    { title: '數位訂閱性質', body: '本服務為數位訊號與會員工具訂閱。訂單確認後，會員權限可能立即開通並可查看付費內容，因此不保證所有已開通訂單皆可無條件退款。' },
+    { title: '可申請退款情境', body: ['重複付款或付款金額明顯錯誤。', '付款後尚未開通且會員主動取消。', '平台長時間重大異常，導致會員無法使用已付款服務。', '其他經客服審核合理的特殊情況。'] },
+    { title: '不適用或可能部分退款', body: ['會員已大量查看付費訊號或已使用一段期間。', '因個人交易虧損、未依訊號操作、滑價、延遲、券商或交易平台問題而要求退款。', '違反服務條款、轉售或外流訊號內容。'] },
+    { title: '處理方式', body: '退款由管理員於後台或 Telegram 管理指令記錄，會留下退款金額、原因、處理人、時間與會員通知。必要時會同步停用或調整會員期限。' },
+    { title: '申請管道', body: '會員可在會員中心建立客服工單，或於 Telegram 使用 /support 說明訂單編號、付款方式與退款原因。' }
+  ]);
 }
 
 function normalizeTvTicker(value) {
@@ -8975,6 +9026,15 @@ export default {
 
     if (url.pathname === '/terms' || url.pathname === '/terms/') {
       return html(renderTermsPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+    if (url.pathname === '/risk-disclosure' || url.pathname === '/risk-disclosure/' || url.pathname === '/risk' || url.pathname === '/risk/') {
+      return html(renderRiskDisclosurePage(), 200, { 'Cache-Control': 'no-store' });
+    }
+    if (url.pathname === '/privacy' || url.pathname === '/privacy/') {
+      return html(renderPrivacyPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+    if (url.pathname === '/refund' || url.pathname === '/refund/') {
+      return html(renderRefundPolicyPage(), 200, { 'Cache-Control': 'no-store' });
     }
 
     const memberReceiptMatch = url.pathname.match(/^\/member\/receipt\/([^/]+)$/);

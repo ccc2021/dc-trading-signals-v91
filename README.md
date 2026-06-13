@@ -20,6 +20,7 @@
 - **🔔 Telegram 推播綁定** - 網站會員可用 Telegram `/login` 6 位碼綁定推播，之後訊號、訂單與客服通知會同步送達
 - **🎧 線上客服工單** - 會員可在網站或 Telegram 建立工單、補充內容，後台可回覆與結案
 - **🧾 訂單明細與條款紀錄** - 付費下單前記錄條款與風險揭露版本，會員可回看訂單明細/收據
+- **📄 販售政策頁** - 內建服務條款、交易風險揭露、退款政策與隱私權政策公開入口
 - **💳 Telegram 訂單查詢** - 會員可用 `/myorders` 與 `/receipt` 查詢付款狀態、流程與收據入口
 - **💸 售後退款紀錄** - 後台與 Telegram 管理指令可記錄人工退款、同步會員權限並留下事件軌跡
 - **📈 財務營運指標** - 後台與 Telegram 可查淨營收、退款率、ARPU、LTV、流失與待處理訂單
@@ -176,6 +177,15 @@ https://your-worker.workers.dev/auth/line/callback
 ### 3c. 選配 Stripe 線上付款
 
 會員中心會保留轉帳付款；`STRIPE_SECRET_KEY` 與 `STRIPE_WEBHOOK_SECRET` 都設定完成後，才會額外顯示「線上付款」並透過 Checkout 自動確認訂單。退款目前是人工退款紀錄與會員權限同步，不會自動呼叫 Stripe Refund API。
+
+正式收費前請檢查公開政策頁：
+
+```text
+https://your-worker.workers.dev/terms
+https://your-worker.workers.dev/risk-disclosure
+https://your-worker.workers.dev/refund
+https://your-worker.workers.dev/privacy
+```
 
 ```bash
 wrangler secret put STRIPE_SECRET_KEY
