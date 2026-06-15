@@ -6270,77 +6270,183 @@ function renderMemberPage() {
     textarea { min-height:92px; resize:vertical; }
     .check { display:flex; align-items:center; gap:8px; min-height:34px; color:var(--ink); font-size:14px; }
     .check input { width:auto; min-height:unset; }
-    .login { min-height:70vh; display:grid; place-items:center; padding:20px; }
-    .login-card { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:12px; padding:24px; box-shadow:var(--shadow); display:grid; gap:14px; text-align:center; }
-    .login-code { display:grid; gap:8px; text-align:left; }
+    .login { min-height:100vh; padding:22px; display:grid; place-items:center; background:
+      radial-gradient(circle at 20% 12%, rgba(8,167,179,.14), transparent 28%),
+      linear-gradient(135deg,#f7fbfc 0%,#eef6f8 45%,#f8fafc 100%);
+    }
+    .login-shell { width:min(1120px,100%); display:grid; grid-template-columns:minmax(360px,.88fr) minmax(420px,1fr); gap:18px; align-items:stretch; }
+    .login-panel, .login-preview { background:rgba(255,255,255,.94); border:1px solid rgba(217,227,234,.92); border-radius:8px; box-shadow:var(--shadow); overflow:hidden; }
+    .login-panel { padding:22px; display:grid; gap:14px; align-content:start; }
+    .login-brand { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+    .login-title { display:grid; gap:6px; }
+    .login-title h1 { font-size:25px; line-height:1.15; letter-spacing:0; }
+    .login-title p { color:var(--muted); line-height:1.55; font-size:14px; }
+    .login-badge { display:inline-flex; align-items:center; min-height:30px; padding:5px 10px; border-radius:999px; background:#ecfeff; color:#0e7490; font-size:12px; font-weight:900; white-space:nowrap; }
+    .login-proof { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    .login-proof div { border:1px solid var(--line); border-radius:8px; padding:9px; background:#f8fafc; }
+    .login-proof span { display:block; font-size:11px; font-weight:900; color:var(--muted); }
+    .login-proof b { display:block; margin-top:4px; font-size:14px; }
+    .login-code { display:grid; gap:9px; text-align:left; }
     .login-code button { width:100%; }
     .auth-tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; padding:4px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; }
     .auth-tabs button { border:0; border-radius:6px; min-height:34px; background:transparent; color:var(--muted); font-weight:900; cursor:pointer; }
     .auth-tabs button.active { background:#fff; color:var(--ink); box-shadow:0 2px 8px rgba(15,23,42,.06); }
-    .auth-form { display:grid; gap:9px; }
+    .auth-form { display:grid; gap:10px; }
     .auth-form .btn { width:100%; }
-    .login-switch { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; display:grid; gap:9px; }
+    .field { display:grid; gap:6px; }
+    .password-field { position:relative; }
+    .password-field input { padding-right:72px; }
+    .password-field button { position:absolute; right:6px; top:6px; min-height:28px; padding:4px 8px; border-radius:6px; border:1px solid var(--line); background:#fff; color:var(--muted); font-size:12px; font-weight:900; cursor:pointer; }
+    .form-foot { display:flex; justify-content:space-between; gap:10px; align-items:center; color:var(--muted); font-size:13px; }
+    .form-foot a { color:#087e90; font-weight:900; text-decoration:none; }
+    .login-message { min-height:38px; border:1px solid var(--line); border-radius:8px; background:#f8fafc; color:var(--muted); padding:9px 10px; font-size:13px; line-height:1.45; display:flex; align-items:center; }
+    .login-message:empty { display:none; }
+    .login-message.error { border-color:rgba(209,67,63,.28); background:#fff5f5; color:var(--red); }
+    .login-message.ok { border-color:rgba(22,132,90,.28); background:#effaf3; color:var(--green); }
+    .login-switch { border:1px solid var(--line); border-radius:8px; padding:12px; text-align:left; display:grid; gap:9px; background:#fff; }
     .login-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; font-weight:800; }
     .login-divider:before, .login-divider:after { content:""; height:1px; background:var(--line); flex:1; }
     .login-hint { font-size:13px; line-height:1.55; }
     .oauth-grid { display:grid; gap:8px; }
-    .oauth-grid:empty { display:none; }
-    .oauth-btn { width:100%; min-height:42px; }
+    .oauth-btn { width:100%; min-height:42px; justify-content:flex-start; padding-left:13px; }
+    .oauth-icon { width:23px; height:23px; border-radius:6px; display:grid; place-items:center; background:#f8fafc; color:#101828; font-weight:900; font-size:13px; }
     .oauth-btn.google { border-color:#d6dee8; }
+    .oauth-btn.google .oauth-icon { color:#4285f4; background:#fff; border:1px solid #e5e7eb; }
     .oauth-btn.line { background:#06c755; border-color:#06c755; color:#fff; }
+    .oauth-btn.line .oauth-icon { color:#06c755; background:#fff; }
+    .oauth-empty { border:1px dashed var(--line); border-radius:8px; padding:10px; color:var(--muted); font-size:13px; line-height:1.45; background:#f8fafc; }
     .login-widget { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; }
     .login-widget summary { cursor:pointer; font-weight:900; list-style:none; }
     .login-widget summary::-webkit-details-marker { display:none; }
     .widget-box { margin-top:12px; display:grid; justify-items:center; gap:8px; }
+    .login-footer { display:flex; justify-content:center; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+    .login-footer a { color:var(--muted); text-decoration:none; font-weight:800; }
+    .login-preview { background:#0f172a; color:#f8fafc; padding:18px; display:grid; gap:14px; align-content:stretch; }
+    .preview-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .preview-head h2 { font-size:20px; line-height:1.2; }
+    .preview-head p { margin-top:5px; color:#94a3b8; font-size:13px; line-height:1.45; }
+    .preview-status { border:1px solid rgba(148,163,184,.24); border-radius:999px; padding:6px 10px; color:#67e8f9; font-size:12px; font-weight:900; white-space:nowrap; }
+    .chart-stage { border:1px solid rgba(148,163,184,.18); border-radius:8px; min-height:168px; padding:14px; background:linear-gradient(180deg,#111827,#0b1220); position:relative; overflow:hidden; }
+    .chart-grid { position:absolute; inset:0; background-image:linear-gradient(rgba(148,163,184,.08) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,.08) 1px, transparent 1px); background-size:100% 34px, 58px 100%; }
+    .chart-line { position:absolute; left:18px; right:18px; top:44px; height:74px; border-bottom:3px solid #22d3ee; transform:skewY(-8deg); opacity:.92; }
+    .chart-line:before, .chart-line:after { content:""; position:absolute; border-radius:999px; background:#22d3ee; box-shadow:0 0 0 7px rgba(34,211,238,.12); }
+    .chart-line:before { width:10px; height:10px; left:28%; bottom:-6px; }
+    .chart-line:after { width:12px; height:12px; right:18%; bottom:-7px; background:#f43f5e; box-shadow:0 0 0 7px rgba(244,63,94,.12); }
+    .chart-labels { position:relative; z-index:1; display:flex; gap:7px; flex-wrap:wrap; }
+    .signal-preview-card { border:1px solid rgba(148,163,184,.22); border-radius:8px; padding:15px; background:rgba(15,23,42,.86); box-shadow:0 18px 42px rgba(0,0,0,.24); display:grid; gap:13px; }
+    .signal-preview-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .signal-preview-head strong { display:block; font-size:22px; letter-spacing:0; }
+    .signal-preview-head span { display:block; color:#94a3b8; font-size:12px; margin-top:4px; }
+    .preview-levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .preview-levels div { border:1px solid rgba(148,163,184,.18); border-radius:8px; padding:9px; background:rgba(255,255,255,.04); }
+    .preview-levels span { color:#94a3b8; font-size:11px; font-weight:900; }
+    .preview-levels b { display:block; margin-top:4px; font-size:15px; }
+    .login-checklist { display:grid; gap:8px; color:#cbd5e1; font-size:13px; line-height:1.45; }
+    .login-checklist div { display:flex; gap:8px; align-items:flex-start; }
+    .login-checklist b { color:#67e8f9; }
     .hidden { display:none !important; }
     .toast { position:fixed; right:16px; bottom:16px; max-width:min(420px,calc(100vw - 32px)); background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:var(--shadow); color:var(--muted); }
     .toast:empty { display:none; }
-    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid, .proof-grid, .signal-toolbar, .date-range, .plan-row { grid-template-columns:1fr; } .hero h2 { font-size:23px; } .panel header { align-items:flex-start; flex-direction:column; } .tabs, .signal-actions, .plan-actions { width:100%; } .tabs button, .signal-actions .btn, .plan-actions .btn { flex:1; } }
+    @media (max-width:860px) { .login { padding:12px; align-items:start; } .login-shell { grid-template-columns:1fr; } .login-panel { order:1; } .login-preview { order:2; min-height:auto; } .chart-stage { min-height:116px; } .login-checklist { display:none; } }
+    @media (max-width:760px) { .wrap { padding:12px 12px 28px; } .top, .hero { grid-template-columns:1fr; align-items:start; } .grid.two, .kpis, .levels, .form-grid, .plan-grid, .proof-grid, .signal-toolbar, .date-range, .plan-row, .preview-levels { grid-template-columns:1fr; } .hero h2 { font-size:23px; } .panel header { align-items:flex-start; flex-direction:column; } .tabs, .signal-actions, .plan-actions { width:100%; } .tabs button, .signal-actions .btn, .plan-actions .btn { flex:1; } .login-panel { padding:16px; } .login-brand { align-items:flex-start; } .login-title h1 { font-size:22px; } .login-proof { grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; } .login-proof div { padding:8px 6px; } .login-proof b { font-size:12px; } .login-badge { display:none; } .signal-preview-head strong { font-size:18px; } }
   </style>
 </head>
 <body>
   <section class="login" id="loginView">
-    <div class="login-card">
-      <div class="mark" style="margin:0 auto">DC</div>
-      <h1>DC Signals 會員中心</h1>
-      <p class="muted">登入後可線上查看訊號、維護訂閱品種與處理續費。</p>
-      <div class="auth-tabs">
-        <button class="active" type="button" data-auth-tab="login">會員登入</button>
-        <button type="button" data-auth-tab="register">建立帳號</button>
-      </div>
-      <form class="auth-form" id="passwordLoginForm">
-        <label for="loginEmailInput">Email</label>
-        <input id="loginEmailInput" type="email" autocomplete="email" placeholder="you@example.com">
-        <label for="loginPasswordInput">密碼</label>
-        <input id="loginPasswordInput" type="password" autocomplete="current-password" placeholder="至少 8 碼">
-        <button class="btn primary" type="submit">登入會員中心</button>
-      </form>
-      <form class="auth-form hidden" id="passwordRegisterForm">
-        <label for="registerNameInput">顯示名稱</label>
-        <input id="registerNameInput" autocomplete="name" placeholder="例如 Juliot">
-        <label for="registerEmailInput">Email</label>
-        <input id="registerEmailInput" type="email" autocomplete="email" placeholder="you@example.com">
-        <label for="registerPasswordInput">密碼</label>
-        <input id="registerPasswordInput" type="password" autocomplete="new-password" placeholder="英文 + 數字，至少 8 碼">
-        <button class="btn primary" type="submit">建立並登入</button>
-      </form>
-      <div class="login-divider"><span>其他登入方式</span></div>
-      <div class="oauth-grid" id="oauthLogin"></div>
-      <details class="login-switch">
-        <summary>使用 Telegram /login 登入碼</summary>
-      <form class="login-code" id="loginCodeForm">
-        <label for="loginCodeInput">一次性登入碼</label>
-        <input id="loginCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="輸入 6 位碼">
-        <button class="btn primary" type="submit">登入會員中心</button>
-      </form>
-      <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b> 取得登入碼。</p>
-      </details>
-      <details class="login-widget">
-        <summary>Telegram 一鍵登入</summary>
-        <div class="widget-box">
-          ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
+    <div class="login-shell">
+      <div class="login-panel">
+        <div class="login-brand">
+          <div class="brand"><div class="mark">DC</div><div><h1>DC Signals</h1><p class="muted">Trading Signals Portal</p></div></div>
+          <div class="login-badge">會員專用</div>
         </div>
-      </details>
+        <div class="login-title">
+          <h1>登入會員中心</h1>
+          <p>線上查看最新訊號、訂閱品種、會員方案、訂單付款與客服紀錄。</p>
+        </div>
+        <div class="login-proof">
+          <div><span>訊號</span><b>即時 / 歷史</b></div>
+          <div><span>通知</span><b>Telegram 綁定</b></div>
+          <div><span>帳務</span><b>續費 / 訂單</b></div>
+        </div>
+        <div class="login-message" id="loginStatus"></div>
+        <div class="auth-tabs">
+          <button class="active" type="button" data-auth-tab="login">登入</button>
+          <button type="button" data-auth-tab="register">註冊</button>
+        </div>
+        <form class="auth-form" id="passwordLoginForm">
+          <div class="field">
+            <label for="loginEmailInput">Email</label>
+            <input id="loginEmailInput" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </div>
+          <div class="field">
+            <label for="loginPasswordInput">密碼</label>
+            <div class="password-field"><input id="loginPasswordInput" type="password" autocomplete="current-password" placeholder="至少 8 碼" required><button type="button" data-toggle-password="loginPasswordInput">顯示</button></div>
+          </div>
+          <div class="form-foot"><span>安全登入，Cookie 僅用於會員驗證</span>${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">需要協助？</a>` : `<a href="/terms">使用條款</a>`}</div>
+          <button class="btn primary" type="submit" id="passwordLoginButton">登入會員中心</button>
+        </form>
+        <form class="auth-form hidden" id="passwordRegisterForm">
+          <div class="field">
+            <label for="registerNameInput">顯示名稱</label>
+            <input id="registerNameInput" autocomplete="name" placeholder="例如 Juliot" required>
+          </div>
+          <div class="field">
+            <label for="registerEmailInput">Email</label>
+            <input id="registerEmailInput" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </div>
+          <div class="field">
+            <label for="registerPasswordInput">密碼</label>
+            <div class="password-field"><input id="registerPasswordInput" type="password" autocomplete="new-password" placeholder="英文 + 數字，至少 8 碼" required><button type="button" data-toggle-password="registerPasswordInput">顯示</button></div>
+          </div>
+          <button class="btn primary" type="submit" id="passwordRegisterButton">建立並登入</button>
+        </form>
+        <div class="login-divider"><span>快速登入</span></div>
+        <div class="oauth-grid" id="oauthLogin"><div class="oauth-empty">正在檢查第三方登入...</div></div>
+        <details class="login-switch">
+          <summary>使用 Telegram /login 一次性登入碼</summary>
+          <form class="login-code" id="loginCodeForm">
+            <label for="loginCodeInput">6 位登入碼</label>
+            <input id="loginCodeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="輸入 Telegram 取得的 6 位碼">
+            <button class="btn primary" type="submit" id="loginCodeButton">使用登入碼登入</button>
+          </form>
+          <p class="muted login-hint">在 Telegram 對 ${bot ? `<a href="https://t.me/${bot}" target="_blank" rel="noopener">@${bot}</a>` : '機器人'} 輸入 <b>/login</b>，系統會產生一次性登入碼。</p>
+        </details>
+        <details class="login-widget">
+          <summary>Telegram 一鍵登入 Widget</summary>
+          <div class="widget-box">
+            ${bot ? `<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="${bot}" data-size="large" data-userpic="false" data-request-access="write" data-onauth="onTelegramAuth(user)"></script>` : `<div class="chip amber">尚未設定 BOT_USERNAME</div>`}
+          </div>
+        </details>
+        <div class="login-footer"><a href="/terms">服務條款</a><a href="/risk-disclosure">風險揭露</a><a href="/privacy">隱私權</a><a href="/refund">退款政策</a></div>
+      </div>
+      <aside class="login-preview" aria-label="訊號預覽">
+        <div class="preview-head">
+          <div><h2>會員訊號工作台</h2><p>登入後即可查看可訂閱品種、進出場點位、歷史訊號與付款狀態。</p></div>
+          <div class="preview-status">Worker Online</div>
+        </div>
+        <div class="chart-stage">
+          <div class="chart-grid"></div>
+          <div class="chart-line"></div>
+          <div class="chart-labels">${['USTEC','XAUUSD','NQ','GC'].map((item) => `<span class="chip">${item}</span>`).join('')}</div>
+        </div>
+        <div class="signal-preview-card">
+          <div class="signal-preview-head">
+            <div><strong>USTEC SHORT</strong><span>短線訊號 · TradingView Alert</span></div>
+            <span class="chip red">進行中</span>
+          </div>
+          <div class="preview-levels">
+            <div><span>進場</span><b>21,506.00</b></div>
+            <div><span>止損</span><b>21,536.00</b></div>
+            <div><span>TP1</span><b>21,476.00</b></div>
+            <div><span>TP2 / TP3</span><b>21,446 / 21,416</b></div>
+          </div>
+        </div>
+        <div class="login-checklist">
+          <div><b>✓</b><span>第三方登入、Email 密碼與 Telegram 登入碼可並行使用。</span></div>
+          <div><b>✓</b><span>登入後可直接管理訂閱、付款與客服，不必只靠 Telegram 指令。</span></div>
+          <div><b>✓</b><span>所有交易資訊僅供參考，請先閱讀風險揭露。</span></div>
+        </div>
+      </aside>
     </div>
   </section>
   <main class="wrap hidden" id="appView">
@@ -6380,12 +6486,30 @@ var loginCodeInput = document.getElementById('loginCodeInput');
 var passwordLoginForm = document.getElementById('passwordLoginForm');
 var passwordRegisterForm = document.getElementById('passwordRegisterForm');
 var oauthLogin = document.getElementById('oauthLogin');
+var loginStatus = document.getElementById('loginStatus');
 function esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function money(value){ return 'NT$' + Number(value || 0).toLocaleString('zh-TW'); }
 function price(value){ var n = Number(value); return isFinite(n) ? n.toFixed(2) : '-'; }
 function dateText(value){ if(!value) return '-'; var text=String(value); var d=new Date(/(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(text)?text:text.replace(' ','T')+'Z'); return isNaN(d.getTime())?'-':d.toLocaleString('zh-TW',{timeZone:'Asia/Taipei',hour12:false}); }
 function chip(text,tone){ return '<span class="chip '+(tone||'')+'">'+esc(text)+'</span>'; }
 function showToast(text,tone){ toast.textContent=text||''; toast.style.color=tone==='error'?'#d1433f':'#667085'; if(text) setTimeout(function(){ if(toast.textContent===text) toast.textContent=''; },3600); }
+function showLoginMessage(text,tone){
+  if(!loginStatus) return;
+  loginStatus.textContent = text || '';
+  loginStatus.className = 'login-message ' + (tone || '');
+}
+function setButtonBusy(buttonId,busy,text){
+  var button = document.getElementById(buttonId);
+  if(!button) return;
+  if(busy){
+    button.dataset.originalText = button.dataset.originalText || button.textContent;
+    button.textContent = text || '處理中...';
+    button.disabled = true;
+  }else{
+    button.textContent = button.dataset.originalText || button.textContent;
+    button.disabled = false;
+  }
+}
 async function api(path, options){ var res=await fetch(path,Object.assign({credentials:'same-origin',headers:{'Content-Type':'application/json'}},options||{})); var data=await res.json().catch(function(){return{};}); if(!res.ok||!data.ok) throw new Error(data.error||('HTTP '+res.status)); return data.data; }
 function showCheckoutReturnToast(){
   if(checkoutNoticeShown) return;
@@ -6402,55 +6526,82 @@ async function loadOAuthProviders(){
   try{
     var data = await api('/api/member/oauth/providers');
     var providers = (data.providers || []).filter(function(provider){ return provider.enabled; });
+    if(!providers.length){
+      oauthLogin.innerHTML = '<div class="oauth-empty">第三方登入尚未啟用，請使用 Email 密碼或 Telegram /login 登入碼。</div>';
+      return;
+    }
     oauthLogin.innerHTML = providers.map(function(provider){
       var cls = provider.id === 'line' ? 'line' : 'google';
-      return '<a class="btn oauth-btn '+esc(cls)+'" href="/auth/'+esc(provider.id)+'/start">使用 '+esc(provider.name)+' 登入</a>';
+      var icon = provider.id === 'line' ? 'L' : 'G';
+      return '<a class="btn oauth-btn '+esc(cls)+'" href="/auth/'+esc(provider.id)+'/start"><span class="oauth-icon">'+esc(icon)+'</span><span>使用 '+esc(provider.name)+' 登入</span></a>';
     }).join('');
-  }catch(err){ oauthLogin.innerHTML = ''; }
+  }catch(err){ oauthLogin.innerHTML = '<div class="oauth-empty">第三方登入狀態暫時無法取得，請改用 Email 或 Telegram 登入碼。</div>'; }
 }
-window.onTelegramAuth = async function(user){ try{ state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); render(); }catch(err){ showToast(err.message,'error'); } };
+window.onTelegramAuth = async function(user){ try{ showLoginMessage('正在驗證 Telegram 身分...'); state = await api('/api/member/login',{method:'POST',body:JSON.stringify(user)}); showLoginMessage('登入成功，正在載入會員中心','ok'); render(); }catch(err){ showLoginMessage(err.message,'error'); showToast(err.message,'error'); } };
 function setAuthTab(tab){
   Array.prototype.slice.call(document.querySelectorAll('[data-auth-tab]')).forEach(function(btn){ btn.classList.toggle('active', btn.dataset.authTab === tab); });
   passwordLoginForm.classList.toggle('hidden', tab !== 'login');
   passwordRegisterForm.classList.toggle('hidden', tab !== 'register');
+  showLoginMessage('');
 }
 document.querySelector('.auth-tabs').addEventListener('click', function(event){
   var btn = event.target.closest('[data-auth-tab]');
   if(btn) setAuthTab(btn.dataset.authTab);
 });
+document.body.addEventListener('click', function(event){
+  var toggle = event.target.closest('[data-toggle-password]');
+  if(!toggle) return;
+  var input = document.getElementById(toggle.dataset.togglePassword);
+  if(!input) return;
+  var visible = input.type === 'text';
+  input.type = visible ? 'password' : 'text';
+  toggle.textContent = visible ? '顯示' : '隱藏';
+});
 passwordLoginForm.addEventListener('submit', async function(event){
   event.preventDefault();
   try{
+    showLoginMessage('正在登入會員中心...');
+    setButtonBusy('passwordLoginButton', true, '登入中...');
     state = await api('/api/member/password-login',{method:'POST',body:JSON.stringify({
       email: document.getElementById('loginEmailInput').value,
       password: document.getElementById('loginPasswordInput').value
     })});
     document.getElementById('loginPasswordInput').value = '';
+    showLoginMessage('登入成功，正在載入會員中心','ok');
     render();
-  }catch(err){ showToast(err.message,'error'); }
+  }catch(err){ showLoginMessage(err.message,'error'); showToast(err.message,'error'); }
+  finally{ setButtonBusy('passwordLoginButton', false); }
 });
 passwordRegisterForm.addEventListener('submit', async function(event){
   event.preventDefault();
   try{
+    showLoginMessage('正在建立會員帳號...');
+    setButtonBusy('passwordRegisterButton', true, '建立中...');
     state = await api('/api/member/register',{method:'POST',body:JSON.stringify({
       display_name: document.getElementById('registerNameInput').value,
       email: document.getElementById('registerEmailInput').value,
       password: document.getElementById('registerPasswordInput').value
     })});
     document.getElementById('registerPasswordInput').value = '';
+    showLoginMessage('帳號已建立，正在載入會員中心','ok');
     render();
-  }catch(err){ showToast(err.message,'error'); }
+  }catch(err){ showLoginMessage(err.message,'error'); showToast(err.message,'error'); }
+  finally{ setButtonBusy('passwordRegisterButton', false); }
 });
 loginCodeForm.addEventListener('submit', async function(event){
   event.preventDefault();
   var code = (loginCodeInput.value || '').replace(/\\D/g,'');
   try{
+    showLoginMessage('正在驗證 Telegram 登入碼...');
+    setButtonBusy('loginCodeButton', true, '驗證中...');
     state = await api('/api/member/login-code',{method:'POST',body:JSON.stringify({code:code})});
     loginCodeInput.value = '';
+    showLoginMessage('登入成功，正在載入會員中心','ok');
     render();
-  }catch(err){ showToast(err.message,'error'); }
+  }catch(err){ showLoginMessage(err.message,'error'); showToast(err.message,'error'); }
+  finally{ setButtonBusy('loginCodeButton', false); }
 });
-async function load(){ try{ state = await api('/api/member/me'); render(); }catch(err){ loginView.classList.remove('hidden'); appView.classList.add('hidden'); } }
+async function load(){ try{ state = await api('/api/member/me'); render(); }catch(err){ loginView.classList.remove('hidden'); appView.classList.add('hidden'); showLoginMessage('請登入會員中心，或使用 Telegram /login 取得一次性登入碼。'); } }
 function tierTone(tier){ return tier === 'vip' ? 'amber' : tier === 'pro' ? 'green' : ''; }
 function memberDisplayName(u){ return u.username ? (String(u.username).indexOf('@') >= 0 ? u.username : '@' + u.username) : (u.first_name || u.user_id); }
 function signalTone(sig){ return sig.action === 'LONG' ? 'green' : 'red'; }
