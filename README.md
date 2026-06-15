@@ -16,7 +16,7 @@
 - **📝 執行記錄** - 記錄已執行/跳過的訊號
 - **🖥️ 線上後台** - 手機可操作的訊號、策略、會員、訂單與收費維護
 - **🌐 會員中心** - 會員可直接在網站查看最新/歷史訊號、依起訖時間查詢、維護訂閱設定與續費
-- **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊、登入與修改密碼，並保留 Telegram 登入碼與 Google / LINE OAuth
+- **🔐 網站帳號登入** - 支援 Email + 密碼直接註冊、登入與修改密碼，並保留 Telegram 登入碼與 Google OAuth
 - **🔔 Telegram 推播綁定** - 網站會員可用 Telegram `/login` 6 位碼綁定推播，之後訊號、訂單與客服通知會同步送達
 - **🎧 線上客服工單** - 會員可在網站或 Telegram 建立工單、補充內容，後台可回覆與結案
 - **🧾 訂單明細與條款紀錄** - 付費下單前記錄條款與風險揭露版本，會員可回看訂單明細/收據
@@ -156,20 +156,17 @@ wrangler secret put ADMIN_WEB_PASSWORD
 
 ### 3b. 選配第三方登入
 
-會員中心預設可用 Email + 密碼註冊登入，也可用 Telegram `/login` 一次性登入碼。網站會員登入後可在「帳號安全」輸入 Telegram `/login` 6 位碼，把網站帳號與 Telegram 推播綁在一起；綁定後，付費訊號、訂單通知與客服回覆會送到該 Telegram。若要啟用網站第三方登入，另外設定對應 OAuth secrets：
+會員中心短網址為 `/m`，舊的 `/member` 與 `/login` 仍保留相容。會員中心預設可用 Email + 密碼註冊登入，也可用 Telegram `/login` 一次性登入碼。網站會員登入後可在「帳號安全」輸入 Telegram `/login` 6 位碼，把網站帳號與 Telegram 推播綁在一起；綁定後，付費訊號、訂單通知與客服回覆會送到該 Telegram。若要啟用 Google 第三方登入，另外設定對應 OAuth secrets：
 
 ```bash
 wrangler secret put GOOGLE_CLIENT_ID
 wrangler secret put GOOGLE_CLIENT_SECRET
-wrangler secret put LINE_CLIENT_ID
-wrangler secret put LINE_CLIENT_SECRET
 ```
 
 OAuth callback URL：
 
 ```text
 https://your-worker.workers.dev/auth/google/callback
-https://your-worker.workers.dev/auth/line/callback
 ```
 
 若有自訂網域，請設定 `PUBLIC_BASE_URL`，讓登入回呼與會員中心網址一致。
@@ -256,7 +253,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `support_tickets` | 會員客服工單 |
 | `support_replies` | 客服工單對話紀錄 |
 | `member_login_codes` | 會員中心一次性登入碼 |
-| `member_oauth_identities` | Google / LINE 第三方登入身份 |
+| `member_oauth_identities` | Google 第三方登入身份 |
 | `member_password_accounts` | Email + 密碼網站會員帳號 |
 | `rate_limits` | 會員登入與訂單建立速率限制 |
 | `queued_signals` | 待發訊號 |

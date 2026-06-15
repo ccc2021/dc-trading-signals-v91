@@ -3491,7 +3491,7 @@ async function getOperationalHealth(db, config = {}, startedAt = Date.now(), env
     issues.push(opsIssue('critical', 'Stripe webhook 尚未啟用', 'Checkout 可收款但訂單無法自動確認，系統已暫停對會員顯示線上付款。', '設定 STRIPE_WEBHOOK_SECRET 並在 Stripe 訂閱 webhook 事件。', 'billing'));
   }
   if (!integrations.oauth.enabledCount) {
-    issues.push(opsIssue('info', '第三方登入尚未啟用', '會員仍可用 Telegram 登入碼，但 Google / LINE 按鈕不會顯示。', '設定 Google 或 LINE OAuth secret。', 'billing'));
+    issues.push(opsIssue('info', 'Google 登入尚未啟用', '會員仍可用 Email 或 Telegram 登入碼。', '設定 Google OAuth secret。', 'billing'));
   }
   if (!integrations.telegram.botToken) {
     issues.push(opsIssue('critical', 'Telegram Bot Token 未設定', '會員登入碼與 Telegram 推播都無法使用。', '設定 BOT_TOKEN secret。', 'billing'));
@@ -4201,9 +4201,10 @@ const MEMBER_SESSION_TTL = 30 * 86400;
 const MEMBER_OAUTH_TTL = 10 * 60;
 const MEMBER_PASSWORD_ITERATIONS = 100000;
 const ORDER_TERMS_VERSION = '2026-06-13';
+const MEMBER_PORTAL_PATH = '/m';
 
 function memberPortalUrl(env = {}) {
-  return `${publicBaseUrl(env)}/member`;
+  return `${publicBaseUrl(env)}${MEMBER_PORTAL_PATH}`;
 }
 
 function memberTermsUrl(env = {}) {
@@ -4739,16 +4740,6 @@ function oauthProviders(env = {}) {
       tokenUrl: 'https://oauth2.googleapis.com/token',
       userInfoUrl: 'https://www.googleapis.com/oauth2/v3/userinfo',
       scope: 'openid email profile'
-    },
-    {
-      id: 'line',
-      name: 'LINE',
-      clientId: env.LINE_CLIENT_ID || env.OAUTH_LINE_CLIENT_ID || '',
-      clientSecret: env.LINE_CLIENT_SECRET || env.OAUTH_LINE_CLIENT_SECRET || '',
-      authUrl: 'https://access.line.me/oauth2/v2.1/authorize',
-      tokenUrl: 'https://api.line.me/oauth2/v2.1/token',
-      userInfoUrl: 'https://api.line.me/v2/profile',
-      scope: 'profile openid email'
     }
   ];
   return providers.map((provider) => ({
@@ -4797,7 +4788,7 @@ async function verifyOAuthState(request, provider, state, env) {
 }
 
 function oauthErrorPage(message) {
-  return html(`<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登入失敗</title><style>body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f7f9;color:#101828;display:grid;place-items:center;min-height:100vh;padding:24px}.card{max-width:420px;background:#fff;border:1px solid #d9e3ea;border-radius:12px;padding:22px;box-shadow:0 14px 34px rgba(15,23,42,.08)}a{color:#087e90;font-weight:800}</style></head><body><main class="card"><h1>登入失敗</h1><p>${escHtml(message)}</p><p><a href="/member">返回會員中心</a></p></main></body></html>`, 400, { 'Cache-Control': 'no-store' });
+  return html(`<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登入失敗</title><style>body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f7f9;color:#101828;display:grid;place-items:center;min-height:100vh;padding:24px}.card{max-width:420px;background:#fff;border:1px solid #d9e3ea;border-radius:12px;padding:22px;box-shadow:0 14px 34px rgba(15,23,42,.08)}a{color:#087e90;font-weight:800}</style></head><body><main class="card"><h1>登入失敗</h1><p>${escHtml(message)}</p><p><a href="${MEMBER_PORTAL_PATH}">返回會員中心</a></p></main></body></html>`, 400, { 'Cache-Control': 'no-store' });
 }
 
 async function exchangeOAuthCode(provider, code, redirectUri) {
@@ -4831,15 +4822,6 @@ async function fetchOAuthProfile(provider, tokenData) {
       email: String(data.email || ''),
       displayName: String(data.name || data.given_name || data.email || 'Google 會員'),
       avatarUrl: String(data.picture || '')
-    };
-  }
-  if (provider.id === 'line') {
-    return {
-      provider: provider.id,
-      providerUserId: String(data.userId || ''),
-      email: '',
-      displayName: String(data.displayName || 'LINE 會員'),
-      avatarUrl: String(data.pictureUrl || '')
     };
   }
   throw new Error('不支援的第三方登入');
@@ -4978,7 +4960,7 @@ function integrationReadiness(env = {}) {
   const stripeKey = String(env.STRIPE_SECRET_KEY || '');
   const stripeMode = stripeKey.startsWith('sk_live_') ? 'live' : stripeKey.startsWith('sk_test_') ? 'test' : stripeConfigured(env) ? 'custom' : 'off';
   return {
-    memberUrl: `${baseUrl}/member`,
+    memberUrl: `${baseUrl}${MEMBER_PORTAL_PATH}`,
     telegram: {
       botToken: Boolean(env.BOT_TOKEN || CONFIG.BOT_TOKEN),
       botUsername: CONFIG.BOT_USERNAME || '',
@@ -4988,13 +4970,12 @@ function integrationReadiness(env = {}) {
       enabledCount: enabledProviders.length,
       providers,
       callbackUrls: {
-        google: `${baseUrl}/auth/google/callback`,
-        line: `${baseUrl}/auth/line/callback`
+        google: `${baseUrl}/auth/google/callback`
       }
     },
     passwordAuth: {
       enabled: true,
-      registerUrl: `${baseUrl}/member`
+      registerUrl: `${baseUrl}${MEMBER_PORTAL_PATH}`
     },
     stripe: {
       enabled: stripeEnabledPublic(env),
@@ -5743,7 +5724,7 @@ function renderMemberReceiptPage(order, events = []) {
         ${refund}
         ${note}
         <section class="section"><h2>訂單流程</h2><div class="timeline">${timeline}</div></section>
-        <div class="actions"><a class="btn primary" href="/member">返回會員中心</a><button class="btn" type="button" onclick="window.print()">列印 / 另存 PDF</button></div>
+        <div class="actions"><a class="btn primary" href="${MEMBER_PORTAL_PATH}">返回會員中心</a><button class="btn" type="button" onclick="window.print()">列印 / 另存 PDF</button></div>
       </div>
     </article>
   `);
@@ -5753,13 +5734,13 @@ async function handleMemberReceiptPage(request, env, orderId) {
   const session = await readMemberSession(request, env);
   if (!session) {
     return renderMemberReceiptShell('請先登入', `
-      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>請先登入會員中心</h1><p class="muted">登入後才能查看訂單明細與收據。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="/member">前往登入</a></div></div></article>
+      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>請先登入會員中心</h1><p class="muted">登入後才能查看訂單明細與收據。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="${MEMBER_PORTAL_PATH}">前往登入</a></div></div></article>
     `, 401);
   }
   const receipt = await getMemberOrderReceipt(env.DB, session.userId, orderId);
   if (!receipt) {
     return renderMemberReceiptShell('找不到訂單', `
-      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>找不到訂單</h1><p class="muted">此訂單不存在，或不屬於目前登入會員。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="/member">返回會員中心</a></div></div></article>
+      <article class="receipt"><header><div class="brand"><div class="mark">DC</div><div><h1>找不到訂單</h1><p class="muted">此訂單不存在，或不屬於目前登入會員。</p></div></div></header><div class="body"><div class="actions"><a class="btn primary" href="${MEMBER_PORTAL_PATH}">返回會員中心</a></div></div></article>
     `, 404);
   }
   return renderMemberReceiptPage(receipt.order, receipt.events);
@@ -6312,8 +6293,6 @@ function renderMemberPage() {
     .oauth-icon { width:23px; height:23px; border-radius:6px; display:grid; place-items:center; background:#f8fafc; color:#101828; font-weight:900; font-size:13px; }
     .oauth-btn.google { border-color:#d6dee8; }
     .oauth-btn.google .oauth-icon { color:#4285f4; background:#fff; border:1px solid #e5e7eb; }
-    .oauth-btn.line { background:#06c755; border-color:#06c755; color:#fff; }
-    .oauth-btn.line .oauth-icon { color:#06c755; background:#fff; }
     .oauth-empty { border:1px dashed var(--line); border-radius:8px; padding:10px; color:var(--muted); font-size:13px; line-height:1.45; background:#f8fafc; }
     .login-widget { border:1px solid var(--line); border-radius:8px; padding:10px 12px; text-align:left; }
     .login-widget summary { cursor:pointer; font-weight:900; list-style:none; }
@@ -6442,7 +6421,7 @@ function renderMemberPage() {
           </div>
         </div>
         <div class="login-checklist">
-          <div><b>✓</b><span>第三方登入、Email 密碼與 Telegram 登入碼可並行使用。</span></div>
+          <div><b>✓</b><span>Google 登入、Email 密碼與 Telegram 登入碼可並行使用。</span></div>
           <div><b>✓</b><span>登入後可直接管理訂閱、付款與客服，不必只靠 Telegram 指令。</span></div>
           <div><b>✓</b><span>所有交易資訊僅供參考，請先閱讀風險揭露。</span></div>
         </div>
@@ -6531,9 +6510,7 @@ async function loadOAuthProviders(){
       return;
     }
     oauthLogin.innerHTML = providers.map(function(provider){
-      var cls = provider.id === 'line' ? 'line' : 'google';
-      var icon = provider.id === 'line' ? 'L' : 'G';
-      return '<a class="btn oauth-btn '+esc(cls)+'" href="/auth/'+esc(provider.id)+'/start"><span class="oauth-icon">'+esc(icon)+'</span><span>使用 '+esc(provider.name)+' 登入</span></a>';
+      return '<a class="btn oauth-btn google" href="/auth/'+esc(provider.id)+'/start"><span class="oauth-icon">G</span><span>使用 '+esc(provider.name)+' 登入</span></a>';
     }).join('');
   }catch(err){ oauthLogin.innerHTML = '<div class="oauth-empty">第三方登入狀態暫時無法取得，請改用 Email 或 Telegram 登入碼。</div>'; }
 }
@@ -6814,7 +6791,7 @@ function renderOrder(o){
   var refunded = !!o.refunded_at;
   var terms = o.terms_accepted_at ? '<div class="muted">條款版本 '+esc(o.terms_version || '-')+' · 同意 '+dateText(o.terms_accepted_at)+'</div>' : '';
   var refund = refunded ? '<div class="muted">退款 '+money(o.refund_amount || o.amount)+' · '+dateText(o.refunded_at)+(o.refund_note?' · '+esc(o.refund_note):'')+'</div>' : '';
-  var receipt = '<a class="btn ghost" target="_blank" rel="noopener" href="/member/receipt/'+encodeURIComponent(o.order_id)+'">訂單明細</a>';
+  var receipt = '<a class="btn ghost" target="_blank" rel="noopener" href="/m/receipt/'+encodeURIComponent(o.order_id)+'">訂單明細</a>';
   if(!refunded && o.status === 'pending' && method === 'stripe') actions =
     '<div class="order-actions">' + (o.payment_url ? '<a class="btn primary" href="'+esc(o.payment_url)+'" target="_blank" rel="noopener">繼續付款</a>' : '') + '<button class="btn" data-order-cancel="'+esc(o.order_id)+'">取消</button>'+receipt+'</div>';
   if(!refunded && o.status === 'pending' && method !== 'stripe') actions =
@@ -7057,7 +7034,7 @@ function renderLegalPage(title, subtitle, active, sections) {
       <div class="meta">版本 ${escHtml(ORDER_TERMS_VERSION)} · DC Trading Signals</div>
       <div class="notice"><b>重要提醒：</b>${escHtml(subtitle)}</div>
       ${legalSectionsHtml(sections)}
-      <div class="foot"><a href="/member">返回會員中心</a><a href="/terms">查看服務條款</a><a href="/member#support">聯繫客服</a></div>
+      <div class="foot"><a href="${MEMBER_PORTAL_PATH}">返回會員中心</a><a href="/terms">查看服務條款</a><a href="${MEMBER_PORTAL_PATH}#support">聯繫客服</a></div>
     </article>
   </main>
 </body>
@@ -7087,7 +7064,7 @@ function renderPrivacyPage() {
   return renderLegalPage('隱私權政策', '本頁說明會員中心、Telegram Bot、付款與客服流程會處理哪些資料，以及資料如何被使用與保護。', '/privacy', [
     { title: '蒐集資料', body: ['帳號資料：Email、顯示名稱、Telegram ID、OAuth 識別碼與登入紀錄。', '會員資料：訂閱等級、到期日、訂閱品種、通知設定、客服工單與訊號執行紀錄。', '付款資料：訂單編號、付款狀態、金額、幣別、轉帳備註、Stripe session 或 webhook 狀態。平台不保存完整信用卡資料。'] },
     { title: '使用目的', body: '資料會用於會員登入、權限控管、訊號推播、付款確認、客服回覆、退款紀錄、系統安全、營運分析與法令或爭議處理。' },
-    { title: '第三方服務', body: '系統可能使用 Cloudflare、Telegram、TradingView、Stripe、Google OAuth、LINE OAuth 等第三方服務。第三方會依其服務條款與隱私政策處理必要資料。' },
+    { title: '第三方服務', body: '系統可能使用 Cloudflare、Telegram、TradingView、Stripe、Google OAuth 等第三方服務。第三方會依其服務條款與隱私政策處理必要資料。' },
     { title: '保存與刪除', body: '訂單、條款同意、退款與客服紀錄會保留作為售後、稽核與爭議處理依據。會員可聯繫客服申請更正或刪除不再必要的帳號資料；依法或營運必要需保留者除外。' },
     { title: '安全措施', body: '系統以 Cloudflare Worker 與 D1 保存資料，密碼以 PBKDF2 雜湊保存；管理端需授權登入。會員仍應妥善保管 Email、Telegram 與密碼。' }
   ]);
@@ -8216,8 +8193,8 @@ function renderOpsHealth() {
   }
   cards.push('<article class="health-card ' + (stripe.enabled ? 'info' : 'warning') + '"><strong>線上付款</strong><p>' + (stripe.enabled ? 'Stripe Checkout 與 webhook 已完整啟用。' : '線上付款尚未完整啟用，會員目前不會看到線上付款按鈕。') + '</p><small>' + esc(stripe.mode || 'off') + ' · ' + esc(stripe.currency || '-') + '</small></article>');
   var oauthNames = (oauth.providers || []).filter(function (p) { return p.enabled; }).map(function (p) { return p.name; }).join(', ');
-  cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>第三方登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google / LINE，會員仍可用 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/member') + '</small></article>');
-  cards.push('<article class="health-card ' + (passwordAuth.enabled ? 'info' : 'warning') + '"><strong>網站帳號登入</strong><p>' + (passwordAuth.enabled ? '會員可直接用 Email + 密碼註冊與登入會員中心。' : '網站帳號登入尚未啟用。') + '</p><small>' + esc(passwordAuth.registerUrl || integrations.memberUrl || '/member') + '</small></article>');
+  cards.push('<article class="health-card ' + (oauth.enabledCount ? 'info' : 'warning') + '"><strong>Google 登入</strong><p>' + (oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '。' : '尚未啟用 Google，會員仍可用 Email 或 Telegram 登入碼。') + '</p><small>會員中心 ' + esc(integrations.memberUrl || '/m') + '</small></article>');
+  cards.push('<article class="health-card ' + (passwordAuth.enabled ? 'info' : 'warning') + '"><strong>網站帳號登入</strong><p>' + (passwordAuth.enabled ? '會員可直接用 Email + 密碼註冊與登入會員中心。' : '網站帳號登入尚未啟用。') + '</p><small>' + esc(passwordAuth.registerUrl || integrations.memberUrl || '/m') + '</small></article>');
   cards.push('<article class="health-card ' + (cron.manualSecret ? 'info' : 'warning') + '"><strong>Cron 手動端點</strong><p>' + (cron.manualSecret ? '手動維運端點已由 CRON_SECRET 保護。' : '手動維運端點已鎖定；需設定 CRON_SECRET 才能外部觸發。') + '</p><small>Cloudflare scheduled cron 不受影響</small></article>');
   cards.push('<article class="health-card info"><strong>TradingView</strong><p>24H Alert ' + esc((ops.alertStats && ops.alertStats.total24) || 0) + ' 筆，錯誤 ' + esc((ops.alertStats && ops.alertStats.failed24) || 0) + ' 筆。</p><small>最新 ' + esc((ops.alertStats && ops.alertStats.latestAt) ? dateText(ops.alertStats.latestAt) : '尚無紀錄') + '</small></article>');
   cards.push('<article class="health-card info"><strong>會員安全</strong><p>登入碼與訂單建立已啟用速率限制。</p><small>目前限制中 ' + esc((ops.securityStats && ops.securityStats.activeRateLimits) || 0) + '，高頻 ' + esc((ops.securityStats && ops.securityStats.hotRateLimits) || 0) + '</small></article>');
@@ -8249,7 +8226,7 @@ function renderConfigSummary() {
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || {};
   summary.innerHTML =
-    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip((oauth.enabledCount || 0) + ' 個第三方登入', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
     '<div class="muted">付款：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">客服：' + esc(c.contact_telegram || '-') + ' / ' + esc(c.contact_line || '-') + '</div>';
 }
@@ -8287,10 +8264,10 @@ function renderBillingReadiness() {
     stripe.webhookUrl || ''
   ));
   cards.push(readinessCard(
-    '會員第三方登入',
+    'Google 第三方登入',
     oauth.enabledCount ? 'info' : 'warning',
-    oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '，純網站會員可直接登入會員中心。' : '尚未啟用 Google / LINE；會員仍可由 Telegram /login 取得一次性登入碼。',
-    'Google callback 與 LINE callback 請分別貼到 OAuth 後台。',
+    oauth.enabledCount ? '已啟用 ' + esc(oauthNames) + '，純網站會員可直接登入會員中心。' : '尚未啟用 Google；會員仍可用 Email 或 Telegram /login 登入。',
+    'Google callback 請貼到 OAuth 後台。',
     (oauth.callbackUrls && oauth.callbackUrls.google) || ''
   ));
   cards.push(readinessCard(
@@ -8301,17 +8278,10 @@ function renderBillingReadiness() {
     passwordAuth.registerUrl || integrations.memberUrl || ''
   ));
   cards.push(readinessCard(
-    'LINE OAuth Callback',
-    (oauth.providers || []).some(function (p) { return p.id === 'line' && p.enabled; }) ? 'info' : 'warning',
-    'LINE 登入啟用時使用此 callback URL。',
-    '若暫時不用 LINE，可先保持未設定。',
-    (oauth.callbackUrls && oauth.callbackUrls.line) || ''
-  ));
-  cards.push(readinessCard(
     'Telegram 會員入口',
     telegram.botToken ? 'info' : 'critical',
     telegram.botToken ? 'Telegram 登入碼與推播可用。' : 'BOT_TOKEN 尚未設定，Telegram 推播與登入碼不可用。',
-    'Bot ' + esc(telegram.botUsername || '-') + ' · 會員中心 ' + esc(integrations.memberUrl || '/member'),
+    'Bot ' + esc(telegram.botUsername || '-') + ' · 會員中心 ' + esc(integrations.memberUrl || '/m'),
     integrations.memberUrl || ''
   ));
   cards.push(readinessCard(
@@ -9313,7 +9283,7 @@ export default {
       return renderSignalCardResponse(env.DB, decodeURIComponent(cardMatch[1]));
     }
 
-    const oauthMatch = url.pathname.match(/^\/auth\/(google|line)\/(start|callback)$/);
+    const oauthMatch = url.pathname.match(/^\/auth\/(google)\/(start|callback)$/);
     if (oauthMatch && request.method === 'GET') {
       return oauthMatch[2] === 'start'
         ? handleOAuthStart(request, env, oauthMatch[1])
@@ -9347,12 +9317,12 @@ export default {
       return html(renderRefundPolicyPage(), 200, { 'Cache-Control': 'no-store' });
     }
 
-    const memberReceiptMatch = url.pathname.match(/^\/member\/receipt\/([^/]+)$/);
+    const memberReceiptMatch = url.pathname.match(/^\/(?:member|m)\/receipt\/([^/]+)$/);
     if (memberReceiptMatch && request.method === 'GET') {
       return handleMemberReceiptPage(request, env, decodeURIComponent(memberReceiptMatch[1]));
     }
 
-    if (url.pathname === '/member' || url.pathname === '/member/' || url.pathname === '/login' || url.pathname === '/login/') {
+    if (['/m', '/m/', '/member', '/member/', '/login', '/login/'].includes(url.pathname)) {
       return html(renderMemberPage(), 200, { 'Cache-Control': 'no-store' });
     }
 
