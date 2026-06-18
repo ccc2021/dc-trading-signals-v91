@@ -137,7 +137,9 @@ TradingView Alert Message 範例：
 }
 ```
 
-止盈止損**以腳本送來的為準**：`stop_loss`/`tp1`/`tp2`/`tp3` 對應 Pine 腳本用 `plot(..., "SL")`、`plot(..., "TP1")` 繪製的數值。腳本有送就照腳本，沒送後台才會用策略規則估算並在訊號上標示「系統估算」。`script` 欄位是顯示在訊號上的腳本名稱（沒填則用來源名稱）。來源可設定為自動發送或先存草稿。
+止盈止損**以腳本送來的為準**：`stop_loss`/`tp1`/`tp2`/`tp3` 對應 Pine 腳本用 `plot(..., "SL")`、`plot(..., "TP1")` 繪製的數值；若不方便加 plot，也可以在下單 `comment` 帶上 `SL=.. TP1=..`，系統會自動從 `order_comment` 解析。腳本有送就照腳本，沒送後台才會用策略規則估算並在訊號上標示「系統估算」。`script` 欄位是顯示在訊號上的腳本名稱（沒填則用來源名稱）。來源可設定為自動發送或先存草稿。
+
+📄 完整接入步驟與 Pine 範例見 [`TRADINGVIEW_SETUP.md`](TRADINGVIEW_SETUP.md)。
 
 > ⚠️ Webhook 必須在數秒內回應，否則 TradingView 會顯示「request took too long and timed out」。本專案已將訊號廣播改為背景執行、webhook 立即回應，避免這個問題。
 

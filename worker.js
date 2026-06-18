@@ -7334,6 +7334,24 @@ function tvScriptLabel(payload, source = null, strategy = null) {
   return 'TradingView';
 }
 
+// 從 alert 文字（order_comment / message 等）解析腳本帶出的止盈止損。
+// 支援多種寫法：SL=4330、sl:4330、stop 4330、TP1=4300、tp1 4300、T/P1 4300 …
+function parseLevelsFromText(...texts) {
+  const text = texts.map((t) => String(t == null ? '' : t)).join(' ');
+  if (!text.trim()) return { stop: null, tp1: null, tp2: null, tp3: null };
+  const num = '(-?\\d+(?:\\.\\d+)?)';
+  const grab = (label) => {
+    const m = text.match(new RegExp(`${label}\\s*[:=]?\\s*${num}`, 'i'));
+    return m ? asNumber(m[1]) : null;
+  };
+  return {
+    stop: grab('\\b(?:sl|stop[\\s_-]?loss|stop)\\b'),
+    tp1: grab('\\b(?:tp1|tp|t[\\s/_-]?p1|take[\\s_-]?profit[\\s_-]?1|target1)\\b'),
+    tp2: grab('\\b(?:tp2|t[\\s/_-]?p2|take[\\s_-]?profit[\\s_-]?2|target2)\\b'),
+    tp3: grab('\\b(?:tp3|t[\\s/_-]?p3|take[\\s_-]?profit[\\s_-]?3|target3)\\b')
+  };
+}
+
 const TRADINGVIEW_WEBHOOK_IPS = new Set([
   '52.89.214.238',
   '34.212.75.30',
@@ -7474,27 +7492,40 @@ async function buildTvSignalDraft(db, source, payload) {
   const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' });
   const tickSize = Number(symbol?.tick_size || 0.25);
   const entry = roundToTick(entryRaw, tickSize);
-  const explicitStop = asNumber(firstTvValue(payload.stop_loss, payload.stopLoss, payload.stop, payload.sl, payload.stop_price, payload.stopPrice));
-  const riskPoints = explicitStop !== null
-    ? Math.abs(entry - explicitStop)
-    : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
-  if (!Number.isFinite(riskPoints) || riskPoints <= 0) throw new Error('策略風控 riskPoints 不正確');
-
-  const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
   const signed = action === 'LONG' ? 1 : -1;
-  const stopLoss = explicitStop !== null ? roundToTick(explicitStop, tickSize) : roundToTick(entry - signed * riskPoints, tickSize);
+  const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
+
+  // 止盈止損「以腳本送來的為準」：
+  // 1) 先看明確的數字欄位（stop_loss / tp1...）；
+  // 2) 沒有的話，從 alert 文字（order_comment / comment / message）解析，例如
+  //    "Adv Short SL=4330 TP1=4300 TP2=4280"，讓只會帶 comment 的策略 alert 也能用；
+  // 3) 都沒有才用策略規則估算，並標示為 system。
+  const textLevels = parseLevelsFromText(tvOrderComment(payload), payload.message, payload.comment, payload.alert_message, payload.alertMessage);
+  const explicitStop = asNumber(firstTvValue(payload.stop_loss, payload.stopLoss, payload.stop, payload.sl, payload.stop_price, payload.stopPrice));
+  const scriptStop = explicitStop !== null ? explicitStop : textLevels.stop;
   const explicitTargets = [
     asNumber(firstTvValue(payload.tp1, payload.take_profit_1, payload.takeProfit1)),
     asNumber(firstTvValue(payload.tp2, payload.take_profit_2, payload.takeProfit2)),
     asNumber(firstTvValue(payload.tp3, payload.take_profit_3, payload.takeProfit3))
   ];
-  const stopFromScript = explicitStop !== null;
-  const targetsFromScript = explicitTargets.some((target) => target !== null);
+  const scriptTargets = [
+    explicitTargets[0] !== null ? explicitTargets[0] : textLevels.tp1,
+    explicitTargets[1] !== null ? explicitTargets[1] : textLevels.tp2,
+    explicitTargets[2] !== null ? explicitTargets[2] : textLevels.tp3
+  ];
+
+  const riskPoints = scriptStop !== null
+    ? Math.abs(entry - scriptStop)
+    : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
+  if (!Number.isFinite(riskPoints) || riskPoints <= 0) throw new Error('策略風控 riskPoints 不正確');
+
+  const stopFromScript = scriptStop !== null;
+  const targetsFromScript = scriptTargets.some((target) => target !== null);
+  const stopLoss = stopFromScript ? roundToTick(scriptStop, tickSize) : roundToTick(entry - signed * riskPoints, tickSize);
   const targets = targetsFromScript
-    ? explicitTargets.map((target) => target === null ? null : roundToTick(target, tickSize))
+    ? scriptTargets.map((target) => target === null ? null : roundToTick(target, tickSize))
     : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
-  // 止盈止損是否完全來自腳本的 alert。只要有任何一項是後台推算的，就標示為 system（系統估算），
-  // 讓會員清楚知道這個點位不是 TradingView 腳本直接給的。
+  // 只要止損或任一目標是後台推算的，就標示為 system（系統估算），讓會員清楚不是腳本直接給的。
   const levelsSource = (stopFromScript && targetsFromScript) ? 'script' : 'system';
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
@@ -8291,7 +8322,7 @@ function renderTradingViewGeneratorHtml() {
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
-    <p class="muted" style="font-size:12px;line-height:1.7">止盈止損會「以腳本送來的為準」。範本中的 <code>stop_loss</code>、<code>tp1</code>、<code>tp2</code>、<code>tp3</code> 對應 Pine 腳本用 <code>plot(..., "SL")</code>、<code>plot(..., "TP1")</code> 等繪製的數值；腳本有送就照腳本，沒送後台才會用策略規則估算並標示「系統估算」。<code>script</code> 欄位是顯示在訊號上的腳本名稱，預設帶入來源名稱，可改成你的 Pine 腳本標題。</p>
+    <p class="muted" style="font-size:12px;line-height:1.7">止盈止損會「以腳本送來的為準」。範本中的 <code>stop_loss</code>、<code>tp1</code>、<code>tp2</code>、<code>tp3</code> 對應 Pine 腳本用 <code>plot(..., "SL")</code>、<code>plot(..., "TP1")</code> 等繪製的數值。若不方便加 plot，也可以在下單 <code>comment</code> 帶上 <code>SL=.. TP1=.. TP2=..</code>，系統會自動從 <code>order_comment</code> 解析。腳本有送就照腳本，沒送後台才會估算並標示「系統估算」。<code>script</code> 欄位是顯示在訊號上的腳本名稱（預設帶來源名稱）。詳見 repo 的 <code>TRADINGVIEW_SETUP.md</code>。</p>
     <div class="preview" id="tvPreview"></div>
   </div>`;
 }
