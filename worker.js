@@ -1576,7 +1576,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // ═══════════════════════════════════════════════════════════════════════════
   // 我的績效 /mystats
   // ═══════════════════════════════════════════════════════════════════════════
-  if (cmd === '/mystats' || cmd === '/perf') {
+  if (cmd === '/mystats') {
     if (user.tier === 'free') {
       // 免費用戶看簡版
       const stats = await db.prepare(`
@@ -2964,6 +2964,8 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
   
   if (cmd === '/perf') {
     const days = parseInt(args[0]) || 7;
+    const since = new Date(Date.now() - days * 86400000);
+    const sinceIso = since.toISOString().replace('T', ' ').slice(0, 19);
     
     const stats = await db.prepare(`
       SELECT 
@@ -2974,12 +2976,13 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
         AVG(CASE WHEN result = 'win' THEN pnl_points END) as avg_win,
         AVG(CASE WHEN result = 'loss' THEN pnl_points END) as avg_loss
       FROM performance 
-      WHERE created_at > datetime('now', '-${days} days')
-    `).first();
+      WHERE created_at > ?
+    `).bind(sinceIso).first();
     
     const winRate = stats?.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(1) : '0';
     
     let m = `<b>績效統計</b> (${days}天)\n\n`;
+    m += `期間：${fmtDateTime(sinceIso)} 至 ${fmtTime()}\n\n`;
     m += `📊 總交易：${stats?.total || 0} 筆\n`;
     m += `✅ 獲利：${stats?.wins || 0} 筆\n`;
     m += `❌ 虧損：${stats?.losses || 0} 筆\n`;
@@ -7128,6 +7131,61 @@ function tvOrderPrice(payload) {
   ));
 }
 
+function tvExplicitNumber(...values) {
+  return asNumber(firstTvValue(...values), null);
+}
+
+function tvEntryPrice(payload) {
+  return tvExplicitNumber(
+    payload.entry_price, payload.entryPrice,
+    payload.entry, payload.entry_level, payload.entryLevel,
+    payload.signal_price, payload.signalPrice,
+    payload.order_price, payload.orderPrice,
+    payload.strategy_order_price, payload.strategyOrderPrice,
+    payload.strategy?.order?.price,
+    payload.price, payload.close, payload.last
+  );
+}
+
+function tvStopLoss(payload) {
+  return tvExplicitNumber(
+    payload.stop_loss, payload.stopLoss,
+    payload.stop, payload.sl,
+    payload.sl_price, payload.slPrice,
+    payload.stop_price, payload.stopPrice,
+    payload.stop_level, payload.stopLevel
+  );
+}
+
+function tvTargetPrice(payload, index) {
+  if (index === 1) {
+    return tvExplicitNumber(
+      payload.tp1, payload.tp_1,
+      payload.target1, payload.target_1,
+      payload.take_profit_1, payload.takeProfit1,
+      payload.take_profit, payload.takeProfit,
+      payload.target_price_1, payload.targetPrice1,
+      payload.tp1_price, payload.tp1Price
+    );
+  }
+  if (index === 2) {
+    return tvExplicitNumber(
+      payload.tp2, payload.tp_2,
+      payload.target2, payload.target_2,
+      payload.take_profit_2, payload.takeProfit2,
+      payload.target_price_2, payload.targetPrice2,
+      payload.tp2_price, payload.tp2Price
+    );
+  }
+  return tvExplicitNumber(
+    payload.tp3, payload.tp_3,
+    payload.target3, payload.target_3,
+    payload.take_profit_3, payload.takeProfit3,
+    payload.target_price_3, payload.targetPrice3,
+    payload.tp3_price, payload.tp3Price
+  );
+}
+
 function cleanUrl(value) {
   const explicit = String(firstTvValue(value)).trim();
   return /^https?:\/\//i.test(explicit) ? explicit : '';
@@ -7276,10 +7334,10 @@ async function selectTvStrategy(db, source, payload, ticker, signalType) {
 async function buildTvSignalDraft(db, source, payload) {
   const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
   const action = normalizeTvAction(payload);
-  const entryRaw = tvOrderPrice(payload);
+  const entryRaw = tvEntryPrice(payload);
   if (!ticker) throw new Error('TradingView alert 缺少 ticker');
   if (!action) throw new Error('TradingView alert 缺少 action，請傳 LONG/SHORT 或 buy/sell');
-  if (entryRaw === null) throw new Error('TradingView alert 缺少 strategy.order.price / price / close');
+  if (entryRaw === null) throw new Error('TradingView alert 缺少 entry_price / strategy.order.price / price / close');
 
   const allowed = parseList(source.allowed_symbols).map((s) => s.toUpperCase());
   if (allowed.length && !allowed.includes(ticker)) throw new Error(`${ticker} 不在此來源允許品種內`);
@@ -7289,8 +7347,8 @@ async function buildTvSignalDraft(db, source, payload) {
   const strategy = await selectTvStrategy(db, source, payload, ticker, signalType);
   const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' });
   const tickSize = Number(symbol?.tick_size || 0.25);
-  const entry = roundToTick(entryRaw, tickSize);
-  const explicitStop = asNumber(firstTvValue(payload.stop_loss, payload.stopLoss, payload.stop, payload.sl, payload.stop_price, payload.stopPrice));
+  const entry = entryRaw;
+  const explicitStop = tvStopLoss(payload);
   const riskPoints = explicitStop !== null
     ? Math.abs(entry - explicitStop)
     : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
@@ -7298,14 +7356,14 @@ async function buildTvSignalDraft(db, source, payload) {
 
   const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
   const signed = action === 'LONG' ? 1 : -1;
-  const stopLoss = explicitStop !== null ? roundToTick(explicitStop, tickSize) : roundToTick(entry - signed * riskPoints, tickSize);
+  const stopLoss = explicitStop !== null ? explicitStop : roundToTick(entry - signed * riskPoints, tickSize);
   const explicitTargets = [
-    asNumber(firstTvValue(payload.tp1, payload.take_profit_1, payload.takeProfit1)),
-    asNumber(firstTvValue(payload.tp2, payload.take_profit_2, payload.takeProfit2)),
-    asNumber(firstTvValue(payload.tp3, payload.take_profit_3, payload.takeProfit3))
+    tvTargetPrice(payload, 1),
+    tvTargetPrice(payload, 2),
+    tvTargetPrice(payload, 3)
   ];
   const targets = explicitTargets.some((target) => target !== null)
-    ? explicitTargets.map((target) => target === null ? null : roundToTick(target, tickSize))
+    ? explicitTargets
     : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
@@ -8028,6 +8086,7 @@ function renderTradingViewGeneratorHtml() {
       <div class="full"><label>Webhook URL</label><input class="readonly" id="tvWebhookUrl" readonly></div>
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
+    <div class="muted">要讓進場、止損、TP 完全等於圖上指標，請確認 Alert Message 內的 stop_loss、tp1、tp2、tp3 對應該指標實際 plot 名稱；若名稱不同，請把 {{plot("SL")}}、{{plot("TP1")}} 等改成圖上指標實際輸出的 Pine alert placeholder。後端收到這些欄位後會原樣保存，不會重算。</div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
@@ -8673,7 +8732,12 @@ function buildTradingViewAlertMessage() {
 	    action: action === 'AUTO' ? '{{strategy.order.action}}' : action,
 	    order_id: '{{strategy.order.id}}',
 	    order_comment: '{{strategy.order.comment}}',
+	    entry_price: '{{strategy.order.price}}',
 	    order_price: '{{strategy.order.price}}',
+	    stop_loss: '{{plot("SL")}}',
+	    tp1: '{{plot("TP1")}}',
+	    tp2: '{{plot("TP2")}}',
+	    tp3: '{{plot("TP3")}}',
 	    contracts: '{{strategy.order.contracts}}',
 	    market_position: '{{strategy.market_position}}',
 	    prev_market_position: '{{strategy.prev_market_position}}',

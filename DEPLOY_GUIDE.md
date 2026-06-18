@@ -340,12 +340,18 @@ Alert Message 範例：
   "strategy": "auto",
   "ticker": "{{ticker}}",
   "action": "{{strategy.order.action}}",
-  "price": "{{close}}",
+  "entry_price": "{{strategy.order.price}}",
+  "stop_loss": "{{plot(\"SL\")}}",
+  "tp1": "{{plot(\"TP1\")}}",
+  "tp2": "{{plot(\"TP2\")}}",
+  "tp3": "{{plot(\"TP3\")}}",
   "time": "{{time}}",
   "interval": "{{interval}}",
   "alert_id": "{{ticker}}-{{time}}-auto"
 }
 ```
+
+如果要讓 Telegram / 後台點位完全等於圖上指標，`stop_loss`、`tp1`、`tp2`、`tp3` 必須由 TradingView Alert Message 傳入指標實際顯示的值。`{{plot("SL")}}`、`{{plot("TP1")}}` 等名稱需改成該指標實際 plot title；也可改用 `{{plot_0}}`、`{{plot_1}}` 這類序號。Worker 收到明確欄位後會原樣保存；缺欄位時才使用後台策略規則補算。
 
 如果 TradingView alert 不是 strategy alert，請在後台產生器把方向改成 `LONG` 或 `SHORT`，避免 `{{strategy.order.action}}` 沒有值。
 

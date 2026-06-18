@@ -125,14 +125,18 @@ TradingView Alert Message 範例：
   "strategy": "auto",
   "ticker": "{{ticker}}",
   "action": "{{strategy.order.action}}",
-  "price": "{{close}}",
+  "entry_price": "{{strategy.order.price}}",
+  "stop_loss": "{{plot(\"SL\")}}",
+  "tp1": "{{plot(\"TP1\")}}",
+  "tp2": "{{plot(\"TP2\")}}",
+  "tp3": "{{plot(\"TP3\")}}",
   "time": "{{time}}",
   "interval": "{{interval}}",
   "alert_id": "{{ticker}}-{{time}}-auto"
 }
 ```
 
-Worker 會依來源、品種、週期與策略規則推算 entry、stop loss、TP1/TP2/TP3。來源可設定為自動發送或先存草稿。
+若 Alert Message 傳入 `entry_price`、`stop_loss`、`tp1`、`tp2`、`tp3`，Worker 會原樣保存這些 TradingView 指標點位，不會依 tick size 重新四捨五入或推算。`{{plot("SL")}}`、`{{plot("TP1")}}` 等名稱需改成該指標實際 plot title；也可改用 `{{plot_0}}`、`{{plot_1}}` 這類序號。只有缺少止損/目標價時，才會依來源、品種、週期與策略規則補算。來源可設定為自動發送或先存草稿。
 
 ## 🛠️ 部署
 
