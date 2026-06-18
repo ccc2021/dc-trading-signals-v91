@@ -2311,7 +2311,10 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
 
 async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
   const db = env.DB;
-  
+  // 確保新欄位（strategy_label / levels_source 等）已存在，避免剛部署後第一個
+  // 動作就是 /long、/short 這類發訊指令時，因欄位未補上而 insert 失敗。
+  await ensureAdminSchema(db);
+
   // ═══════════════════════════════════════════════════════════════════════════
   // 快速發訊
   // ═══════════════════════════════════════════════════════════════════════════
@@ -3962,6 +3965,7 @@ async function getAdminBootstrap(db, env = {}) {
 }
 
 async function createAdminSignal(db, adminId, payload, env = {}) {
+  await ensureAdminSchema(db); // 確保 strategy_label / levels_source 等欄位存在
   const ticker = String(payload.ticker || payload.symbol || payload.instrument || '').trim().toUpperCase();
   const action = String(payload.action || '').toUpperCase();
   const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
@@ -7368,13 +7372,18 @@ function isTrustedTradingViewWebhook(request) {
 }
 
 function inferTvEventKind(payload) {
-  const text = [payload.event, payload.event_type, payload.type, tvOrderId(payload), tvOrderComment(payload), payload.market_position, payload.marketPosition]
-    .map((value) => String(value || '').toLowerCase())
-    .join(' ');
   const market = String(firstTvValue(payload.market_position, payload.marketPosition)).toLowerCase();
   const previous = String(firstTvValue(payload.prev_market_position, payload.prevMarketPosition, payload.previous_position, payload.previousPosition)).toLowerCase();
+  // 有明確倉位資訊時以倉位為準：變成 flat 才是出場，long/short 是進場/持倉。
+  // 這也避免 comment 內帶 "SL=.. TP1=.." 點位標註的進場 alert 被誤判為出場。
   if (market === 'flat' && ['long', 'short'].includes(previous)) return 'exit';
-  if (/\b(exit|close|flat|tp|take profit|takeprofit|sl|stop|stop loss|stoploss)\b/.test(text)) return 'exit';
+  if (market === 'long' || market === 'short') return 'entry';
+  // 沒有倉位資訊時才用文字關鍵字判斷；先移除 "sl=4330"、"tp1=4300" 這類點位標註再比對。
+  const rawText = [payload.event, payload.event_type, payload.type, tvOrderId(payload), tvOrderComment(payload)]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+  const text = rawText.replace(/\b(?:sl|tp\d?|stop(?:[\s_-]?loss)?|take[\s_-]?profit[\s_-]?\d?|target\d?)\s*[:=]?\s*-?\d+(?:\.\d+)?/g, ' ');
+  if (/\b(exit|close|flat|tp\d?|take profit|takeprofit|sl|stop|stop loss|stoploss)\b/.test(text)) return 'exit';
   return 'entry';
 }
 
