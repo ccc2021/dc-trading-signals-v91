@@ -299,7 +299,9 @@ X-Cron-Secret: 你的 CRON_SECRET
 https://你的Worker網址/admin
 ```
 
-登入帳號預設為 `admin`，密碼是 `ADMIN_WEB_PASSWORD`。
+未登入會自動導向 `/admin/login` 登入頁，輸入帳號密碼登入（cookie 維持 12 小時，可在後台右上角登出）。登入帳號預設為 `admin`，密碼是 `ADMIN_WEB_PASSWORD`（支援中文與特殊字元）。`/api/admin/*` 與 `/cron/*` 仍相容 Basic Auth。
+
+> 若曾遇到「輸入正確帳密仍無法登入」，多半是舊版用 `atob` 解碼導致中文／特殊字元密碼比對失敗，已修正。
 
 後台可維護：
 - 訊號與結案
