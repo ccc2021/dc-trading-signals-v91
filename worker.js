@@ -8726,6 +8726,7 @@ function buildTradingViewAlertMessage() {
   var strategy = getSelectedTvStrategy();
   var action = document.getElementById('tvGenAction').value;
 	  var message = {
+	    secret: source.webhook_secret || '',
 	    strategy: strategy ? strategy.strategy_id : 'auto',
 	    ticker: '{{ticker}}',
 	    exchange: '{{exchange}}',
