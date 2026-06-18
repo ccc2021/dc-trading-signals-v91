@@ -401,10 +401,11 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
 
   const tierLine = signal.is_vip_only ? 'VIP 專屬' : (signal.target_group === 'vip' ? 'VIP' : signal.target_group === 'pro' ? 'Pro 以上' : '付費會員');
   const chartUrl = signalMediaUrl(signal);
-  const origin = signal.strategy_id || signal.source || 'TradingView';
+  const scriptLabel = signalScriptLabel(signal);
 
   let msg = `${actionInfo.emoji || ''} <b>${escHtml(action)} ${escHtml(ticker)}</b>\n`;
-  msg += `${typeInfo.emoji || ''} ${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
+  msg += `${typeInfo.emoji || ''} ${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n`;
+  msg += `📜 腳本　${escHtml(scriptLabel)}\n\n`;
 
   msg += `💰 進場　<code>${fmtPrice(entry_price)}</code>\n`;
   msg += `🛑 止損　<code>${fmtPrice(stop_loss)}</code>\n\n`;
@@ -412,6 +413,7 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   if (tp1) msg += `🎯 TP1　<code>${fmtPrice(tp1)}</code>\n`;
   if (tp2) msg += `🎯 TP2　<code>${fmtPrice(tp2)}</code>\n`;
   if (tp3 && isVip) msg += `🎯 TP3　<code>${fmtPrice(tp3)}</code>　VIP\n`;
+  msg += `${signalLevelsNote(signal)}\n`;
   msg += `\n📊 風險　<code>${fmtPrice(risk)}</code> 點\n`;
   msg += `🎯 報酬　<code>1:${rr}</code>\n`;
 
@@ -424,11 +426,30 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
     msg += `建議口數　${contracts} 口\n`;
   }
 
-  msg += `\n${escHtml(origin)} · ${fmtTime()}\n`;
+  msg += `\n${escHtml(scriptLabel)} · ${fmtTime()}\n`;
   msg += `<code>#${escHtml(signal.signal_uid)}</code>`;
   if (chartUrl) msg += `\n<a href="${escHtml(chartUrl)}">查看圖表</a>`;
 
   return msg;
+}
+
+// 訊號要顯示「哪個 TradingView 腳本發出的」：優先用建立時擷取的腳本名稱，
+// 再退回來源 / 策略代號。
+function signalScriptLabel(signal) {
+  return String(
+    signal.strategy_label ||
+    signal.source ||
+    signal.strategy_id ||
+    'TradingView'
+  ).trim() || 'TradingView';
+}
+
+// 止盈止損點位來源說明（給 Telegram 文字用）：
+// script=腳本提供、manual=後台手動、其餘=系統估算。
+function signalLevelsNote(signal) {
+  if (signal.levels_source === 'script') return '✅ 止盈止損依腳本訊號';
+  if (signal.levels_source === 'manual') return '✏️ 止盈止損為後台手動設定';
+  return '⚠️ 止盈止損為系統估算（腳本未提供）';
 }
 
 function signalPreviewOptions(signal) {
@@ -981,6 +1002,7 @@ function formatSignalListItem(sig, tier, options = {}) {
   const lines = [
     `${actionInfo.emoji || ''} <b>${escHtml(side)} ${escHtml(sig.ticker)}</b>`,
     `${typeInfo.emoji || ''} ${escHtml(typeInfo.name)} · ${escHtml(signalStatusLabel(sig))}${escHtml(pnl)}`,
+    `📜 ${escHtml(signalScriptLabel(sig))}`,
     '',
     `💰 進場　<code>${fmtPrice(sig.entry_price)}</code>`,
     `🛑 止損　<code>${fmtPrice(sig.stop_loss)}</code>`
@@ -989,6 +1011,7 @@ function formatSignalListItem(sig, tier, options = {}) {
   if (sig.tp1) lines.push(`🎯 TP1　<code>${fmtPrice(sig.tp1)}</code>`);
   if (sig.tp2) lines.push(`🎯 TP2　<code>${fmtPrice(sig.tp2)}</code>`);
   if (sig.tp3 && tier === 'vip') lines.push(`🎯 TP3　<code>${fmtPrice(sig.tp3)}</code>`);
+  if (sig.levels_source !== 'script') lines.push(signalLevelsNote(sig));
   if (options.includeTimes) {
     const endedAt = sig.closed_at ? fmtSignalTime(sig.closed_at) : '尚未結束';
     lines.push('');
@@ -2336,12 +2359,12 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
       return sendTg(cid, `⚠️ 訊號已暫停\n使用 /resume 恢復`);
     }
     
-    // 儲存訊號
+    // 儲存訊號（Telegram 指令發訊屬於後台手動）
     await db.prepare(`
-      INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind(signalUid, ticker, action, signalType, entry, sl, tp1, tp2, tp3, targetGroup, isVipOnly ? 1 : 0).run();
-    
+      INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, strategy_label, levels_source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind(signalUid, ticker, action, signalType, entry, sl, tp1, tp2, tp3, targetGroup, isVipOnly ? 1 : 0, '後台手動', 'manual').run();
+
     // 建立訊號物件
     const signal = {
       signal_uid: signalUid,
@@ -2349,7 +2372,9 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
       entry_price: entry, stop_loss: sl,
       tp1, tp2, tp3,
       target_group: targetGroup,
-      is_vip_only: isVipOnly
+      is_vip_only: isVipOnly,
+      strategy_label: '後台手動',
+      levels_source: 'manual'
     };
     
     // 廣播訊號
@@ -2404,19 +2429,21 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     const signalType = cmd === '/scalp' ? 'scalp' : 'swing';
     
     await db.prepare(`
-      INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind(signalUid, ticker, action, signalType, entry, sl, tp1, tp2, tp3, targetGroup, isVipOnly ? 1 : 0).run();
-    
+      INSERT INTO signals (signal_uid, ticker, action, signal_type, entry_price, stop_loss, tp1, tp2, tp3, target_group, is_vip_only, strategy_label, levels_source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind(signalUid, ticker, action, signalType, entry, sl, tp1, tp2, tp3, targetGroup, isVipOnly ? 1 : 0, '後台手動', 'manual').run();
+
     const signal = {
       signal_uid: signalUid,
       ticker, action, signal_type: signalType,
       entry_price: entry, stop_loss: sl,
       tp1, tp2, tp3,
       target_group: targetGroup,
-      is_vip_only: isVipOnly
+      is_vip_only: isVipOnly,
+      strategy_label: '後台手動',
+      levels_source: 'manual'
     };
-    
+
     const result = await broadcastSignal(db, signal, env);
     await logAction(db, uid, 'signal', signalUid, `${signalType} ${action} ${ticker}`);
     
@@ -3176,6 +3203,18 @@ const adminHtmlResponse = (body, status = 200, headers = {}) => new Response(bod
   headers: { 'Content-Type': 'text/html; charset=utf-8', ...headers }
 });
 
+const ADMIN_SESSION_COOKIE = 'dc_admin_session';
+const ADMIN_SESSION_TTL = 12 * 3600; // 12 小時
+
+// 把 Basic Auth 的 base64 還原成 UTF-8 字串。atob 只會得到 binary string
+// （每個字元代表一個 byte），若密碼含中文或特殊字元，直接比對會失敗、導致無法登入。
+function decodeBasicAuthUtf8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
 function unauthorizedAdminResponse(message = '需要後台登入') {
   return adminHtmlResponse(message, 401, {
     'WWW-Authenticate': 'Basic realm="DC Signals Admin", charset="UTF-8"',
@@ -3183,40 +3222,87 @@ function unauthorizedAdminResponse(message = '需要後台登入') {
   });
 }
 
-function isAdminHttpRequest(request, env) {
-  const password = env.ADMIN_WEB_PASSWORD;
-  if (!password) return false;
+function adminLoginRedirect() {
+  return new Response(null, {
+    status: 302,
+    headers: { Location: '/admin/login', 'Cache-Control': 'no-store' }
+  });
+}
 
-  const header = request.headers.get('Authorization') || '';
-  if (!header.startsWith('Basic ')) return false;
+async function adminSessionSecret(env) {
+  // 綁定目前的後台密碼：改密碼後舊的登入 session 會自動失效。
+  return sha256Bytes(`dc-admin:${env.ADMIN_WEB_PASSWORD || ''}:${env.BOT_TOKEN || 'dc-admin-session'}`);
+}
 
+async function createAdminSession(env) {
+  const exp = Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL;
+  const payload = base64UrlEncode(JSON.stringify({ u: env.ADMIN_WEB_USER || 'admin', exp }));
+  const sig = await hmacHex(await adminSessionSecret(env), payload);
+  return `${payload}.${sig}`;
+}
+
+async function hasValidAdminSession(request, env) {
+  if (!env.ADMIN_WEB_PASSWORD) return false;
+  const raw = readCookie(request, ADMIN_SESSION_COOKIE);
+  if (!raw) return false;
+  const [payload, sig] = raw.split('.');
+  if (!payload || !sig) return false;
+  const expected = await hmacHex(await adminSessionSecret(env), payload);
+  if (!timingSafeEqual(expected, sig)) return false;
   try {
-    const decoded = atob(header.slice(6));
-    const separator = decoded.indexOf(':');
-    if (separator === -1) return false;
-
-    const username = decoded.slice(0, separator);
-    const provided = decoded.slice(separator + 1);
-    const expectedUser = env.ADMIN_WEB_USER || 'admin';
-    return username === expectedUser && provided === password;
+    const session = JSON.parse(base64UrlDecode(payload));
+    return Number(session.exp || 0) >= Math.floor(Date.now() / 1000);
   } catch {
     return false;
   }
 }
 
-function requireAdminHttp(request, env, wantsJson = false) {
+function adminSessionCookie(value, maxAge = ADMIN_SESSION_TTL) {
+  return `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function clearAdminSessionCookie() {
+  return `${ADMIN_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+// Basic Auth 比對（保留給 API / cron 用）。已修正 UTF-8 解碼問題。
+function basicAuthMatches(request, env) {
+  const password = env.ADMIN_WEB_PASSWORD;
+  if (!password) return false;
+  const header = request.headers.get('Authorization') || '';
+  if (!header.startsWith('Basic ')) return false;
+  try {
+    const decoded = decodeBasicAuthUtf8(header.slice(6));
+    const separator = decoded.indexOf(':');
+    if (separator === -1) return false;
+    const username = decoded.slice(0, separator);
+    const provided = decoded.slice(separator + 1);
+    const expectedUser = env.ADMIN_WEB_USER || 'admin';
+    return timingSafeEqual(username, expectedUser) && timingSafeEqual(provided, password);
+  } catch {
+    return false;
+  }
+}
+
+// 後台請求是否已通過授權：先看登入 cookie（網頁登入頁），再看 Basic Auth（API/cron 相容）。
+async function isAdminHttpRequest(request, env) {
+  if (await hasValidAdminSession(request, env)) return true;
+  return basicAuthMatches(request, env);
+}
+
+async function requireAdminHttp(request, env, wantsJson = false) {
   if (!env.ADMIN_WEB_PASSWORD) {
     return json({ ok: false, error: 'ADMIN_WEB_PASSWORD secret is not configured' }, 503);
   }
-  if (!isAdminHttpRequest(request, env)) {
+  if (!(await isAdminHttpRequest(request, env))) {
     if (wantsJson) return json({ ok: false, error: 'Unauthorized' }, 401);
-    return unauthorizedAdminResponse();
+    return adminLoginRedirect();
   }
   return null;
 }
 
-function requireCronHttp(request, env, url) {
-  if (isAdminHttpRequest(request, env)) return null;
+async function requireCronHttp(request, env, url) {
+  if (await isAdminHttpRequest(request, env)) return null;
   const expected = String(env.CRON_SECRET || '').trim();
   if (!expected) return json({ ok: false, error: 'CRON_SECRET secret is not configured' }, 503);
   const provided = String(
@@ -3227,6 +3313,51 @@ function requireCronHttp(request, env, url) {
   ).trim();
   if (!timingSafeEqual(provided, expected)) return json({ ok: false, error: 'Unauthorized cron request' }, 401);
   return null;
+}
+
+async function handleAdminLogin(request, env) {
+  if (!env.ADMIN_WEB_PASSWORD) {
+    return adminHtmlResponse(renderAdminLoginPage('後台密碼尚未設定，請先以 wrangler secret put ADMIN_WEB_PASSWORD 設定。'), 503, { 'Cache-Control': 'no-store' });
+  }
+  let username = '';
+  let password = '';
+  const contentType = request.headers.get('Content-Type') || '';
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await request.json();
+      username = String(body.username || '');
+      password = String(body.password || '');
+    } else {
+      const form = await request.formData();
+      username = String(form.get('username') || '');
+      password = String(form.get('password') || '');
+    }
+  } catch {}
+
+  // 基本的登入嘗試限流，避免被暴力破解（DB 失敗時不擋登入）。
+  try {
+    const key = await rateKey(['admin-login', requestClientIp(request)]);
+    await enforceRateLimit(env.DB, key, 10, 600, '登入嘗試過多，請稍後再試');
+  } catch (err) {
+    if (err && err.status === 429) {
+      return adminHtmlResponse(renderAdminLoginPage(err.message), 429, { 'Cache-Control': 'no-store' });
+    }
+  }
+
+  const expectedUser = env.ADMIN_WEB_USER || 'admin';
+  if (!timingSafeEqual(username, expectedUser) || !timingSafeEqual(password, env.ADMIN_WEB_PASSWORD)) {
+    return adminHtmlResponse(renderAdminLoginPage('帳號或密碼錯誤，請再試一次。'), 401, { 'Cache-Control': 'no-store' });
+  }
+
+  const session = await createAdminSession(env);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: '/admin',
+      'Set-Cookie': adminSessionCookie(session),
+      'Cache-Control': 'no-store'
+    }
+  });
 }
 
 async function readJsonBody(request) {
@@ -3271,7 +3402,14 @@ async function addColumnIfMissing(db, table, column, definition) {
   if (!tableExists) return;
   const info = await db.prepare(`PRAGMA table_info(${table})`).all();
   const exists = (info.results || []).some((row) => row.name === column);
-  if (!exists) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  if (!exists) {
+    try {
+      await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+    } catch (err) {
+      // 冷啟動時多個請求可能同時補欄位，忽略「欄位已存在」的競態錯誤，其餘照舊拋出。
+      if (!/duplicate column/i.test(String(err && err.message))) throw err;
+    }
+  }
 }
 
 async function ensureRateLimitSchema(db) {
@@ -3322,7 +3460,12 @@ async function enforceRateLimit(db, key, limit, windowSeconds, message) {
   return { allowed: true, remaining: Math.max(0, limit - current - 1), resetAt: row.reset_at_ms };
 }
 
+let adminSchemaReady = false;
 async function ensureAdminSchema(db) {
+  // 同一個 Worker isolate 內只需建表/補欄位一次，避免每次 TradingView webhook
+  // 都重跑十幾個 DDL 造成回應變慢、TradingView 端 timeout。重新部署會換 isolate，
+  // 屆時會再跑一次，所以新增欄位後仍會生效。
+  if (adminSchemaReady) return;
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS strategies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3348,6 +3491,9 @@ async function ensureAdminSchema(db) {
   await addColumnIfMissing(db, 'signals', 'tv_alert_uid', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'chart_url', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'snapshot_url', 'TEXT');
+  // 哪個 TradingView 腳本/來源發出的（顯示用），以及止盈止損點位是腳本提供還是後台估算
+  await addColumnIfMissing(db, 'signals', 'strategy_label', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'levels_source', "TEXT DEFAULT 'system'");
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_active ON strategies(is_active)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
   await db.prepare(`
@@ -3399,6 +3545,7 @@ async function ensureAdminSchema(db) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
   }
+  adminSchemaReady = true;
 }
 
 function hoursSinceDbTime(value) {
@@ -3845,15 +3992,17 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
   const paused = await getConfig(db, 'signals_paused');
   if (sendNow && paused === '1') throw new Error('訊號目前已暫停，請先恢復或儲存草稿');
 
+  // 後台手動建立的訊號不是來自 TradingView 腳本，明確標示為「後台手動」，避免誤會成腳本訊號。
+  const manualLabel = String(payload.strategy_label || payload.script || '後台手動').trim() || '後台手動';
   const signalUid = genUID();
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
-      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, strategy_label, levels_source, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     signalUid, ticker, action, signalType, entry, stopLoss,
-    tp1, tp2, tp3, payload.note || null, chartUrl || null, snapshotUrl || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
+    tp1, tp2, tp3, payload.note || null, chartUrl || null, snapshotUrl || null, targetGroup, isVipOnly ? 1 : 0, manualLabel, 'manual', sendNow ? 'active' : 'pending'
   ).run();
 
   const signal = {
@@ -3870,7 +4019,9 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
     chart_url: chartUrl,
     snapshot_url: snapshotUrl,
     target_group: targetGroup,
-    is_vip_only: isVipOnly ? 1 : 0
+    is_vip_only: isVipOnly ? 1 : 0,
+    strategy_label: manualLabel,
+    levels_source: 'manual'
   };
 
   let delivery = { sent: 0, queued: 0, skipped: 0, total: 0 };
@@ -3882,7 +4033,7 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
   return { signalUid, delivery };
 }
 
-async function closeAdminSignal(db, adminId, signalUid, payload) {
+async function closeAdminSignal(db, adminId, signalUid, payload, ctx = null) {
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal) throw new Error('找不到訊號');
   if (signal.status !== 'active') throw new Error('只有已發送且進行中的訊號可以結案');
@@ -3909,7 +4060,13 @@ async function closeAdminSignal(db, adminId, signalUid, payload) {
 
   let delivery = { sent: 0 };
   if (payload.notify !== false) {
-    delivery = await broadcastExit(db, type, signal.ticker, price, pnl, reason, signalUid);
+    // 來自 TradingView webhook 時用背景廣播，避免逐一發 Telegram 拖慢回應造成 timeout。
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(broadcastExit(db, type, signal.ticker, price, pnl, reason, signalUid).catch((err) => console.error('TradingView exit broadcast error:', err)));
+      delivery = { sent: 0, deferred: true };
+    } else {
+      delivery = await broadcastExit(db, type, signal.ticker, price, pnl, reason, signalUid);
+    }
   }
   await logAction(db, adminId, 'web_signal_close', signalUid, `${type} ${price}`);
   return { signalUid, pnl, result, delivery };
@@ -5233,7 +5390,9 @@ function signalDto(sig, tier = 'free') {
     target_group: sig.target_group,
     is_vip_only: sig.is_vip_only,
     source: sig.source,
-    strategy_id: sig.strategy_id
+    strategy_id: sig.strategy_id,
+    strategy_label: sig.strategy_label || sig.source || sig.strategy_id || null,
+    levels_source: sig.levels_source || 'system'
   };
 }
 
@@ -6239,6 +6398,7 @@ function renderMemberPage() {
     .signal-head { display:flex; justify-content:space-between; gap:10px; }
     .signal-head strong { display:block; font-size:17px; }
     .signal-meta { color:var(--muted); font-size:12px; line-height:1.45; margin-top:4px; }
+    .signal-tags { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 2px; }
     .levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .levels div { background:#f8fafc; border-radius:7px; padding:9px; }
     .levels span { display:block; color:var(--muted); font-size:11px; font-weight:800; margin-bottom:4px; }
@@ -6614,7 +6774,9 @@ function signalPlainText(sig){
   ];
   if(sig.tp3 != null) lines.push('TP3 ' + price(sig.tp3));
   if(sig.exit_price != null) lines.push('結案價 ' + price(sig.exit_price));
-  if(sig.strategy_id) lines.push('策略 ' + sig.strategy_id);
+  lines.push('止盈止損 ' + (sig.levels_source === 'script' ? '依腳本訊號' : sig.levels_source === 'manual' ? '後台手動設定' : '系統估算（腳本未提供）'));
+  var scriptName = sig.strategy_label || sig.source || sig.strategy_id;
+  if(scriptName) lines.push('腳本 ' + scriptName);
   lines.push('#' + sig.signal_uid);
   return lines.join('\\n');
 }
@@ -6655,8 +6817,14 @@ function renderSignal(sig){
   if(sig.snapshot_url) actions += '<a class="btn mini ghost" target="_blank" rel="noopener" href="'+esc(sig.snapshot_url)+'">原始截圖</a>';
   actions += '<button class="btn mini ghost" type="button" data-copy-signal="'+esc(sig.signal_uid)+'">複製文字</button>';
   actions += '</div>';
+  var scriptName = sig.strategy_label || sig.source || sig.strategy_id || 'TradingView';
+  var levelTag = sig.levels_source === 'script'
+    ? chip('✅ 點位依腳本', 'green')
+    : sig.levels_source === 'manual'
+      ? chip('✏️ 後台手動點位', '')
+      : chip('⚠️ 點位系統估算', 'amber');
   var result = sig.pnl_points != null ? '<div class="signal-result">'+chip((Number(sig.pnl_points) >= 0 ? '+' : '') + price(sig.pnl_points) + ' 點', Number(sig.pnl_points) >= 0 ? 'green' : 'red')+(sig.exit_reason?'<span>'+esc(sig.exit_reason)+'</span>':'')+'</div>' : '';
-  return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+actionText(sig))+'</strong><p class="signal-meta">'+esc(signalTime(sig))+'<br>'+esc(sig.signal_type || '-')+(sig.strategy_id?' · '+esc(sig.strategy_id):'')+'</p></div>'+chip(statusText(sig), statusTone(sig) || signalTone(sig))+'</div><div class="levels">'+levels+'</div>'+result+actions+'</article>';
+  return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+actionText(sig))+'</strong><p class="signal-meta">'+esc(signalTime(sig))+'<br>📜 '+esc(scriptName)+' · '+esc(sig.signal_type || '-')+'</p></div>'+chip(statusText(sig), statusTone(sig) || signalTone(sig))+'</div><div class="signal-tags">'+levelTag+'</div><div class="levels">'+levels+'</div>'+result+actions+'</article>';
 }
 function checkbox(name,label,checked){ return '<label class="check"><input type="checkbox" name="'+esc(name)+'" '+(checked?'checked':'')+'> '+esc(label)+'</label>'; }
 function renderSettings(){
@@ -7150,6 +7318,22 @@ function tvChartUrl(payload, ticker) {
   return symbol ? `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}` : '';
 }
 
+// 取得「這個訊號是哪個 TradingView 腳本發出的」的可讀名稱。
+// 優先用 alert 內明確的腳本名稱欄位，其次用此 webhook 來源的名稱（使用者通常一個腳本綁一個來源），
+// 最後才退回後台自動挑選到的策略名稱。
+function tvScriptLabel(payload, source = null, strategy = null) {
+  const explicit = String(firstTvValue(
+    payload.script, payload.script_name, payload.scriptName,
+    payload.strategy_name, payload.strategyName,
+    payload.alert_name, payload.alertName,
+    payload.indicator, payload.title
+  )).trim();
+  if (explicit) return explicit.slice(0, 80);
+  if (source?.name) return String(source.name).trim().slice(0, 80);
+  if (strategy?.name) return String(strategy.name).trim().slice(0, 80);
+  return 'TradingView';
+}
+
 const TRADINGVIEW_WEBHOOK_IPS = new Set([
   '52.89.214.238',
   '34.212.75.30',
@@ -7304,17 +7488,25 @@ async function buildTvSignalDraft(db, source, payload) {
     asNumber(firstTvValue(payload.tp2, payload.take_profit_2, payload.takeProfit2)),
     asNumber(firstTvValue(payload.tp3, payload.take_profit_3, payload.takeProfit3))
   ];
-  const targets = explicitTargets.some((target) => target !== null)
+  const stopFromScript = explicitStop !== null;
+  const targetsFromScript = explicitTargets.some((target) => target !== null);
+  const targets = targetsFromScript
     ? explicitTargets.map((target) => target === null ? null : roundToTick(target, tickSize))
     : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
+  // 止盈止損是否完全來自腳本的 alert。只要有任何一項是後台推算的，就標示為 system（系統估算），
+  // 讓會員清楚知道這個點位不是 TradingView 腳本直接給的。
+  const levelsSource = (stopFromScript && targetsFromScript) ? 'script' : 'system';
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
   const snapshotUrl = tvSnapshotUrl(payload);
   const orderId = tvOrderId(payload);
   const orderComment = tvOrderComment(payload);
+  const strategyLabel = tvScriptLabel(payload, source, strategy);
   const noteParts = [
-    `TradingView: ${source.name}`,
-    `策略: ${strategy.name}`,
+    `腳本: ${strategyLabel}`,
+    `來源: ${source.name}`,
+    `策略規則: ${strategy.name}`,
+    levelsSource === 'script' ? '點位: 腳本提供' : '點位: 系統估算（腳本未提供止盈止損）',
     orderId ? `Order: ${orderId}` : '',
     orderComment ? `Comment: ${orderComment}` : '',
     payload.interval ? `週期: ${payload.interval}` : '',
@@ -7339,36 +7531,51 @@ async function buildTvSignalDraft(db, source, payload) {
     target_group: targetGroup,
     is_vip_only: targetGroup === 'vip' ? 1 : 0,
     strategy_id: strategy.strategy_id,
+    strategy_label: strategyLabel,
+    levels_source: levelsSource,
     source: source.source_id,
     strategy,
     rules
   };
 }
 
-async function createSignalFromTvDraft(db, draft, alertUid, autoSend, env = {}) {
+async function createSignalFromTvDraft(db, draft, alertUid, autoSend, env = {}, ctx = null) {
   const paused = await getConfig(db, 'signals_paused');
   const shouldSend = Boolean(autoSend) && paused !== '1';
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
       tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status,
-      source, strategy_id, tv_alert_uid, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      source, strategy_id, strategy_label, levels_source, tv_alert_uid, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     draft.signal_uid, draft.ticker, draft.action, draft.signal_type, draft.entry_price, draft.stop_loss,
     draft.tp1, draft.tp2, draft.tp3, draft.note, draft.chart_url || null, draft.snapshot_url || null, draft.target_group, draft.is_vip_only,
-    shouldSend ? 'active' : 'pending', draft.source, draft.strategy_id, alertUid
+    shouldSend ? 'active' : 'pending', draft.source, draft.strategy_id, draft.strategy_label || null, draft.levels_source || 'system', alertUid
   ).run();
 
+  // 廣播（逐一發 Telegram）很慢，必須在背景跑，否則 TradingView 端會 timeout。
   let delivery = { sent: 0, queued: 0, skipped: 0, total: 0 };
   if (shouldSend) {
-    delivery = await broadcastSignal(db, draft, env);
-    await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, draft.signal_uid).run();
+    const broadcastTask = (async () => {
+      try {
+        const result = await broadcastSignal(db, draft, env);
+        await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(result.sent, draft.signal_uid).run();
+      } catch (err) {
+        console.error('TradingView broadcast error:', err);
+      }
+    })();
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(broadcastTask);
+      delivery = { sent: 0, queued: 0, skipped: 0, total: 0, deferred: true };
+    } else {
+      await broadcastTask;
+    }
   }
   return { signalUid: draft.signal_uid, status: shouldSend ? 'active' : 'pending', delivery, paused: paused === '1' };
 }
 
-async function closeSignalFromTvExit(db, source, payload, alertUid) {
+async function closeSignalFromTvExit(db, source, payload, alertUid, ctx = null) {
   const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
   if (!ticker) throw new Error('TradingView exit alert 缺少 ticker');
   const price = tvOrderPrice(payload);
@@ -7396,7 +7603,7 @@ async function closeSignalFromTvExit(db, source, payload, alertUid) {
     type,
     reason,
     notify: Boolean(source.auto_send)
-  });
+  }, ctx);
   return { ...result, status: 'closed', ticker, type, price, reason };
 }
 
@@ -7451,13 +7658,17 @@ async function previewTradingViewSignal(db, payload) {
       tp2: draft.tp2,
       tp3: draft.tp3,
       target_group: draft.target_group,
-      strategy_id: draft.strategy_id
+      strategy_id: draft.strategy_id,
+      strategy_label: draft.strategy_label,
+      levels_source: draft.levels_source
     },
-    strategy: { id: draft.strategy.strategy_id, name: draft.strategy.name, rules: draft.rules }
+    strategy: { id: draft.strategy.strategy_id, name: draft.strategy.name, rules: draft.rules },
+    levels_source: draft.levels_source,
+    strategy_label: draft.strategy_label
   };
 }
 
-async function handleTradingViewWebhook(request, env, sourceId, url) {
+async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null) {
   const db = env.DB;
   await ensureAdminSchema(db);
   const source = await getTradingViewSource(db, sourceId);
@@ -7487,7 +7698,7 @@ async function handleTradingViewWebhook(request, env, sourceId, url) {
 
   try {
     if (inferTvEventKind(payload) === 'exit') {
-      const result = await closeSignalFromTvExit(db, source, payload, alertUid);
+      const result = await closeSignalFromTvExit(db, source, payload, alertUid, ctx);
       await db.prepare(`
         INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
@@ -7505,7 +7716,7 @@ async function handleTradingViewWebhook(request, env, sourceId, url) {
     }
 
     const draft = await buildTvSignalDraft(db, source, payload);
-    const result = await createSignalFromTvDraft(db, draft, alertUid, source.auto_send, env);
+    const result = await createSignalFromTvDraft(db, draft, alertUid, source.auto_send, env, ctx);
     await db.prepare(`
       INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
@@ -7521,7 +7732,7 @@ async function handleTradingViewWebhook(request, env, sourceId, url) {
 }
 
 async function handleAdminApi(request, env, pathname) {
-  const auth = requireAdminHttp(request, env, true);
+  const auth = await requireAdminHttp(request, env, true);
   if (auth) return auth;
 
   const db = env.DB;
@@ -7606,6 +7817,55 @@ async function handleAdminApi(request, env, pathname) {
   } catch (e) {
     return json({ ok: false, error: e.message }, 400);
   }
+}
+
+function renderAdminLoginPage(error = '') {
+  const errorHtml = error
+    ? `<div class="alert">${escHtml(error)}</div>`
+    : '';
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DC Signals 後台登入</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+      font-family: -apple-system, "Segoe UI", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+      background: radial-gradient(120% 120% at 50% 0%, #1f2937 0%, #0b1220 60%, #060a12 100%); color: #e5e7eb; }
+    .card { width: 100%; max-width: 380px; background: rgba(17, 24, 39, 0.92); border: 1px solid #243045;
+      border-radius: 18px; padding: 28px 24px; box-shadow: 0 24px 60px rgba(0,0,0,0.45); }
+    .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+    .brand .dot { width: 12px; height: 12px; border-radius: 50%; background: linear-gradient(135deg,#22d3ee,#3b82f6); }
+    h1 { font-size: 20px; margin: 0; letter-spacing: 0.5px; }
+    p.sub { margin: 6px 0 22px; color: #94a3b8; font-size: 13px; }
+    label { display: block; font-size: 13px; color: #cbd5e1; margin: 14px 0 6px; }
+    input { width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #334155;
+      background: #0f172a; color: #f8fafc; font-size: 16px; }
+    input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
+    button { width: 100%; margin-top: 22px; padding: 13px; border: 0; border-radius: 10px; cursor: pointer;
+      font-size: 16px; font-weight: 600; color: #fff; background: linear-gradient(135deg,#2563eb,#1d4ed8); }
+    button:active { transform: translateY(1px); }
+    .alert { margin-bottom: 16px; padding: 11px 14px; border-radius: 10px; font-size: 13px;
+      background: rgba(220,38,38,0.15); border: 1px solid rgba(248,113,113,0.4); color: #fca5a5; }
+    .foot { margin-top: 18px; font-size: 12px; color: #64748b; text-align: center; }
+  </style>
+</head>
+<body>
+  <form class="card" method="POST" action="/admin/login" autocomplete="on">
+    <div class="brand"><span class="dot"></span><h1>DC Signals 後台</h1></div>
+    <p class="sub">請輸入管理員帳號與密碼登入</p>
+    ${errorHtml}
+    <label for="username">帳號</label>
+    <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="admin" required>
+    <label for="password">密碼</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" placeholder="管理員密碼" required>
+    <button type="submit">登入</button>
+    <div class="foot">DC Trading Signals Pro</div>
+  </form>
+</body>
+</html>`;
 }
 
 function renderAdminPage() {
@@ -7779,6 +8039,7 @@ function renderAdminPage() {
     .signal-card-head { display:flex; justify-content:space-between; gap: 10px; align-items:flex-start; }
     .signal-card-head strong { display:block; font-size: 15px; }
     .signal-card-head span { display:block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+    .signal-card-script { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin: 8px 0 4px; font-size: 12px; color: var(--muted); }
     .signal-card-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .signal-card-grid div { background: var(--panel-2); border-radius: 6px; padding: 8px; min-width: 0; }
     .signal-card-grid span { display:block; color: var(--muted); font-size: 11px; font-weight: 800; margin-bottom: 3px; }
@@ -7875,6 +8136,7 @@ function renderAdminPage() {
           <span class="pill"><span class="dot"></span>Worker 線上</span>
           <span class="pill" id="dbPill">D1 連線中</span>
           <button class="btn ghost" id="refreshBtn" type="button">重新整理</button>
+          <a class="btn ghost" href="/admin/logout">登出</a>
         </div>
       </div>
       <section class="content">
@@ -8029,6 +8291,7 @@ function renderTradingViewGeneratorHtml() {
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
+    <p class="muted" style="font-size:12px;line-height:1.7">止盈止損會「以腳本送來的為準」。範本中的 <code>stop_loss</code>、<code>tp1</code>、<code>tp2</code>、<code>tp3</code> 對應 Pine 腳本用 <code>plot(..., "SL")</code>、<code>plot(..., "TP1")</code> 等繪製的數值；腳本有送就照腳本，沒送後台才會用策略規則估算並標示「系統估算」。<code>script</code> 欄位是顯示在訊號上的腳本名稱，預設帶入來源名稱，可改成你的 Pine 腳本標題。</p>
     <div class="preview" id="tvPreview"></div>
   </div>`;
 }
@@ -8350,11 +8613,16 @@ function signalRow(sig, compact) {
   if (compact) {
     return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td>' + esc(sig.ticker) + '</td><td>' + chip(actionText(sig.action), sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + targets + '</td><td>' + chip(statusText(sig), tone) + '</td><td class="actions">' + media + action + '</td></tr>';
   }
-  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">' + esc(sig.source || sig.strategy_id || '') + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(actionText(sig.action), sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + targets + '</td><td>' + media + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(statusText(sig), tone) + '</td><td class="actions">' + action + '</td></tr>';
+  var scriptName = sig.strategy_label || sig.source || sig.strategy_id || 'TradingView';
+  var levelTag = ' ' + (sig.levels_source === 'script' ? chip('腳本點位', 'green') : sig.levels_source === 'manual' ? chip('後台手動', '') : chip('系統估算', 'amber'));
+  return '<tr><td>' + esc(dateText(sig.created_at)) + '</td><td><code>' + esc(sig.signal_uid) + '</code><div class="muted">📜 ' + esc(scriptName) + '</div></td><td>' + esc(sig.ticker) + '</td><td>' + chip(actionText(sig.action), sig.action === 'LONG' ? 'green' : 'red') + '</td><td>' + esc(sig.signal_type) + '</td><td>' + targets + levelTag + '</td><td>' + media + '</td><td>' + esc(sig.sent_count || 0) + '</td><td>' + chip(statusText(sig), tone) + '</td><td class="actions">' + action + '</td></tr>';
 }
 function signalCard(sig) {
+  var scriptName = sig.strategy_label || sig.source || sig.strategy_id || 'TradingView';
+  var levelTag = sig.levels_source === 'script' ? chip('✅ 腳本點位', 'green') : sig.levels_source === 'manual' ? chip('✏️ 後台手動', '') : chip('⚠️ 系統估算', 'amber');
   return '<article class="signal-card">' +
     '<div class="signal-card-head"><div><strong>' + esc(sig.ticker) + ' ' + esc(actionText(sig.action)) + '</strong><span>' + esc(dateText(sig.created_at)) + ' · ' + esc(sig.signal_type || '-') + '</span></div>' + chip(statusText(sig), statusTone(sig.status)) + '</div>' +
+    '<div class="signal-card-script">📜 ' + esc(scriptName) + ' ' + levelTag + '</div>' +
     '<div class="signal-card-grid">' +
       '<div><span>進場</span><strong>' + esc(priceText(sig.entry_price)) + '</strong></div>' +
       '<div><span>止損</span><strong>' + esc(priceText(sig.stop_loss)) + '</strong></div>' +
@@ -8668,6 +8936,7 @@ function buildTradingViewAlertMessage() {
   var action = document.getElementById('tvGenAction').value;
 	  var message = {
 	    strategy: strategy ? strategy.strategy_id : 'auto',
+	    script: source.name,
 	    ticker: '{{ticker}}',
 	    exchange: '{{exchange}}',
 	    action: action === 'AUTO' ? '{{strategy.order.action}}' : action,
@@ -8679,6 +8948,10 @@ function buildTradingViewAlertMessage() {
 	    prev_market_position: '{{strategy.prev_market_position}}',
 	    price: '{{strategy.order.price}}',
 	    close: '{{close}}',
+	    stop_loss: '{{plot("SL")}}',
+	    tp1: '{{plot("TP1")}}',
+	    tp2: '{{plot("TP2")}}',
+	    tp3: '{{plot("TP3")}}',
 	    time: '{{time}}',
 	    interval: '{{interval}}',
 	    chart_url: 'https://www.tradingview.com/chart/?symbol={{exchange}}:{{ticker}}',
@@ -9107,9 +9380,11 @@ document.getElementById('tvPreviewBtn').addEventListener('click', async function
     };
     var result = await api('/api/admin/tradingview/preview', { method: 'POST', body: JSON.stringify(payload) });
     var s = result.signal;
+    var levelTag = s.levels_source === 'system' ? chip('⚠️ 系統估算（腳本未提供）', 'amber') : chip('✅ 依腳本點位', 'green');
     document.getElementById('tvPreview').innerHTML =
-      '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + '</div>' +
+      '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + ' ' + levelTag + '</div>' +
       '<b>' + esc(s.action + ' ' + s.ticker) + '</b>' +
+      '<div class="muted">📜 ' + esc(s.strategy_label || '') + '</div>' +
       '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>';
   } catch (err) {
     showError(err, '預覽 TradingView 訊號失敗');
@@ -9290,12 +9565,23 @@ export default {
         : handleOAuthCallback(request, env, oauthMatch[1], url);
     }
 
+    if (url.pathname === '/admin/login') {
+      if (request.method === 'POST') return handleAdminLogin(request, env);
+      if (await hasValidAdminSession(request, env)) {
+        return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } });
+      }
+      return adminHtmlResponse(renderAdminLoginPage(), 200, { 'Cache-Control': 'no-store' });
+    }
+
     if (url.pathname === '/admin/logout') {
-      return unauthorizedAdminResponse('已登出');
+      return new Response(null, {
+        status: 302,
+        headers: { Location: '/admin/login', 'Set-Cookie': clearAdminSessionCookie(), 'Cache-Control': 'no-store' }
+      });
     }
 
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
-      const auth = requireAdminHttp(request, env);
+      const auth = await requireAdminHttp(request, env);
       if (auth) return auth;
       return adminHtmlResponse(renderAdminPage(), 200, { 'Cache-Control': 'no-store' });
     }
@@ -9336,7 +9622,7 @@ export default {
 
     const tvMatch = url.pathname.match(/^\/(?:tv|tradingview|webhook\/tradingview)\/([A-Za-z0-9-]+)$/);
     if (tvMatch && request.method === 'POST') {
-      return handleTradingViewWebhook(request, env, tvMatch[1], url);
+      return handleTradingViewWebhook(request, env, tvMatch[1], url, ctx);
     }
     
     // 健康檢查
@@ -9356,7 +9642,7 @@ export default {
     
     // Cron - 過期檢查
     if (url.pathname === '/cron/expire') {
-      const auth = requireCronHttp(request, env, url);
+      const auth = await requireCronHttp(request, env, url);
       if (auth) return auth;
       const result = await handleExpireCheck(env);
       return json({ ok: true, ...result });
@@ -9364,7 +9650,7 @@ export default {
     
     // Cron - 到期提醒
     if (url.pathname === '/cron/remind') {
-      const auth = requireCronHttp(request, env, url);
+      const auth = await requireCronHttp(request, env, url);
       if (auth) return auth;
       const result = await handleExpireReminder(env);
       return json({ ok: true, ...result });
@@ -9372,14 +9658,14 @@ export default {
     
     // Cron - 待發訊號
     if (url.pathname === '/cron/queued') {
-      const auth = requireCronHttp(request, env, url);
+      const auth = await requireCronHttp(request, env, url);
       if (auth) return auth;
       const result = await handleQueuedSignals(env);
       return json({ ok: true, ...result });
     }
 
     if (url.pathname === '/cron/security-cleanup') {
-      const auth = requireCronHttp(request, env, url);
+      const auth = await requireCronHttp(request, env, url);
       if (auth) return auth;
       const result = await handleSecurityCleanup(env);
       return json({ ok: true, ...result });

@@ -101,13 +101,13 @@
 https://your-worker.workers.dev/admin
 ```
 
-後台使用 Basic Auth，部署前需設定：
+未登入時會自動導向 `/admin/login` 登入頁（手機友善、可登出）。輸入帳號密碼後會以 cookie session 維持登入 12 小時；`/api/admin/*` 與 `/cron/*` 仍相容 Basic Auth。部署前需設定後台密碼：
 
 ```bash
 wrangler secret put ADMIN_WEB_PASSWORD
 ```
 
-預設帳號由 `wrangler.toml` 的 `ADMIN_WEB_USER` 設定，預設為 `admin`。
+預設帳號由 `wrangler.toml` 的 `ADMIN_WEB_USER` 設定，預設為 `admin`。密碼支援中文與特殊字元。
 
 ### TradingView Alert
 
@@ -123,16 +123,23 @@ TradingView Alert Message 範例：
 {
   "secret": "來源 secret",
   "strategy": "auto",
+  "script": "ICT Silver Bullet",
   "ticker": "{{ticker}}",
   "action": "{{strategy.order.action}}",
   "price": "{{close}}",
+  "stop_loss": "{{plot(\"SL\")}}",
+  "tp1": "{{plot(\"TP1\")}}",
+  "tp2": "{{plot(\"TP2\")}}",
+  "tp3": "{{plot(\"TP3\")}}",
   "time": "{{time}}",
   "interval": "{{interval}}",
   "alert_id": "{{ticker}}-{{time}}-auto"
 }
 ```
 
-Worker 會依來源、品種、週期與策略規則推算 entry、stop loss、TP1/TP2/TP3。來源可設定為自動發送或先存草稿。
+止盈止損**以腳本送來的為準**：`stop_loss`/`tp1`/`tp2`/`tp3` 對應 Pine 腳本用 `plot(..., "SL")`、`plot(..., "TP1")` 繪製的數值。腳本有送就照腳本，沒送後台才會用策略規則估算並在訊號上標示「系統估算」。`script` 欄位是顯示在訊號上的腳本名稱（沒填則用來源名稱）。來源可設定為自動發送或先存草稿。
+
+> ⚠️ Webhook 必須在數秒內回應，否則 TradingView 會顯示「request took too long and timed out」。本專案已將訊號廣播改為背景執行、webhook 立即回應，避免這個問題。
 
 ## 🛠️ 部署
 

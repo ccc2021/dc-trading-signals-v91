@@ -145,7 +145,14 @@ CREATE TABLE signals (
   -- 發送目標
   target_group TEXT DEFAULT 'all',
   is_vip_only INTEGER DEFAULT 0,
-  
+
+  -- TradingView 腳本來源
+  source TEXT,
+  strategy_id TEXT,
+  strategy_label TEXT,                 -- 哪個 TradingView 腳本/來源發出的（顯示用）
+  levels_source TEXT DEFAULT 'system', -- 'script'=止盈止損由腳本提供, 'system'=後台估算
+  tv_alert_uid TEXT,
+
   -- 狀態
   status TEXT DEFAULT 'active' CHECK(status IN ('pending', 'active', 'closed', 'cancelled')),
   
