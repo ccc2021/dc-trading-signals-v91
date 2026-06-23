@@ -3606,7 +3606,8 @@ async function getEconomicSettings(db) {
     enabled: enabled == null ? true : enabled === '1',
     leadMinutes: Math.max(5, Number(lead) || 60),
     currencies: parseEconList(currencies, ['USD']),
-    impacts: parseEconList(impacts, ['High']),
+    // impacts 需正規化成資料庫的 Title-case（High/Medium/Low/Holiday），parseEconList 會轉大寫
+    impacts: [...new Set(parseEconList(impacts, ['High']).map(normalizeEconomicImpact))],
     lastSync: lastSync || null
   };
 }
