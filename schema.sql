@@ -154,7 +154,10 @@ CREATE TABLE signals (
   exit_reason TEXT,
   pnl_points REAL,
   result TEXT CHECK(result IN ('win', 'loss', 'breakeven', NULL)),
-  
+
+  -- 部分止盈：0=未命中、1=TP1(保本)、2=TP2、3=TP3 出場
+  tp_hit_level INTEGER DEFAULT 0,
+
   -- 統計
   sent_count INTEGER DEFAULT 0,
   

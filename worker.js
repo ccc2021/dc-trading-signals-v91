@@ -2469,28 +2469,36 @@ async function handleAdminCommand(cid, uid, cmd, args, fullText, env) {
     }
     
     const type = `TP${tpNum}`;
-    
+    if (!['TP1', 'TP2', 'TP3'].includes(type)) return sendTg(cid, `用法：/tp [品種] [1/2/3] [價格]`);
+
     // 找到對應訊號
     const signal = await db.prepare(`
-      SELECT * FROM signals WHERE ticker = ? AND action IN ('LONG', 'SHORT') AND status = 'active' 
+      SELECT * FROM signals WHERE ticker = ? AND action IN ('LONG', 'SHORT') AND status = 'active'
       ORDER BY created_at DESC LIMIT 1
     `).bind(ticker).first();
-    
+
+    // TP1 / TP2：部分止盈，移動止損保本續抱（不平倉）
+    if (signal && (type === 'TP1' || type === 'TP2')) {
+      const r = await applyPartialTakeProfit(db, uid, signal, type, price, true);
+      return sendTg(cid, `✅ ${type} 部分止盈已發送\n${ticker} @ ${fmtPrice(price)}\n盈虧：${r.pnl >= 0 ? '+' : ''}${fmtPrice(r.pnl)} 點\n止損移到 ${fmtPrice(r.newStop)}（${r.level === 1 ? '保本' : '鎖利'}），續抱中\n發送：${r.delivery.sent} 人`);
+    }
+
     let pnl = null;
     if (signal) {
       pnl = signal.action === 'LONG' ? price - signal.entry_price : signal.entry_price - price;
-      
+      // TP3：全部止盈出場，結案
+      await db.prepare(`UPDATE signals SET status = 'closed', exit_price = ?, pnl_points = ?, result = 'win', exit_reason = ?, tp_hit_level = 3, closed_at = datetime('now') WHERE signal_uid = ?`).bind(price, pnl, type, signal.signal_uid).run();
       // 記錄績效
       await db.prepare(`
         INSERT INTO performance (signal_uid, ticker, direction, signal_type, entry_price, exit_price, pnl_points, result, exit_reason, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'win', ?, datetime('now'))
       `).bind(signal.signal_uid, ticker, signal.action, signal.signal_type, signal.entry_price, price, pnl, type).run();
     }
-    
-    const result = await broadcastExit(db, type, ticker, price, pnl, '恭喜獲利！🎉', signal?.signal_uid);
-    
+
+    const result = await broadcastExit(db, type, ticker, price, pnl, type === 'TP3' ? '全部止盈出場 🎉' : '恭喜獲利！🎉', signal?.signal_uid);
+
     await logAction(db, uid, type, ticker, `${fmtPrice(price)}`);
-    
+
     return sendTg(cid, `✅ ${type} 已發送\n${ticker} @ ${fmtPrice(price)}\n盈虧：${pnl !== null ? (pnl >= 0 ? '+' : '') + fmtPrice(pnl) + '點' : '-'}\n發送：${result.sent} 人`);
   }
   
@@ -3374,6 +3382,8 @@ async function ensureAdminSchema(db) {
   await addColumnIfMissing(db, 'signals', 'tv_alert_uid', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'chart_url', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'snapshot_url', 'TEXT');
+  // 部分止盈狀態：0=未命中、1=TP1 已命中(保本)、2=TP2 已命中
+  await addColumnIfMissing(db, 'signals', 'tp_hit_level', 'INTEGER DEFAULT 0');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_active ON strategies(is_active)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
   // 品種預設止損 / 止盈點位（當 TradingView 沒帶指標點位時使用）
@@ -4260,6 +4270,31 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
   return { signalUid, delivery };
 }
 
+// 部分止盈：TP1/TP2 命中 → 移動止損保本續抱，不平倉
+async function applyPartialTakeProfit(db, actorId, signal, type, price, notify = true) {
+  const level = type === 'TP2' ? 2 : 1;
+  const pnl = signal.action === 'LONG' ? price - signal.entry_price : signal.entry_price - price;
+  // TP1 → 止損移到進場價（保本）；TP2 → 止損移到 TP1（無 TP1 則進場價）
+  const newStop = level === 1
+    ? signal.entry_price
+    : (signal.tp1 != null ? signal.tp1 : signal.entry_price);
+  await db.prepare('UPDATE signals SET stop_loss = ?, tp_hit_level = ? WHERE signal_uid = ?')
+    .bind(newStop, level, signal.signal_uid).run();
+  await db.prepare(`
+    INSERT INTO performance (signal_uid, ticker, direction, signal_type, entry_price, exit_price, pnl_points, result, exit_reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'win', ?, datetime('now'))
+  `).bind(signal.signal_uid, signal.ticker, signal.action, signal.signal_type, signal.entry_price, price, pnl, type).run();
+  const beText = level === 1
+    ? `止損已上移到進場價 ${fmtPrice(signal.entry_price)}（保本），續抱 TP2 / TP3。`
+    : `止損已上移到 TP1 ${fmtPrice(newStop)}，續抱 TP3。`;
+  let delivery = { sent: 0 };
+  if (notify !== false) {
+    delivery = await broadcastExit(db, type, signal.ticker, price, pnl, `部分止盈 🎉 ${beText}`, signal.signal_uid);
+  }
+  if (actorId) await logAction(db, actorId, `partial_${type.toLowerCase()}`, signal.ticker, `${fmtPrice(price)} → SL ${fmtPrice(newStop)}`);
+  return { signalUid: signal.signal_uid, pnl, result: 'win', newStop, level, status: 'active', delivery };
+}
+
 async function closeAdminSignal(db, adminId, signalUid, payload) {
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal) throw new Error('找不到訊號');
@@ -4270,6 +4305,11 @@ async function closeAdminSignal(db, adminId, signalUid, payload) {
 
   const type = String(payload.type || 'CLOSE').toUpperCase();
   if (!['CLOSE', 'TP1', 'TP2', 'TP3', 'SL'].includes(type)) throw new Error('結案類型不正確');
+
+  // TP1 / TP2 改為部分止盈：移動止損保本續抱，不結案
+  if (type === 'TP1' || type === 'TP2') {
+    return applyPartialTakeProfit(db, adminId, signal, type, price, payload.notify);
+  }
   const reason = String(payload.reason || (type === 'SL' ? '止損觸發' : '手動平倉')).trim();
   const pnl = signal.action === 'LONG' ? price - signal.entry_price : signal.entry_price - price;
   const result = type === 'SL' ? 'loss' : pnl > 0.5 ? 'win' : pnl < -0.5 ? 'loss' : 'breakeven';
@@ -5612,6 +5652,7 @@ function signalDto(sig, tier = 'free') {
     tp3: tier === 'vip' ? sig.tp3 : null,
     status: sig.status,
     result: sig.result,
+    tp_hit_level: sig.tp_hit_level || 0,
     pnl_points: sig.pnl_points,
     exit_price: sig.exit_price,
     exit_reason: sig.exit_reason,
@@ -7055,7 +7096,8 @@ function renderSignal(sig){
   actions += '<button class="btn mini ghost" type="button" data-copy-signal="'+esc(sig.signal_uid)+'">複製文字</button>';
   actions += '</div>';
   var result = sig.pnl_points != null ? '<div class="signal-result">'+chip((Number(sig.pnl_points) >= 0 ? '+' : '') + price(sig.pnl_points) + ' 點', Number(sig.pnl_points) >= 0 ? 'green' : 'red')+(sig.exit_reason?'<span>'+esc(sig.exit_reason)+'</span>':'')+'</div>' : '';
-  return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+actionText(sig))+'</strong><p class="signal-meta">'+esc(signalTime(sig))+'<br>'+esc(sig.signal_type || '-')+(sig.strategy_id?' · '+esc(sig.strategy_id):'')+'</p></div>'+chip(statusText(sig), statusTone(sig) || signalTone(sig))+'</div><div class="levels">'+levels+'</div>'+result+actions+'</article>';
+  var partial = (sig.status === 'active' && sig.tp_hit_level > 0) ? chip(sig.tp_hit_level >= 2 ? 'TP2已達·鎖利' : 'TP1已達·保本', 'green') : '';
+  return '<article class="signal"><div class="signal-head"><div><strong>'+esc(sig.ticker+' '+actionText(sig))+'</strong><p class="signal-meta">'+esc(signalTime(sig))+'<br>'+esc(sig.signal_type || '-')+(sig.strategy_id?' · '+esc(sig.strategy_id):'')+'</p></div>'+partial+chip(statusText(sig), statusTone(sig) || signalTone(sig))+'</div><div class="levels">'+levels+'</div>'+result+actions+'</article>';
 }
 function checkbox(name,label,checked){ return '<label class="check"><input type="checkbox" name="'+esc(name)+'" '+(checked?'checked':'')+'> '+esc(label)+'</label>'; }
 function renderSettings(){
@@ -7896,7 +7938,7 @@ async function closeSignalFromTvExit(db, source, payload, alertUid) {
     reason,
     notify: Boolean(source.auto_send)
   });
-  return { ...result, status: 'closed', ticker, type, price, reason };
+  return { ...result, status: result.status || 'closed', ticker, type, price, reason };
 }
 
 async function upsertTradingViewSource(db, payload) {
