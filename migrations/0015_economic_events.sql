@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS economic_events (
   actual TEXT,
   event_at TEXT NOT NULL,
   reminded INTEGER DEFAULT 0,
+  analyzed INTEGER DEFAULT 0,
   source TEXT DEFAULT 'forexfactory',
   synced_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))

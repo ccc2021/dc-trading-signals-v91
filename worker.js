@@ -3380,6 +3380,8 @@ async function ensureAdminSchema(db) {
   const symbolDefaultsExisted = (await db.prepare("PRAGMA table_info(symbols)").all()).results?.some((row) => row.name === 'default_stop_points');
   await addColumnIfMissing(db, 'symbols', 'default_stop_points', 'REAL');
   await addColumnIfMissing(db, 'symbols', 'default_tp_spacing', 'REAL');
+  // 推算模式：auto（有固定點位用固定，否則 R 倍數）/ fixed（固定點位）/ rmultiple（riskPoints × targetR）
+  await addColumnIfMissing(db, 'symbols', 'default_level_mode', "TEXT DEFAULT 'auto'");
   if (!symbolDefaultsExisted) {
     // 首次建立欄位時，帶入黃金品種預設（止損 20、TP 間隔 12）
     await db.prepare("UPDATE symbols SET default_stop_points = 20, default_tp_spacing = 12 WHERE symbol IN ('XAUUSD','GC') AND (default_stop_points IS NULL OR default_stop_points = 0)").run();
@@ -3431,7 +3433,13 @@ async function ensureAdminSchema(db) {
     await db.prepare(`
       INSERT INTO tradingview_sources (source_id, name, webhook_secret, default_strategy_id, allowed_symbols, default_signal_type, target_group, auto_send, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'auto', 'pro', 0, '預設來源，先以草稿模式接收 alert。確認規則後可改為自動發送。').run();
+    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'auto', 'pro', 1, '預設來源，抓到進場位即自動發送訊號。可在後台改回草稿模式。').run();
+  }
+  // 一次性遷移：把既有來源改為自動發送（抓到進場位即推播）
+  const autoSendMigrated = await getConfig(db, 'tv_autosend_migrated');
+  if (autoSendMigrated !== '1') {
+    await db.prepare('UPDATE tradingview_sources SET auto_send = 1 WHERE auto_send = 0').run();
+    await setConfig(db, 'tv_autosend_migrated', '1');
   }
 }
 
@@ -3458,11 +3466,18 @@ async function ensureEconomicSchema(db) {
       actual TEXT,
       event_at TEXT NOT NULL,
       reminded INTEGER DEFAULT 0,
+      analyzed INTEGER DEFAULT 0,
       source TEXT DEFAULT 'forexfactory',
       synced_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )
   `).run();
+  const analyzedExisted = (await db.prepare("PRAGMA table_info(economic_events)").all()).results?.some((row) => row.name === 'analyzed');
+  await addColumnIfMissing(db, 'economic_events', 'analyzed', 'INTEGER DEFAULT 0');
+  if (!analyzedExisted) {
+    // 首次建立欄位時，把「已公布」的歷史事件標記為已解讀，避免上線時對 VIP 回補大量舊事件
+    await db.prepare("UPDATE economic_events SET analyzed = 1 WHERE actual IS NOT NULL AND actual != ''").run();
+  }
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_econ_event_at ON economic_events(event_at)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_econ_reminded ON economic_events(reminded, event_at)').run();
 }
@@ -3628,6 +3643,76 @@ function renderEconomicEventsText(events, title = '財經日曆') {
   return m.trim();
 }
 
+// 把財經數值字串轉成數字（處理 %、$、逗號與 K/M/B/T 後綴）
+function econParseNumber(value) {
+  if (value == null) return null;
+  let s = String(value).trim();
+  if (!s || s === '-') return null;
+  s = s.replace(/[%$,\s]/g, '');
+  const m = s.match(/^(-?\d+(?:\.\d+)?)([kKmMbBtT])?/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const mult = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[(m[2] || '').toLowerCase()] || 1;
+  return n * mult;
+}
+
+// 數值越高代表貨幣越「弱」的反向指標（失業率、失業金申請等）
+const ECON_INVERSE_KEYWORDS = ['unemployment rate', 'jobless', 'initial claims', 'continuing claims', 'misery'];
+function econIsInverseIndicator(title) {
+  const t = String(title || '').toLowerCase();
+  return ECON_INVERSE_KEYWORDS.some((k) => t.includes(k));
+}
+
+// VIP 事件解讀：依實際值偏離預測，研判貨幣與各品種可能多空方向
+function analyzeEconomicEvent(ev) {
+  const actual = econParseNumber(ev.actual);
+  const forecast = econParseNumber(ev.forecast);
+  if (actual == null || forecast == null) return null;
+  const diff = actual - forecast;
+  const eps = Math.max(Math.abs(forecast) * 0.0005, 1e-9);
+  const inverse = econIsInverseIndicator(ev.title);
+  // beat > 0：對該貨幣偏多；< 0：偏空；0：符合預期
+  let beat = 0;
+  if (Math.abs(diff) > eps) beat = (diff > 0 ? 1 : -1) * (inverse ? -1 : 1);
+  const pct = forecast !== 0 ? (diff / Math.abs(forecast)) * 100 : null;
+  return { actual, forecast, diff, beat, pct, inverse, cur: String(ev.country || '').toUpperCase() };
+}
+
+function dirChip(dir) {
+  return dir > 0 ? '偏多 🟢' : dir < 0 ? '偏空 🔴' : '震盪 ⚪';
+}
+
+function renderEconomicAnalysisText(ev, a) {
+  const verdict = a.beat > 0 ? '優於預期' : a.beat < 0 ? '不如預期' : '符合預期';
+  const pctText = a.pct == null ? '' : `（偏離 ${a.pct >= 0 ? '+' : ''}${a.pct.toFixed(1)}%）`;
+  let m = `<b>🧠 VIP 事件解讀</b>\n\n`;
+  m += `${econCurrencyFlag(ev.country)} <b>${escHtml(ev.title)}</b>（${escHtml(ev.country)}）${econImpactLabel(ev.impact)}\n`;
+  m += `公布 <b>${escHtml(ev.actual)}</b> / 預期 ${escHtml(ev.forecast || '-')}｜<b>${verdict}</b>${pctText}\n\n`;
+
+  if (a.cur === 'USD') {
+    const strongerUsd = a.beat > 0;
+    const curWord = a.beat === 0 ? '中性' : strongerUsd ? '偏強 🟢' : '偏弱 🔴';
+    m += `研判：美元 ${curWord}\n`;
+    if (a.beat === 0) {
+      m += `數據貼近預期，方向不明，留意公布後的延伸波動。\n`;
+    } else {
+      const s = strongerUsd ? -1 : 1; // 美元走強 → 美元計價商品多偏空
+      m += `可能影響（機械式研判，僅供參考）：\n`;
+      m += `🥇 貴金屬 XAU/GC：${dirChip(s)}\n`;
+      m += `📈 美股指數 NQ/ES/USTEC：${dirChip(s)}\n`;
+      m += `🛢️ 原油 CL：${dirChip(s)}\n`;
+      m += `💱 美元指數偏${strongerUsd ? '多' : '空'}、歐元/日圓等非美貨幣偏${strongerUsd ? '空' : '多'}\n`;
+    }
+  } else {
+    const curWord = a.beat === 0 ? '中性' : a.beat > 0 ? '偏強 🟢' : '偏弱 🔴';
+    m += `研判：${escHtml(a.cur)} ${curWord}\n`;
+    m += `此為非美元數據，對美元計價的黃金 / 美股指數影響相對間接，主要反映在 ${escHtml(a.cur)} 相關匯率。\n`;
+  }
+  m += `\n⚠️ 以上為「實際值偏離預期」的機械式研判，非投資建議，請搭配盤勢、技術面與風控自行判斷。`;
+  return m;
+}
+
 async function handleEconomicReminders(env) {
   const db = env.DB;
   await ensureEconomicSchema(db);
@@ -3669,7 +3754,30 @@ async function handleEconomicReminders(env) {
     notified += result?.sent || 0;
     await db.prepare('UPDATE economic_events SET reminded = 1 WHERE event_uid = ?').bind(ev.event_uid).run();
   }
-  return { synced, dueEvents: events.length, notified };
+
+  // VIP 事件解讀：數據公布後（有 actual）依偏離預期研判多空，只發給 VIP
+  let analyzedSent = 0;
+  const published = await db.prepare(`
+    SELECT * FROM economic_events
+    WHERE analyzed = 0
+      AND actual IS NOT NULL AND actual != ''
+      AND event_at >= datetime('now', '-12 hours')
+      AND event_at <= datetime('now', '+30 minutes')
+      ${where}
+    ORDER BY event_at DESC
+    LIMIT 20
+  `).bind(...binds).all();
+  for (const ev of published.results || []) {
+    const analysis = analyzeEconomicEvent(ev);
+    if (analysis) {
+      const result = await broadcastMessage(db, renderEconomicAnalysisText(ev, analysis), 'vip', 'alert');
+      analyzedSent += result?.sent || 0;
+    }
+    // 無論能否解讀都標記，避免重複處理
+    await db.prepare('UPDATE economic_events SET analyzed = 1 WHERE event_uid = ?').bind(ev.event_uid).run();
+  }
+
+  return { synced, dueEvents: events.length, notified, analyzed: (published.results || []).length, analyzedSent };
 }
 
 function opsIssue(severity, title, detail, action, view = 'overview') {
@@ -4219,10 +4327,12 @@ async function upsertAdminSymbol(db, payload) {
   const defaultTpRaw = asNumber(payload.default_tp_spacing ?? payload.defaultTpSpacing, null);
   const defaultStop = Number.isFinite(defaultStopRaw) && defaultStopRaw > 0 ? defaultStopRaw : null;
   const defaultTp = Number.isFinite(defaultTpRaw) && defaultTpRaw > 0 ? defaultTpRaw : null;
+  const levelModeRaw = String(payload.default_level_mode ?? payload.defaultLevelMode ?? 'auto').trim().toLowerCase();
+  const levelMode = ['auto', 'fixed', 'rmultiple'].includes(levelModeRaw) ? levelModeRaw : 'auto';
 
   await db.prepare(`
-    INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order, default_stop_points, default_tp_spacing)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order, default_stop_points, default_tp_spacing, default_level_mode)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(symbol) DO UPDATE SET
       name = excluded.name,
       name_zh = excluded.name_zh,
@@ -4232,8 +4342,9 @@ async function upsertAdminSymbol(db, payload) {
       is_active = excluded.is_active,
       sort_order = excluded.sort_order,
       default_stop_points = excluded.default_stop_points,
-      default_tp_spacing = excluded.default_tp_spacing
-  `).bind(symbol, name, nameZh, category, tickSize, tickValue, isActive, sortOrder, defaultStop, defaultTp).run();
+      default_tp_spacing = excluded.default_tp_spacing,
+      default_level_mode = excluded.default_level_mode
+  `).bind(symbol, name, nameZh, category, tickSize, tickValue, isActive, sortOrder, defaultStop, defaultTp, levelMode).run();
   return { symbol };
 }
 
@@ -7627,6 +7738,49 @@ async function selectTvStrategy(db, source, payload, ticker, signalType) {
   return scored[0].strategy;
 }
 
+// 依品種推算模式計算止損 / 止盈點位（永遠回傳結果，不會丟錯，確保抓到進場位就能建立訊號）
+function deriveSignalLevels({ entry, action, tickSize, explicitStop, explicitTargets, symbol, rules }) {
+  const tick = Number(tickSize) || 0.25;
+  const signed = action === 'LONG' ? 1 : -1;
+  const symbolStop = Number(symbol?.default_stop_points);
+  const symbolTp = Number(symbol?.default_tp_spacing);
+  const hasSymbolStop = Number.isFinite(symbolStop) && symbolStop > 0;
+  const hasSymbolTp = Number.isFinite(symbolTp) && symbolTp > 0;
+  const mode = ['auto', 'fixed', 'rmultiple'].includes(String(symbol?.default_level_mode || 'auto').toLowerCase())
+    ? String(symbol?.default_level_mode || 'auto').toLowerCase()
+    : 'auto';
+  const targetR = Array.isArray(rules?.targetR) ? rules.targetR : Array.isArray(rules?.target_r) ? rules.target_r : [1, 2, 3];
+  const ruleRisk = Number(rules?.riskPoints ?? rules?.risk_points);
+
+  // 風險點數：指標止損 > 品種固定止損 > 策略 riskPoints > tick × 120（保底，永不為 0）
+  let riskPoints;
+  if (explicitStop !== null) riskPoints = Math.abs(entry - explicitStop);
+  else if (hasSymbolStop) riskPoints = symbolStop;
+  else if (Number.isFinite(ruleRisk) && ruleRisk > 0) riskPoints = ruleRisk;
+  else riskPoints = tick * 120;
+  if (!Number.isFinite(riskPoints) || riskPoints <= 0) riskPoints = tick * 120;
+
+  const stopLoss = explicitStop !== null ? explicitStop : roundToTick(entry - signed * riskPoints, tick);
+
+  let targets;
+  let basis;
+  if (explicitTargets.some((t) => t !== null)) {
+    targets = explicitTargets;
+    basis = 'indicator';
+  } else {
+    // fixed：強制固定間隔（沒設則退回 R 倍數）；rmultiple：強制 R 倍數；auto：有固定間隔用固定，否則 R 倍數
+    const useFixed = mode === 'rmultiple' ? false : hasSymbolTp;
+    if (useFixed) {
+      targets = [1, 2, 3].map((step) => roundToTick(entry + signed * symbolTp * step, tick));
+      basis = 'fixed';
+    } else {
+      targets = targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tick));
+      basis = 'rmultiple';
+    }
+  }
+  return { stopLoss, targets, riskPoints, mode, basis };
+}
+
 async function buildTvSignalDraft(db, source, payload) {
   const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
   const action = normalizeTvAction(payload);
@@ -7645,32 +7799,13 @@ async function buildTvSignalDraft(db, source, payload) {
   const tickSize = Number(symbol?.tick_size || 0.25);
   const entry = entryRaw;
   const explicitStop = tvStopLoss(payload);
-  // 品種預設點位：當指標沒帶止損 / 止盈時，依後台設定的固定點位推算（例：XAU 止損 20、TP 間隔 12）
-  const symbolStopPoints = Number(symbol?.default_stop_points);
-  const symbolTpSpacing = Number(symbol?.default_tp_spacing);
-  const hasSymbolStop = Number.isFinite(symbolStopPoints) && symbolStopPoints > 0;
-  const hasSymbolTpSpacing = Number.isFinite(symbolTpSpacing) && symbolTpSpacing > 0;
-  const riskPoints = explicitStop !== null
-    ? Math.abs(entry - explicitStop)
-    : hasSymbolStop
-      ? symbolStopPoints
-      : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
-  if (!Number.isFinite(riskPoints) || riskPoints <= 0) throw new Error('策略風控 riskPoints 不正確');
-
-  const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
-  const signed = action === 'LONG' ? 1 : -1;
-  const stopLoss = explicitStop !== null ? explicitStop : roundToTick(entry - signed * riskPoints, tickSize);
   const explicitTargets = [
     tvTargetPrice(payload, 1),
     tvTargetPrice(payload, 2),
     tvTargetPrice(payload, 3)
   ];
-  const targets = explicitTargets.some((target) => target !== null)
-    ? explicitTargets
-    : hasSymbolTpSpacing
-      // 依固定間隔推算 TP1~TP3（TP1 = 進場 ± 間隔、TP2 = 進場 ± 間隔×2、TP3 = 進場 ± 間隔×3）
-      ? [1, 2, 3].map((step) => roundToTick(entry + signed * symbolTpSpacing * step, tickSize))
-      : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
+  // 依品種推算模式計算止損 / 止盈（指標點位 > 品種固定點位 / R 倍數），永不丟錯
+  const { stopLoss, targets } = deriveSignalLevels({ entry, action, tickSize, explicitStop, explicitTargets, symbol, rules });
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
   const snapshotUrl = tvSnapshotUrl(payload);
@@ -8421,8 +8556,9 @@ function renderSymbolFormHtml() {
       <div><label>Tick Value</label><input name="tick_value" inputmode="decimal" value="5"></div>
       <div><label>預設止損點數</label><input name="default_stop_points" inputmode="decimal" placeholder="例：XAU 填 20"></div>
       <div><label>預設 TP 間隔點數</label><input name="default_tp_spacing" inputmode="decimal" placeholder="例：XAU 填 12"></div>
+      <div><label>推算模式</label><select name="default_level_mode"><option value="auto">自動（有固定用固定，否則 R 倍數）</option><option value="fixed">固定點位</option><option value="rmultiple">riskPoints × targetR 倍數</option></select></div>
     </div>
-    <p class="muted" style="margin:0;font-size:12px">當 TradingView 指標沒有帶入止損 / 止盈時，系統會用上面的固定點位推算：止損 = 進場 ± 止損點數，TP1~TP3 = 進場 ± 間隔×1/2/3。留白則改用策略風控規則。</p>
+    <p class="muted" style="margin:0;font-size:12px">當 TradingView 指標沒有帶入止損 / 止盈時的推算方式：<b>固定點位</b> = 進場 ± 止損點數、TP1~TP3 = 進場 ± 間隔×1/2/3；<b>R 倍數</b> = 依策略 riskPoints × targetR。<b>自動</b>：有設固定點位就用固定，否則退回 R 倍數。</p>
     <button class="btn primary" type="submit">儲存品種</button>
   </form>`;
 }
@@ -8885,7 +9021,8 @@ function findUser(userId) {
 }
 function renderSymbols() {
   document.getElementById('symbolsTable').innerHTML = filteredSymbols().map(function (s) {
-    var levels = (s.default_stop_points || s.default_tp_spacing) ? ('SL ' + esc(s.default_stop_points || '-') + ' / TP×' + esc(s.default_tp_spacing || '-')) : '<span class="muted">策略預設</span>';
+    var modeText = { auto: '自動', fixed: '固定', rmultiple: 'R倍數' }[s.default_level_mode || 'auto'] || '自動';
+    var levels = (s.default_stop_points || s.default_tp_spacing) ? ('SL ' + esc(s.default_stop_points || '-') + ' / TP×' + esc(s.default_tp_spacing || '-') + ' · ' + esc(modeText)) : ('<span class="muted">' + esc(modeText) + '</span>');
     return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + levels + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-symbol="' + esc(s.symbol) + '">編輯</button></td></tr>';
   }).join('') || '<tr><td colspan="8" class="muted">尚無品種</td></tr>';
 }
@@ -9175,7 +9312,8 @@ function editSymbol(symbolId) {
     tick_size: symbol.tick_size || 0.25,
     tick_value: symbol.tick_value || 5,
     default_stop_points: symbol.default_stop_points == null ? '' : symbol.default_stop_points,
-    default_tp_spacing: symbol.default_tp_spacing == null ? '' : symbol.default_tp_spacing
+    default_tp_spacing: symbol.default_tp_spacing == null ? '' : symbol.default_tp_spacing,
+    default_level_mode: symbol.default_level_mode || 'auto'
   });
   setMessage('已帶入品種 ' + symbol.symbol + '，修改後按儲存品種', 'ok');
 }

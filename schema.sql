@@ -195,6 +195,7 @@ CREATE TABLE symbols (
   tick_value REAL DEFAULT 5,
   default_stop_points REAL,
   default_tp_spacing REAL,
+  default_level_mode TEXT DEFAULT 'auto',
   is_active INTEGER DEFAULT 1,
   sort_order INTEGER DEFAULT 0
 );
@@ -233,7 +234,7 @@ CREATE TABLE tradingview_sources (
   allowed_symbols TEXT DEFAULT '[]',
   default_signal_type TEXT DEFAULT 'auto',
   target_group TEXT DEFAULT 'pro',
-  auto_send INTEGER DEFAULT 0,
+  auto_send INTEGER DEFAULT 1,
   is_active INTEGER DEFAULT 1,
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
@@ -275,6 +276,7 @@ CREATE TABLE economic_events (
   actual TEXT,
   event_at TEXT NOT NULL,
   reminded INTEGER DEFAULT 0,
+  analyzed INTEGER DEFAULT 0,
   source TEXT DEFAULT 'forexfactory',
   synced_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
