@@ -164,6 +164,15 @@ wrangler d1 execute dc-signals-v91-db --remote --file=schema.sql
 
 看到一堆 `CREATE TABLE` 的輸出就成功了！
 
+> **全新部署**用 `schema.sql` 即可（已含品種預設點位/推算模式、經濟事件等所有欄位）。
+> **升級既有資料庫**請改跑增量 migration（不會清空資料）：
+> ```bash
+> wrangler d1 execute dc-signals-v91-db --remote --file=migrations/0014_symbol_default_levels.sql
+> wrangler d1 execute dc-signals-v91-db --remote --file=migrations/0015_economic_events.sql
+> wrangler d1 execute dc-signals-v91-db --remote --file=migrations/0016_level_mode_and_autosend.sql
+> ```
+> Worker 啟動時也會自動補欄位與一次性遷移（含把既有 TradingView 來源改為自動發送），但建議先手動跑 migration 確保乾淨。
+
 ---
 
 ## 5. 部署 Worker

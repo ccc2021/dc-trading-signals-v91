@@ -138,6 +138,53 @@ TradingView Alert Message 範例：
 
 若 Alert Message 傳入 `entry_price`、`stop_loss`、`tp1`、`tp2`、`tp3`，Worker 會原樣保存這些 TradingView 指標點位，不會依 tick size 重新四捨五入或推算。`{{plot("SL")}}`、`{{plot("TP1")}}` 等名稱需改成該指標實際 plot title；也可改用 `{{plot_0}}`、`{{plot_1}}` 這類序號。只有缺少止損/目標價時，才會依來源、品種、週期與策略規則補算。來源可設定為自動發送或先存草稿。
 
+### 自動發送（抓到進場位即推播）
+
+只要 TradingView alert 帶有 **品種 + 方向 + 進場價**，系統就會建立訊號；止損 / 止盈一律自動補算、不會因為缺點位而擋下訊號。預設來源為**自動發送**，抓到進場位即推播給符合的會員（可在「TradingView」分頁把來源改回草稿模式，先審核再發）。
+
+### 分批止盈與保本續抱
+
+當訊號**觸及 TP** 時，系統採分批出場管理（觸發來源：TradingView 出場 alert 或管理員 `/tp1`、`/tp2`、`/tp3`）：
+
+- **TP1 命中**：通知會員、把止損上移到**進場價（保本）**，續抱到 TP2 / TP3（不平倉）。
+- **TP2 命中**：通知會員、把止損上移到 **TP1（鎖利）**，續抱到 TP3。
+- **TP3 命中 / 止損 / 手動平倉**：整筆結案並記錄績效。
+
+會員中心會在進行中的訊號顯示「TP1已達·保本」「TP2已達·鎖利」標記，止損價也會同步更新。
+
+> 註：偵測「是否觸及」目前依 TradingView 出場 alert 或管理員指令，系統不另外接即時報價盯價；若日後要做「自動盯價觸發」可再擴充。
+
+### 品種預設止損 / 止盈點位與推算模式
+
+當 TradingView 指標**沒有帶入止損 / 止盈**時，系統會依「品種管理」設定推算，每個品種可獨立選擇推算模式：
+
+- **固定點位**：止損 = 進場 ± 止損點數；TP1 / TP2 / TP3 = 進場 ± 間隔 × 1 / 2 / 3
+- **R 倍數**：止損 = `riskPoints`；TP = `riskPoints × targetR`（沿用策略風控規則）
+- **自動（預設）**：有設固定點位就用固定，否則退回 R 倍數
+
+例如黃金（`XAUUSD`、`GC`）預設止損 `20`、TP 間隔 `12`、模式「自動」，做多進場 2650 → 止損 2630、TP1 2662、TP2 2674、TP3 2686。後台「品種管理 → 新增/更新品種」可直接調整每個品種的點位與模式。
+
+> **固定點位 vs R 倍數怎麼選？**
+> - **固定點位**：適合波動相對穩定、且你對該商品有「特定點數」打法的品種（例如黃金短線固定 20/12）。優點是點位直觀好執行；缺點是行情波動放大時，固定點位可能太緊（被掃）或太鬆。
+> - **R 倍數**：以止損為 1R，止盈用倍數推算，能在不同波動度下**維持一致的風險報酬比**，跨品種管理最一致；缺點是實際點位會隨止損變動。
+> - **建議**：用「自動」當系統預設——像黃金這種有明確點位打法的品種設固定點位，其餘品種自動沿用 R 倍數，兼顧直觀與風控一致性。
+
+### 經濟事件 / 財經日曆
+
+後台新增「📅 經濟事件」分頁，資料來自真實來源 **Forex Factory 每週財經日曆 JSON**（可用環境變數 `ECON_CALENDAR_URL` 覆寫）。
+
+- 排程每小時自動同步，並在高影響事件公布前依「提前提醒」分鐘數推播給付費會員（需開啟「行情警報」通知）。預設只提醒 **High（重大）** 影響等級。
+- 後台可調整：是否啟用提醒、提前提醒分鐘數、關注幣別（如 `USD,EUR`）、關注影響等級（`High,Medium,Low`），並可手動「立即同步」。
+- 會員可用 Telegram `/calendar`（或 `/events`）查看未來 48 小時財經日曆，會員中心也會顯示近期重要事件。
+
+#### 🧠 VIP 事件解讀（VIP 專屬）
+
+數據**公布後**（取得 `actual` 實際值），系統會依「實際值偏離預期」自動研判：
+
+- 判斷該數據對貨幣偏多 / 偏空（含失業率、初領失業金等反向指標的修正）。
+- 換算各品種可能方向：貴金屬（XAU/GC）、美股指數（NQ/ES/USTEC）、原油（CL）、美元相關外匯。
+- 只推播給 **VIP** 會員，並附機械式研判與風險提醒（非投資建議）。
+
 ## 🛠️ 部署
 
 ### 1. 建立 D1 資料庫
@@ -198,6 +245,7 @@ wrangler secret put STRIPE_WEBHOOK_SECRET
 ```text
 STRIPE_CURRENCY=twd
 PUBLIC_BASE_URL=https://your-worker.workers.dev
+ECON_CALENDAR_URL=https://nfs.faireconomy.media/ff_calendar_thisweek.json
 ```
 
 Stripe webhook endpoint：
@@ -215,7 +263,7 @@ checkout.session.async_payment_succeeded
 
 ### 3d. 選配手動 Cron 維運
 
-Cloudflare scheduled cron 會自動處理到期提醒、過期降級、待發訊號與限流清理，不需要額外設定。若要從外部手動觸發 `/cron/*` 維運端點，請設定：
+Cloudflare scheduled cron 會自動處理到期提醒、過期降級、待發訊號、限流清理與經濟事件同步/提醒，不需要額外設定。若要從外部手動觸發 `/cron/*` 維運端點（含 `/cron/econ`），請設定：
 
 ```bash
 wrangler secret put CRON_SECRET
@@ -261,6 +309,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-worker.wor
 | `member_password_accounts` | Email + 密碼網站會員帳號 |
 | `rate_limits` | 會員登入與訂單建立速率限制 |
 | `queued_signals` | 待發訊號 |
+| `economic_events` | 經濟事件 / 財經日曆快取與提醒狀態 |
 
 ## 📋 指令統計
 
