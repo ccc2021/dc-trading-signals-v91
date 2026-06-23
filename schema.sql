@@ -193,6 +193,8 @@ CREATE TABLE symbols (
   category TEXT,
   tick_size REAL DEFAULT 0.25,
   tick_value REAL DEFAULT 5,
+  default_stop_points REAL,
+  default_tp_spacing REAL,
   is_active INTEGER DEFAULT 1,
   sort_order INTEGER DEFAULT 0
 );
@@ -257,6 +259,28 @@ CREATE TABLE tv_alert_logs (
   created_at TEXT DEFAULT (datetime('now')),
   UNIQUE(source_id, alert_uid)
 );
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 8b. 經濟事件 / 財經日曆 (economic_events) ★新增
+-- 真實來源：Forex Factory 每週 JSON，由排程每小時同步並在高影響事件前提醒
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS economic_events;
+CREATE TABLE economic_events (
+  event_uid TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  country TEXT,
+  impact TEXT,
+  forecast TEXT,
+  previous TEXT,
+  actual TEXT,
+  event_at TEXT NOT NULL,
+  reminded INTEGER DEFAULT 0,
+  source TEXT DEFAULT 'forexfactory',
+  synced_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_econ_event_at ON economic_events(event_at);
+CREATE INDEX idx_econ_reminded ON economic_events(reminded, event_at);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 8. 自訂群組表 (groups)
@@ -561,6 +585,9 @@ INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, sor
 ('NG', 'Natural Gas', '天然氣', 'energy', 0.001, 10, 21),
 ('6E', 'Euro FX', '歐元', 'forex', 0.00005, 6.25, 30),
 ('6J', 'Japanese Yen', '日圓', 'forex', 0.0000005, 6.25, 31);
+
+-- 黃金品種預設止損 / 止盈點位（無指標點位時自動套用：止損 20 點、TP 間隔 12 點）
+UPDATE symbols SET default_stop_points = 20, default_tp_spacing = 12 WHERE symbol IN ('XAUUSD', 'GC');
 
 -- 預設群組
 INSERT INTO groups (group_name, description) VALUES 

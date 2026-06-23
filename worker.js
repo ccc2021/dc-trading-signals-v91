@@ -846,19 +846,22 @@ function renderUserMenuKeyboard() {
         { text: '我的績效', callback_data: 'u_mystats' }
       ],
       [
-        { text: '訂閱設定', callback_data: 'u_subscribe' },
-        { text: '個人設定', callback_data: 'u_settings' }
+        { text: '📅 財經日曆', callback_data: 'u_calendar' },
+        { text: '訂閱設定', callback_data: 'u_subscribe' }
       ],
       [
-        { text: '升級會員', callback_data: 'u_plans' },
-        { text: '邀請好友', callback_data: 'u_invite' }
+        { text: '個人設定', callback_data: 'u_settings' },
+        { text: '升級會員', callback_data: 'u_plans' }
       ],
       [
-        { text: '我的訂單', callback_data: 'u_orders' },
-        { text: '會員中心', callback_data: 'u_login' }
+        { text: '邀請好友', callback_data: 'u_invite' },
+        { text: '我的訂單', callback_data: 'u_orders' }
       ],
       [
-        { text: '聯繫客服', callback_data: 'u_contact' },
+        { text: '會員中心', callback_data: 'u_login' },
+        { text: '聯繫客服', callback_data: 'u_contact' }
+      ],
+      [
         { text: '幫助說明', callback_data: 'u_help' }
       ]
     ]
@@ -1854,6 +1857,23 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   }
   
   // ═══════════════════════════════════════════════════════════════════════════
+  // 財經日曆 /calendar
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (cmd === '/calendar' || cmd === '/events' || cmd === '/econ' || cmd === '/財經') {
+    const settings = await getEconomicSettings(db);
+    // 免費會員只看高影響；付費會員依後台設定的影響等級
+    const impacts = user.tier === 'free' ? ['High'] : settings.impacts;
+    let events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 });
+    if (!events.length) {
+      // 沒有快取資料時即時抓一次
+      try { await syncEconomicEvents(db, env); events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 }); } catch {}
+    }
+    return sendTg(cid, renderEconomicEventsText(events, '未來 48 小時財經日曆'), {
+      inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]]
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // 幫助說明 /help
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/help') {
@@ -1880,6 +1900,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     
     m += `📊 <b>訊號功能</b>\n`;
     m += `/signals - 最新訊號\n`;
+    m += `/calendar - 財經日曆 / 經濟事件\n`;
     m += `/mystats - 我的績效\n\n`;
 
     m += `💳 <b>訂單收據</b>\n`;
@@ -2126,6 +2147,7 @@ async function handleUserCallback(cid, uid, msgId, data, env, cbId = null) {
   
   // 其他頁面跳轉
   if (data === 'u_signals') return handleUserCommand(cid, uid, '/signals', [], env);
+  if (data === 'u_calendar') return handleUserCommand(cid, uid, '/calendar', [], env);
   if (data === 'u_active') return handleUserCommand(cid, uid, '/active', [], env);
   if (data === 'u_mystats') return handleUserCommand(cid, uid, '/mystats', [], env);
   if (data === 'u_plans') return handleUserCommand(cid, uid, '/plans', [], env);
@@ -3171,7 +3193,8 @@ const ADMIN_CONFIG_KEYS = [
   'trial_days', 'trial_tier', 'signals_paused',
   'contact_telegram', 'contact_line',
   'payment_bank', 'payment_account', 'payment_name',
-  'welcome_message'
+  'welcome_message',
+  'econ_enabled', 'econ_reminder_lead', 'econ_currencies', 'econ_impacts'
 ];
 
 const adminHtmlResponse = (body, status = 200, headers = {}) => new Response(body, {
@@ -3353,6 +3376,14 @@ async function ensureAdminSchema(db) {
   await addColumnIfMissing(db, 'signals', 'snapshot_url', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_active ON strategies(is_active)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_strategies_tier ON strategies(tier)').run();
+  // 品種預設止損 / 止盈點位（當 TradingView 沒帶指標點位時使用）
+  const symbolDefaultsExisted = (await db.prepare("PRAGMA table_info(symbols)").all()).results?.some((row) => row.name === 'default_stop_points');
+  await addColumnIfMissing(db, 'symbols', 'default_stop_points', 'REAL');
+  await addColumnIfMissing(db, 'symbols', 'default_tp_spacing', 'REAL');
+  if (!symbolDefaultsExisted) {
+    // 首次建立欄位時，帶入黃金品種預設（止損 20、TP 間隔 12）
+    await db.prepare("UPDATE symbols SET default_stop_points = 20, default_tp_spacing = 12 WHERE symbol IN ('XAUUSD','GC') AND (default_stop_points IS NULL OR default_stop_points = 0)").run();
+  }
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
     ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
@@ -3408,6 +3439,237 @@ function hoursSinceDbTime(value) {
   const parsed = parseDbTime(value);
   if (!parsed) return null;
   return Math.max(0, Math.round((Date.now() - parsed.getTime()) / 36e5));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 經濟事件 / 財經日曆（真實來源：Forex Factory 每週 JSON）
+// ═══════════════════════════════════════════════════════════════════════════════
+const ECON_DEFAULT_SOURCE = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+
+async function ensureEconomicSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS economic_events (
+      event_uid TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      country TEXT,
+      impact TEXT,
+      forecast TEXT,
+      previous TEXT,
+      actual TEXT,
+      event_at TEXT NOT NULL,
+      reminded INTEGER DEFAULT 0,
+      source TEXT DEFAULT 'forexfactory',
+      synced_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_econ_event_at ON economic_events(event_at)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_econ_reminded ON economic_events(reminded, event_at)').run();
+}
+
+function normalizeEconomicImpact(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v.startsWith('high')) return 'High';
+  if (v.startsWith('med')) return 'Medium';
+  if (v.startsWith('low')) return 'Low';
+  if (v.includes('holiday')) return 'Holiday';
+  return 'Low';
+}
+
+function econImpactLabel(impact) {
+  return { High: '🔴 高影響', Medium: '🟠 中影響', Low: '🟡 低影響', Holiday: '⚪ 休市' }[impact] || impact || '-';
+}
+
+function econCurrencyFlag(country) {
+  const map = { USD: '🇺🇸', EUR: '🇪🇺', GBP: '🇬🇧', JPY: '🇯🇵', CNY: '🇨🇳', AUD: '🇦🇺', CAD: '🇨🇦', CHF: '🇨🇭', NZD: '🇳🇿' };
+  return map[String(country || '').toUpperCase()] || '🌐';
+}
+
+function normalizeEconomicEvent(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = String(raw.title || raw.event || '').trim();
+  const country = String(raw.country || raw.currency || '').trim().toUpperCase();
+  const dateRaw = raw.date || raw.dateline || raw.timestamp;
+  if (!title || !dateRaw) return null;
+  const parsed = new Date(dateRaw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const eventAt = parsed.toISOString();
+  const impact = normalizeEconomicImpact(raw.impact);
+  const forecast = raw.forecast == null ? '' : String(raw.forecast);
+  const previous = raw.previous == null ? '' : String(raw.previous);
+  const actual = raw.actual == null ? '' : String(raw.actual);
+  // 以標題 + 幣別 + 時間組成穩定 uid
+  const uid = `${country}|${eventAt}|${title}`.slice(0, 200);
+  return { event_uid: uid, title, country, impact, forecast, previous, actual, event_at: eventAt };
+}
+
+async function fetchEconomicCalendar(env) {
+  const url = String(env.ECON_CALENDAR_URL || ECON_DEFAULT_SOURCE).trim();
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DCSignals/9.1)', 'Accept': 'application/json' },
+    cf: { cacheTtl: 600 }
+  });
+  if (!res.ok) throw new Error(`經濟日曆來源回應 ${res.status}`);
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error('經濟日曆來源回傳的資料不是 JSON');
+  }
+  if (!Array.isArray(data)) throw new Error('經濟日曆來源格式不正確（預期陣列）');
+  return data.map(normalizeEconomicEvent).filter(Boolean);
+}
+
+async function syncEconomicEvents(db, env) {
+  await ensureEconomicSchema(db);
+  const events = await fetchEconomicCalendar(env);
+  let upserted = 0;
+  for (const ev of events) {
+    // 更新 forecast/previous/actual，但保留既有的 reminded 旗標（避免重複提醒）
+    await db.prepare(`
+      INSERT INTO economic_events (event_uid, title, country, impact, forecast, previous, actual, event_at, reminded, source, synced_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'forexfactory', datetime('now'), datetime('now'))
+      ON CONFLICT(event_uid) DO UPDATE SET
+        title = excluded.title,
+        country = excluded.country,
+        impact = excluded.impact,
+        forecast = excluded.forecast,
+        previous = excluded.previous,
+        actual = excluded.actual,
+        event_at = excluded.event_at,
+        updated_at = datetime('now')
+    `).bind(ev.event_uid, ev.title, ev.country, ev.impact, ev.forecast, ev.previous, ev.actual, ev.event_at).run();
+    upserted++;
+  }
+  // 清掉 30 天前的舊事件
+  await db.prepare("DELETE FROM economic_events WHERE event_at < datetime('now', '-30 days')").run();
+  await setConfig(db, 'econ_last_sync', new Date().toISOString());
+  return { upserted, fetched: events.length };
+}
+
+function econFilterClause(currencies, impacts) {
+  const clauses = [];
+  const binds = [];
+  if (Array.isArray(currencies) && currencies.length) {
+    clauses.push(`country IN (${currencies.map(() => '?').join(',')})`);
+    binds.push(...currencies);
+  }
+  if (Array.isArray(impacts) && impacts.length) {
+    clauses.push(`impact IN (${impacts.map(() => '?').join(',')})`);
+    binds.push(...impacts);
+  }
+  return { where: clauses.length ? ' AND ' + clauses.join(' AND ') : '', binds };
+}
+
+function parseEconList(value, fallback) {
+  const list = String(value == null ? '' : value)
+    .split(/[,\s]+/)
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  return list.length ? list : (fallback || []);
+}
+
+async function getEconomicSettings(db) {
+  const [enabled, lead, currencies, impacts, lastSync] = await Promise.all([
+    getConfig(db, 'econ_enabled'),
+    getConfig(db, 'econ_reminder_lead'),
+    getConfig(db, 'econ_currencies'),
+    getConfig(db, 'econ_impacts'),
+    getConfig(db, 'econ_last_sync')
+  ]);
+  return {
+    enabled: enabled == null ? true : enabled === '1',
+    leadMinutes: Math.max(5, Number(lead) || 60),
+    currencies: parseEconList(currencies, ['USD']),
+    impacts: parseEconList(impacts, ['High']),
+    lastSync: lastSync || null
+  };
+}
+
+async function getUpcomingEconomicEvents(db, { hours = 48, currencies = null, impacts = null, limit = 30 } = {}) {
+  await ensureEconomicSchema(db);
+  const { where, binds } = econFilterClause(currencies, impacts);
+  const rows = await db.prepare(`
+    SELECT * FROM economic_events
+    WHERE event_at >= datetime('now', '-30 minutes')
+      AND event_at <= datetime('now', '+${Number(hours) || 48} hours')
+      ${where}
+    ORDER BY event_at ASC
+    LIMIT ?
+  `).bind(...binds, Number(limit) || 30).all();
+  return rows.results || [];
+}
+
+function fmtEconTime(eventAtIso) {
+  try {
+    return new Date(eventAtIso).toLocaleString('zh-TW', {
+      timeZone: 'Asia/Taipei', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+    });
+  } catch {
+    return eventAtIso;
+  }
+}
+
+function renderEconomicEventsText(events, title = '財經日曆') {
+  if (!events.length) return `<b>${escHtml(title)}</b>\n\n近期沒有符合條件的重要經濟事件。`;
+  let m = `<b>📅 ${escHtml(title)}</b>\n<i>時間為台北 (UTC+8)</i>\n\n`;
+  let lastDay = '';
+  for (const ev of events) {
+    const day = fmtEconTime(ev.event_at).split(' ')[0];
+    if (day !== lastDay) { m += `<b>${escHtml(day)}</b>\n`; lastDay = day; }
+    const time = fmtEconTime(ev.event_at).split(' ')[1] || '';
+    m += `${econCurrencyFlag(ev.country)} <code>${escHtml(time)}</code> ${escHtml(ev.title)} <i>${escHtml(ev.country)}</i> ${econImpactLabel(ev.impact)}\n`;
+    const meta = [];
+    if (ev.forecast) meta.push(`預估 ${escHtml(ev.forecast)}`);
+    if (ev.previous) meta.push(`前值 ${escHtml(ev.previous)}`);
+    if (ev.actual) meta.push(`公布 ${escHtml(ev.actual)}`);
+    if (meta.length) m += `   ${meta.join(' · ')}\n`;
+  }
+  return m.trim();
+}
+
+async function handleEconomicReminders(env) {
+  const db = env.DB;
+  await ensureEconomicSchema(db);
+  const settings = await getEconomicSettings(db);
+  let synced = null;
+  try {
+    synced = await syncEconomicEvents(db, env);
+  } catch (e) {
+    // 同步失敗時仍嘗試用既有資料提醒
+    synced = { error: e.message };
+  }
+  if (!settings.enabled) return { skipped: true, reason: 'disabled', synced };
+
+  const { where, binds } = econFilterClause(settings.currencies, settings.impacts);
+  const due = await db.prepare(`
+    SELECT * FROM economic_events
+    WHERE reminded = 0
+      AND event_at >= datetime('now')
+      AND event_at <= datetime('now', '+${settings.leadMinutes} minutes')
+      ${where}
+    ORDER BY event_at ASC
+    LIMIT 20
+  `).bind(...binds).all();
+
+  const events = due.results || [];
+  let notified = 0;
+  for (const ev of events) {
+    const minutesAway = Math.max(0, Math.round((new Date(ev.event_at).getTime() - Date.now()) / 60000));
+    const meta = [];
+    if (ev.forecast) meta.push(`預估 ${ev.forecast}`);
+    if (ev.previous) meta.push(`前值 ${ev.previous}`);
+    const msg = `<b>⏰ 財經事件提醒</b>\n\n`
+      + `${econCurrencyFlag(ev.country)} <b>${escHtml(ev.title)}</b>（${escHtml(ev.country)}）\n`
+      + `${econImpactLabel(ev.impact)}\n`
+      + `🕒 ${escHtml(fmtEconTime(ev.event_at))}（約 ${minutesAway} 分鐘後）\n`
+      + (meta.length ? `📊 ${escHtml(meta.join(' · '))}\n` : '')
+      + `\n高影響數據公布前後波動加劇，請留意持倉風險。`;
+    const result = await broadcastMessage(db, msg, 'paid', 'alert');
+    notified += result?.sent || 0;
+    await db.prepare('UPDATE economic_events SET reminded = 1 WHERE event_uid = ?').bind(ev.event_uid).run();
+  }
+  return { synced, dueEvents: events.length, notified };
 }
 
 function opsIssue(severity, title, detail, action, view = 'overview') {
@@ -3723,6 +3985,7 @@ async function getAdminBootstrap(db, env = {}) {
   await ensureAdminSchema(db);
   await ensureOrderPaymentSchema(db);
   await ensureSupportSchema(db);
+  await ensureEconomicSchema(db);
 
   const [
     totalUsers, proUsers, vipUsers, todaySignals, activeSignals, pendingOrders,
@@ -3779,6 +4042,8 @@ async function getAdminBootstrap(db, env = {}) {
   for (const row of configRows.results || []) config[row.key] = row.value;
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
   const ops = await getOperationalHealth(db, config, startedAt, env);
+  const economicSettings = await getEconomicSettings(db);
+  const economicEvents = await getUpcomingEconomicEvents(db, { hours: 72, limit: 60 });
 
   return {
     stats: {
@@ -3806,6 +4071,8 @@ async function getAdminBootstrap(db, env = {}) {
     integrations: ops.integrations,
     ops,
     finance,
+    economicSettings,
+    economicEvents,
     supportTickets,
     supportStats: {
       open: Number(supportStats?.open || 0),
@@ -3938,6 +4205,7 @@ async function sendPendingAdminSignal(db, adminId, signalUid, env = {}) {
 }
 
 async function upsertAdminSymbol(db, payload) {
+  await ensureAdminSchema(db);
   const symbol = String(payload.symbol || '').trim().toUpperCase();
   if (!symbol) throw new Error('請輸入品種代碼');
   const name = String(payload.name || symbol).trim();
@@ -3947,10 +4215,14 @@ async function upsertAdminSymbol(db, payload) {
   const tickValue = asNumber(payload.tick_value ?? payload.tickValue, 5);
   const isActive = payload.is_active === false || payload.isActive === false ? 0 : 1;
   const sortOrder = asNumber(payload.sort_order ?? payload.sortOrder, 0);
+  const defaultStopRaw = asNumber(payload.default_stop_points ?? payload.defaultStopPoints, null);
+  const defaultTpRaw = asNumber(payload.default_tp_spacing ?? payload.defaultTpSpacing, null);
+  const defaultStop = Number.isFinite(defaultStopRaw) && defaultStopRaw > 0 ? defaultStopRaw : null;
+  const defaultTp = Number.isFinite(defaultTpRaw) && defaultTpRaw > 0 ? defaultTpRaw : null;
 
   await db.prepare(`
-    INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order, default_stop_points, default_tp_spacing)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(symbol) DO UPDATE SET
       name = excluded.name,
       name_zh = excluded.name_zh,
@@ -3958,8 +4230,10 @@ async function upsertAdminSymbol(db, payload) {
       tick_size = excluded.tick_size,
       tick_value = excluded.tick_value,
       is_active = excluded.is_active,
-      sort_order = excluded.sort_order
-  `).bind(symbol, name, nameZh, category, tickSize, tickValue, isActive, sortOrder).run();
+      sort_order = excluded.sort_order,
+      default_stop_points = excluded.default_stop_points,
+      default_tp_spacing = excluded.default_tp_spacing
+  `).bind(symbol, name, nameZh, category, tickSize, tickValue, isActive, sortOrder, defaultStop, defaultTp).run();
   return { symbol };
 }
 
@@ -4994,7 +5268,8 @@ function integrationReadiness(env = {}) {
         expire: `${baseUrl}/cron/expire`,
         remind: `${baseUrl}/cron/remind`,
         queued: `${baseUrl}/cron/queued`,
-        securityCleanup: `${baseUrl}/cron/security-cleanup`
+        securityCleanup: `${baseUrl}/cron/security-cleanup`,
+        econ: `${baseUrl}/cron/econ`
       }
     }
   };
@@ -5411,6 +5686,14 @@ async function getMemberBootstrap(db, userId, env = {}) {
     order.events = (orderEvents[String(order.order_id || '').toUpperCase()] || []).slice(0, 8);
   }
 
+  // 近期重要經濟事件（免費會員看高影響，付費會員依後台關注設定）
+  let economicEvents = [];
+  try {
+    const econSettings = await getEconomicSettings(db);
+    const econImpacts = (user.tier || 'free') === 'free' ? ['High'] : econSettings.impacts;
+    economicEvents = await getUpcomingEconomicEvents(db, { hours: 48, currencies: econSettings.currencies, impacts: econImpacts, limit: 15 });
+  } catch { economicEvents = []; }
+
   return {
     user: {
       user_id: user.user_id,
@@ -5443,6 +5726,7 @@ async function getMemberBootstrap(db, userId, env = {}) {
     signalTypes: CONFIG.SIGNAL_TYPES,
     signals,
     signalQuery: signalPayload.query,
+    economicEvents,
     orders,
     supportTickets: await getMemberSupportTickets(db, userId, 8),
     security: await getMemberSecurity(db, userId),
@@ -6446,6 +6730,7 @@ function renderMemberPage() {
         <section class="panel"><header><h3>線上訊號</h3><div class="tabs" id="signalTabs"><button class="active" data-member-signal-filter="all" type="button">全部</button><button data-member-signal-filter="active" type="button">進行中</button><button data-member-signal-filter="history" type="button">歷史</button></div></header><div class="body"><div class="signal-toolbar"><div class="date-range"><div><label>起始時間</label><input id="signalStart" type="date"></div><div><label>結束時間</label><input id="signalEnd" type="date"></div></div><button class="btn ghost" id="clearSignalDates" type="button">清除</button><span class="muted" id="signalCount"></span></div><div class="stack" id="signals"></div></div></section>
       </div>
       <aside class="grid">
+        <section class="panel"><header><h3>📅 財經日曆</h3><span class="muted">台北 UTC+8</span></header><div class="body"><div class="stack" id="economicEvents"></div></div></section>
         <section class="panel"><header><h3>升級 / 續費</h3></header><div class="body"><div class="stack"><div class="plan-grid" id="plans"></div><div class="payment-box" id="paymentBox"></div></div></div></section>
         <section class="panel"><header><h3>訂閱設定</h3><button class="btn primary" id="saveBtn">儲存</button></header><div class="body"><form id="settingsForm" class="stack"></form></div></section>
         <section class="panel"><header><h3>帳號安全</h3></header><div class="body"><div id="securityBox" class="security-grid"></div></div></section>
@@ -6860,11 +7145,22 @@ function render(){
   document.getElementById('kpis').innerHTML = [['會員等級',u.tier_name],['剩餘天數',u.tier_expires_at?Math.max(0,Math.ceil((new Date(u.tier_expires_at)-new Date())/86400000))+' 天':'-'],['已訂閱',state.settings.subscribed_symbols.length+' 個品種'],['累計消費',money(u.total_spent)]].map(function(k){return '<div class="kpi"><span>'+esc(k[0])+'</span><strong>'+esc(k[1])+'</strong></div>';}).join('');
   renderSignalsOnly();
   document.getElementById('orders').innerHTML = (state.orders||[]).map(renderOrder).join('') || '<div class="muted">尚無訂單。</div>';
+  renderMemberEconomic();
   renderPlans();
   renderSettings();
   renderSecurity();
   renderSupport();
   showCheckoutReturnToast();
+}
+function memberEconImpact(impact){ if(impact==='High') return chip('高','red'); if(impact==='Medium') return chip('中','amber'); if(impact==='Holiday') return chip('休市',''); return chip('低','green'); }
+function memberEconTime(iso){ try{ return new Date(iso).toLocaleString('zh-TW',{timeZone:'Asia/Taipei',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}); }catch(e){ return iso; } }
+function renderMemberEconomic(){
+  var box=document.getElementById('economicEvents'); if(!box) return;
+  var events=state.economicEvents||[];
+  box.innerHTML = events.map(function(ev){
+    var meta=[]; if(ev.forecast) meta.push('預估 '+esc(ev.forecast)); if(ev.previous) meta.push('前值 '+esc(ev.previous)); if(ev.actual) meta.push('公布 '+esc(ev.actual));
+    return '<div style="border:1px solid var(--line);border-radius:7px;padding:9px 11px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong style="font-size:13px">'+esc(ev.title)+'</strong>'+memberEconImpact(ev.impact)+'</div><div class="muted" style="font-size:12px;margin-top:3px">'+esc(memberEconTime(ev.event_at))+' · '+esc(ev.country||'')+(meta.length?(' · '+meta.join(' · ')):'')+'</div></div>';
+  }).join('') || '<div class="muted">近期沒有重要經濟事件。</div>';
 }
 document.getElementById('saveBtn').addEventListener('click', async function(){
   try{
@@ -7349,9 +7645,16 @@ async function buildTvSignalDraft(db, source, payload) {
   const tickSize = Number(symbol?.tick_size || 0.25);
   const entry = entryRaw;
   const explicitStop = tvStopLoss(payload);
+  // 品種預設點位：當指標沒帶止損 / 止盈時，依後台設定的固定點位推算（例：XAU 止損 20、TP 間隔 12）
+  const symbolStopPoints = Number(symbol?.default_stop_points);
+  const symbolTpSpacing = Number(symbol?.default_tp_spacing);
+  const hasSymbolStop = Number.isFinite(symbolStopPoints) && symbolStopPoints > 0;
+  const hasSymbolTpSpacing = Number.isFinite(symbolTpSpacing) && symbolTpSpacing > 0;
   const riskPoints = explicitStop !== null
     ? Math.abs(entry - explicitStop)
-    : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
+    : hasSymbolStop
+      ? symbolStopPoints
+      : Number(rules.riskPoints || rules.risk_points || tickSize * 120);
   if (!Number.isFinite(riskPoints) || riskPoints <= 0) throw new Error('策略風控 riskPoints 不正確');
 
   const targetR = Array.isArray(rules.targetR) ? rules.targetR : Array.isArray(rules.target_r) ? rules.target_r : [1, 2, 3];
@@ -7364,7 +7667,10 @@ async function buildTvSignalDraft(db, source, payload) {
   ];
   const targets = explicitTargets.some((target) => target !== null)
     ? explicitTargets
-    : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
+    : hasSymbolTpSpacing
+      // 依固定間隔推算 TP1~TP3（TP1 = 進場 ± 間隔、TP2 = 進場 ± 間隔×2、TP3 = 進場 ± 間隔×3）
+      ? [1, 2, 3].map((step) => roundToTick(entry + signed * symbolTpSpacing * step, tickSize))
+      : targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tickSize));
   const targetGroup = source.target_group || (strategy.tier === 'vip' ? 'vip' : 'pro');
   const chartUrl = tvChartUrl(payload, ticker);
   const snapshotUrl = tvSnapshotUrl(payload);
@@ -7632,6 +7938,13 @@ async function handleAdminApi(request, env, pathname) {
 
     if (request.method === 'POST' && parts[0] === 'strategies') {
       return json({ ok: true, data: await upsertAdminStrategy(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'economic' && parts[1] === 'sync') {
+      const result = await syncEconomicEvents(db, env);
+      await logAction(db, adminId, 'web_economic_sync', '', `fetched ${result.fetched}`);
+      const events = await getUpcomingEconomicEvents(db, { hours: 72, limit: 60 });
+      return json({ ok: true, data: { ...result, events } });
     }
 
     if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'sources') {
@@ -7921,6 +8234,7 @@ function renderAdminPage() {
         <button data-view="users" data-icon="◎">會員管理</button>
         <button data-view="orders" data-icon="$">訂單管理</button>
         <button data-view="support" data-icon="?">客服工單</button>
+        <button data-view="economic" data-icon="📅">經濟事件</button>
         <button data-view="billing" data-icon="⚙">收費設定</button>
       </nav>
       <div class="admin-foot"><strong>Dan_mix</strong><span>超級管理員</span></div>
@@ -7965,10 +8279,11 @@ function renderAdminPage() {
         <div class="view" id="view-signals"><div class="grid two"><section class="panel"><header><div><h2>快速發訊</h2><p>手動建立訊號或儲存草稿</p></div><span class="chip green" id="signalMode">即時發送</span></header><div class="body">${renderSignalFormHtml()}</div></section><section class="panel has-mobile-cards"><header><div><h2>訊號工作台</h2><p>審核草稿、發送、結案與取消</p></div><div class="filter-tabs" id="signalFilters"><button data-filter="all" class="active">全部</button><button data-filter="pending">草稿</button><button data-filter="active">已發送</button><button data-filter="closed">結案</button><button data-filter="cancelled">取消</button></div></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>UID</th><th>品種</th><th>方向</th><th>類型</th><th>進場/止損/目標</th><th>圖表</th><th>發送</th><th>狀態</th><th></th></tr></thead><tbody id="signalsTable"></tbody></table></div><div class="mobile-list" id="signalsCards"></div></section></div></div>
         <div class="view" id="view-strategies"><div class="grid two"><section class="panel"><header><h2>策略列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>策略</th><th>等級</th><th>品種</th><th>狀態</th><th></th></tr></thead><tbody id="strategiesTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新策略</h2></header><div class="body">${renderStrategyFormHtml()}</div></section></div></div>
         <div class="view" id="view-tradingview">${renderTradingViewHtml()}</div>
-        <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>狀態</th><th></th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
+        <div class="view" id="view-symbols"><div class="grid two"><section class="panel"><header><h2>品種列表</h2></header><div class="table-wrap"><table><thead><tr><th>排序</th><th>代碼</th><th>名稱</th><th>分類</th><th>Tick</th><th>預設SL/TP</th><th>狀態</th><th></th></tr></thead><tbody id="symbolsTable"></tbody></table></div></section><section class="panel"><header><h2>新增/更新品種</h2></header><div class="body">${renderSymbolFormHtml()}</div></section></div></div>
         <div class="view" id="view-users"><section class="panel"><header><h2>會員維護</h2><span class="muted">最近 150 位用戶，可用上方搜尋</span></header><div class="table-wrap"><table><thead><tr><th>用戶</th><th>等級</th><th>到期</th><th>消費</th><th>狀態</th><th></th></tr></thead><tbody id="usersTable"></tbody></table></div></section></div>
         <div class="view" id="view-orders"><section class="panel"><header><h2>訂單維護</h2></header><div class="table-wrap"><table><thead><tr><th>時間</th><th>訂單</th><th>用戶</th><th>方案</th><th>金額</th><th>付款備註</th><th>狀態</th><th></th></tr></thead><tbody id="ordersTable"></tbody></table></div></section></div>
         <div class="view" id="view-support"><section class="panel"><header><div><h2>客服工單</h2><p>會員問題、付款協助與售後追蹤</p></div><div id="supportBadge"></div></header><div class="table-wrap"><table><thead><tr><th>更新</th><th>工單</th><th>會員</th><th>主旨</th><th>最近內容</th><th>狀態</th><th></th></tr></thead><tbody id="supportTable"></tbody></table></div></section></div>
+        <div class="view" id="view-economic">${renderEconomicHtml()}</div>
         <div class="view" id="view-billing"><section class="panel"><header><h2>收費、付款與系統設定</h2></header><div class="body">${renderConfigFormHtml()}</div></section></div>
         <div class="message" id="message"></div>
       </section>
@@ -7984,6 +8299,7 @@ function renderAdminPage() {
 	    <button data-view-target="users" data-icon="◎">會員</button>
 	    <button data-view-target="orders" data-icon="$">訂單</button>
 	    <button data-view-target="support" data-icon="?">客服</button>
+	    <button data-view-target="economic" data-icon="📅">財經</button>
 	    <button data-view-target="billing" data-icon="⚙">收費</button>
 	  </nav>
   <script>${renderAdminScript()}</script>
@@ -8103,9 +8419,38 @@ function renderSymbolFormHtml() {
       <div><label>狀態</label><select name="is_active"><option value="true">啟用</option><option value="false">停用</option></select></div>
       <div><label>Tick Size</label><input name="tick_size" inputmode="decimal" value="0.25"></div>
       <div><label>Tick Value</label><input name="tick_value" inputmode="decimal" value="5"></div>
+      <div><label>預設止損點數</label><input name="default_stop_points" inputmode="decimal" placeholder="例：XAU 填 20"></div>
+      <div><label>預設 TP 間隔點數</label><input name="default_tp_spacing" inputmode="decimal" placeholder="例：XAU 填 12"></div>
     </div>
+    <p class="muted" style="margin:0;font-size:12px">當 TradingView 指標沒有帶入止損 / 止盈時，系統會用上面的固定點位推算：止損 = 進場 ± 止損點數，TP1~TP3 = 進場 ± 間隔×1/2/3。留白則改用策略風控規則。</p>
     <button class="btn primary" type="submit">儲存品種</button>
   </form>`;
+}
+
+function renderEconomicHtml() {
+  return `<div class="grid two">
+    <section class="panel">
+      <header><div><h2>近期經濟事件</h2><p>真實來源：Forex Factory 每週財經日曆（時間為台北 UTC+8）</p></div>
+        <div class="panel-tools"><button class="btn primary" type="button" id="econSyncBtn">立即同步</button></div></header>
+      <div class="body"><div id="econStatus" class="muted" style="margin-bottom:10px"></div>
+      <div class="table-wrap"><table><thead><tr><th>時間</th><th>幣別</th><th>事件</th><th>影響</th><th>預估</th><th>前值</th><th>公布</th></tr></thead><tbody id="economicTable"></tbody></table></div></div>
+    </section>
+    <section class="panel">
+      <header><h2>提醒設定</h2></header>
+      <div class="body">
+        <form id="economicForm" class="stack">
+          <div class="form-grid">
+            <div><label>啟用提醒</label><select name="econ_enabled"><option value="1">啟用</option><option value="0">停用</option></select></div>
+            <div><label>提前提醒（分鐘）</label><input name="econ_reminder_lead" inputmode="numeric" placeholder="60"></div>
+            <div><label>關注幣別</label><input name="econ_currencies" placeholder="USD,EUR"></div>
+            <div><label>關注影響等級</label><input name="econ_impacts" placeholder="High"></div>
+          </div>
+          <p class="muted" style="margin:0;font-size:12px">系統每小時自動同步並在事件前依「提前提醒」分鐘數推播給付費會員（需開啟「行情警報」通知）。幣別以逗號分隔，例：USD,EUR；影響等級可填 High,Medium,Low。</p>
+          <button class="btn primary" type="submit">儲存提醒設定</button>
+        </form>
+      </div>
+    </section>
+  </div>`;
 }
 
 function renderConfigFormHtml() {
@@ -8200,6 +8545,7 @@ function renderAll() {
   renderUsers();
   renderSymbols();
   renderStrategies();
+  renderEconomic();
   renderTradingView();
   renderStrategyHealth();
   renderTvGateway();
@@ -8539,8 +8885,9 @@ function findUser(userId) {
 }
 function renderSymbols() {
   document.getElementById('symbolsTable').innerHTML = filteredSymbols().map(function (s) {
-    return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-symbol="' + esc(s.symbol) + '">編輯</button></td></tr>';
-  }).join('') || '<tr><td colspan="7" class="muted">尚無品種</td></tr>';
+    var levels = (s.default_stop_points || s.default_tp_spacing) ? ('SL ' + esc(s.default_stop_points || '-') + ' / TP×' + esc(s.default_tp_spacing || '-')) : '<span class="muted">策略預設</span>';
+    return '<tr><td>' + esc(s.sort_order) + '</td><td><code>' + esc(s.symbol) + '</code></td><td>' + esc(s.name_zh || s.name) + '</td><td>' + esc(s.category) + '</td><td>' + esc(s.tick_size) + ' / ' + esc(s.tick_value) + '</td><td>' + levels + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-symbol="' + esc(s.symbol) + '">編輯</button></td></tr>';
+  }).join('') || '<tr><td colspan="8" class="muted">尚無品種</td></tr>';
 }
 function filteredSymbols() {
   return (state.data.symbols || []).filter(function (symbol) {
@@ -8551,6 +8898,38 @@ function renderStrategies() {
   document.getElementById('strategiesTable').innerHTML = filteredStrategies().map(function (s) {
     return '<tr><td>' + esc(s.sort_order) + '</td><td><div>' + esc(s.name) + '</div><div class="muted"><code>' + esc(s.strategy_id) + '</code></div></td><td>' + chip(s.tier, s.tier === 'vip' ? 'amber' : 'green') + '</td><td>' + esc(parseJsonList(s.symbols).join(', ')) + '</td><td>' + (s.is_active ? chip('啟用','green') : chip('停用','red')) + '</td><td class="actions"><button class="btn ghost" data-edit-strategy="' + esc(s.strategy_id) + '">編輯</button></td></tr>';
   }).join('') || '<tr><td colspan="6" class="muted">尚無策略</td></tr>';
+}
+function econImpactChip(impact) {
+  if (impact === 'High') return chip('高', 'red');
+  if (impact === 'Medium') return chip('中', 'amber');
+  if (impact === 'Holiday') return chip('休市', '');
+  return chip('低', 'green');
+}
+function econTaipei(iso) {
+  try { return new Date(iso).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }); }
+  catch (e) { return iso; }
+}
+function renderEconomic() {
+  var table = document.getElementById('economicTable');
+  if (table) {
+    var events = state.data.economicEvents || [];
+    table.innerHTML = events.map(function (ev) {
+      return '<tr><td>' + esc(econTaipei(ev.event_at)) + '</td><td>' + esc(ev.country || '-') + '</td><td>' + esc(ev.title) + '</td><td>' + econImpactChip(ev.impact) + '</td><td>' + esc(ev.forecast || '-') + '</td><td>' + esc(ev.previous || '-') + '</td><td>' + esc(ev.actual || '-') + '</td></tr>';
+    }).join('') || '<tr><td colspan="7" class="muted">尚無事件，請點「立即同步」</td></tr>';
+  }
+  var status = document.getElementById('econStatus');
+  var settings = state.data.economicSettings || {};
+  if (status) {
+    var last = settings.lastSync ? econTaipei(settings.lastSync) : '尚未同步';
+    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 提前 ' + (settings.leadMinutes || 60) + ' 分鐘';
+  }
+  var form = document.getElementById('economicForm');
+  if (form) {
+    if (form.elements.econ_enabled) form.elements.econ_enabled.value = settings.enabled === false ? '0' : '1';
+    if (form.elements.econ_reminder_lead) form.elements.econ_reminder_lead.value = settings.leadMinutes || 60;
+    if (form.elements.econ_currencies) form.elements.econ_currencies.value = (settings.currencies || []).join(',');
+    if (form.elements.econ_impacts) form.elements.econ_impacts.value = (settings.impacts || []).join(',');
+  }
 }
 function filteredStrategies() {
   return (state.data.strategies || []).filter(function (strategy) {
@@ -8762,7 +9141,7 @@ function parseObject(value, fallback) { try { var parsed = typeof value === 'str
 function formPayload(form) {
   var data = {};
   Array.prototype.slice.call(new FormData(form).entries()).forEach(function (pair) { data[pair[0]] = pair[1]; });
-  ['entry_price','stop_loss','tp1','tp2','tp3','tick_size','tick_value','sort_order'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
+  ['entry_price','stop_loss','tp1','tp2','tp3','tick_size','tick_value','sort_order','default_stop_points','default_tp_spacing'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
   ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
   return data;
 }
@@ -8794,7 +9173,9 @@ function editSymbol(symbolId) {
     category: symbol.category || 'index',
     is_active: symbol.is_active ? 'true' : 'false',
     tick_size: symbol.tick_size || 0.25,
-    tick_value: symbol.tick_value || 5
+    tick_value: symbol.tick_value || 5,
+    default_stop_points: symbol.default_stop_points == null ? '' : symbol.default_stop_points,
+    default_tp_spacing: symbol.default_tp_spacing == null ? '' : symbol.default_tp_spacing
   });
   setMessage('已帶入品種 ' + symbol.symbol + '，修改後按儲存品種', 'ok');
 }
@@ -9152,6 +9533,8 @@ document.getElementById('signalForm').addEventListener('input', updateSignalPrev
 document.getElementById('signalForm').addEventListener('change', updateSignalPreview);
 document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); } catch (err) { showError(err, '儲存設定失敗'); } });
 document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存品種失敗'); } });
+document.getElementById('economicForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); setMessage('經濟事件提醒設定已儲存', 'ok'); } catch (err) { showError(err, '儲存提醒設定失敗'); } });
+document.getElementById('econSyncBtn').addEventListener('click', async function () { var btn = this; btn.disabled = true; setMessage('同步財經日曆中...'); try { var res = await api('/api/admin/economic/sync', { method: 'POST', body: '{}' }); await load(); setMessage('已同步 ' + ((res && res.fetched) || 0) + ' 筆經濟事件', 'ok'); } catch (err) { showError(err, '同步財經日曆失敗'); } finally { btn.disabled = false; } });
 document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存策略失敗'); } });
 document.getElementById('tvSourceForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/tradingview/sources', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存 TradingView 來源失敗'); } });
 ['tvGenSource','tvGenStrategy','tvGenTicker','tvGenAction','tvGenInterval','tvGenPrice'].forEach(function (id) {
@@ -9449,7 +9832,15 @@ export default {
       const result = await handleSecurityCleanup(env);
       return json({ ok: true, ...result });
     }
-    
+
+    // Cron - 經濟事件同步與提醒
+    if (url.pathname === '/cron/econ') {
+      const auth = requireCronHttp(request, env, url);
+      if (auth) return auth;
+      const result = await handleEconomicReminders(env);
+      return json({ ok: true, ...result });
+    }
+
     return json({ error: 'Not found' }, 404);
   },
   
@@ -9471,5 +9862,11 @@ export default {
     
     await handleQueuedSignals(env);
     await handleSecurityCleanup(env);
+    // 每小時同步財經日曆並在高影響事件前提醒付費會員
+    try {
+      await handleEconomicReminders(env);
+    } catch (e) {
+      // 經濟事件提醒失敗不影響其他排程
+    }
   }
 };
