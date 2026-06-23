@@ -7909,7 +7909,8 @@ async function upsertTradingViewSource(db, payload) {
   const allowedSymbols = cleanListValue(payload.allowed_symbols ?? payload.allowedSymbols ?? existing?.allowed_symbols ?? []);
   const defaultSignalType = String(payload.default_signal_type || payload.defaultSignalType || existing?.default_signal_type || 'auto').trim() || 'auto';
   const targetGroup = String(payload.target_group || payload.targetGroup || existing?.target_group || 'pro').trim();
-  const autoSend = payload.auto_send === true || payload.autoSend === true || payload.auto_send === 'true' || payload.autoSend === 'true' ? 1 : 0;
+  // 預設自動發送：只有明確設為 false 才當草稿
+  const autoSend = (payload.auto_send === false || payload.autoSend === false || payload.auto_send === 'false' || payload.autoSend === 'false') ? 0 : 1;
   const isActive = payload.is_active === false || payload.isActive === false || payload.is_active === 'false' || payload.isActive === 'false' ? 0 : 1;
   const notes = String(payload.notes || existing?.notes || '').trim();
 
@@ -8516,7 +8517,7 @@ function renderTradingViewSourceFormHtml() {
       <div><label>預設策略</label><select name="default_strategy_id" id="tvDefaultStrategy"></select></div>
       <div><label>訊號類型</label><select name="default_signal_type"><option value="auto">自動</option><option value="scalp">短線</option><option value="daytrade">日內</option><option value="swing">波段</option></select></div>
       <div><label>發送目標</label><select name="target_group"><option value="pro">Pro 以上</option><option value="vip">VIP 專屬</option><option value="all">全部付費會員</option></select></div>
-      <div><label>接收模式</label><select name="auto_send"><option value="false">先存草稿</option><option value="true">自動發送</option></select></div>
+      <div><label>接收模式</label><select name="auto_send"><option value="true">自動發送</option><option value="false">先存草稿</option></select></div>
       <div><label>狀態</label><select name="is_active"><option value="true">啟用</option><option value="false">停用</option></select></div>
       <div class="full"><label>允許品種</label><input name="allowed_symbols" placeholder="NQ,ES,GC,CL"></div>
       <div class="full"><label>備註</label><textarea name="notes"></textarea></div>
