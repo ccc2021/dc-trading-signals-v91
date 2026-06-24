@@ -1,0 +1,10 @@
+BridgeBaseUrl=https://dc-signals-v91.cc559773.workers.dev
+BridgeSecret=CHANGE_ME_TO_ADMIN_AUTO_TRADE_BRIDGE_SECRET
+LiveTrading=false
+PollSeconds=5
+FallbackVolume=0.01
+AllowedStrategies=algo-pro-v1-4
+SymbolSuffix=
+MagicNumber=910091
+DeviationPoints=30
+CloseOppositeBeforeEntry=true

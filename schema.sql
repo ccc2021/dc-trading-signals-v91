@@ -57,7 +57,7 @@ CREATE TABLE user_settings (
   risk_percent REAL DEFAULT 1.0,
   
   -- 訂閱品種 (JSON陣列)
-  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC","USTEC","XAUUSD"]',
+  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC","USTEC","XAUUSD","ETH"]',
   
   -- 訊號類型偏好 (JSON陣列)
   signal_types TEXT DEFAULT '["scalp","swing"]',
@@ -264,28 +264,67 @@ CREATE TABLE tv_alert_logs (
   UNIQUE(source_id, alert_uid)
 );
 
--- ═══════════════════════════════════════════════════════════════════════════════
--- 8b. 經濟事件 / 財經日曆 (economic_events) ★新增
+-- 8b. 經濟事件 / 財經日曆 (economic_events)
 -- 真實來源：Forex Factory 每週 JSON，由排程每小時同步並在高影響事件前提醒
 -- ═══════════════════════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS economic_events;
 CREATE TABLE economic_events (
-  event_uid TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_uid TEXT UNIQUE NOT NULL,
+  event_date TEXT NOT NULL,
+  event_time TEXT,
+  timezone TEXT DEFAULT 'Asia/Taipei',
   country TEXT,
-  impact TEXT,
+  currency TEXT,
+  title TEXT NOT NULL,
+  impact TEXT DEFAULT 'medium',
+  actual TEXT,
   forecast TEXT,
   previous TEXT,
-  actual TEXT,
-  event_at TEXT NOT NULL,
-  reminded INTEGER DEFAULT 0,
-  analyzed INTEGER DEFAULT 0,
-  source TEXT DEFAULT 'forexfactory',
-  synced_at TEXT DEFAULT (datetime('now')),
+  source TEXT DEFAULT 'manual',
+  source_url TEXT,
+  status TEXT DEFAULT 'scheduled',
+  notes TEXT,
+  reminded_at TEXT,
+  pre_reminded_at TEXT,
+  synced_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX idx_econ_event_at ON economic_events(event_at);
-CREATE INDEX idx_econ_reminded ON economic_events(reminded, event_at);
+CREATE INDEX idx_economic_events_date ON economic_events(event_date);
+CREATE INDEX idx_economic_events_time ON economic_events(event_time);
+CREATE INDEX idx_economic_events_impact ON economic_events(impact);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 7C. 自動交易指令佇列 (auto_trade_orders)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS auto_trade_orders;
+CREATE TABLE auto_trade_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  command_id TEXT UNIQUE NOT NULL,
+  signal_uid TEXT NOT NULL,
+  ticker TEXT,
+  action TEXT,
+  broker TEXT DEFAULT 'exness-mt5',
+  account TEXT,
+  mode TEXT DEFAULT 'paper',
+  volume REAL,
+  risk_percent REAL,
+  entry_price REAL,
+  stop_loss REAL,
+  tp1 REAL,
+  tp2 REAL,
+  tp3 REAL,
+  status TEXT DEFAULT 'queued',
+  attempts INTEGER DEFAULT 0,
+  request_payload TEXT,
+  response_payload TEXT,
+  last_error TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  sent_at TEXT,
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (signal_uid) REFERENCES signals(signal_uid)
+);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 8. 自訂群組表 (groups)
@@ -552,6 +591,9 @@ CREATE INDEX idx_strategies_tier ON strategies(tier);
 CREATE INDEX idx_tv_sources_active ON tradingview_sources(is_active);
 CREATE INDEX idx_tv_logs_source ON tv_alert_logs(source_id);
 CREATE INDEX idx_tv_logs_created ON tv_alert_logs(created_at);
+CREATE INDEX idx_auto_trade_signal ON auto_trade_orders(signal_uid);
+CREATE INDEX idx_auto_trade_status ON auto_trade_orders(status, created_at);
+CREATE INDEX idx_auto_trade_created ON auto_trade_orders(created_at);
 
 CREATE INDEX idx_orders_user ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
@@ -589,7 +631,8 @@ INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, sor
 ('CL', 'Crude Oil', '原油', 'energy', 0.01, 10, 20),
 ('NG', 'Natural Gas', '天然氣', 'energy', 0.001, 10, 21),
 ('6E', 'Euro FX', '歐元', 'forex', 0.00005, 6.25, 30),
-('6J', 'Japanese Yen', '日圓', 'forex', 0.0000005, 6.25, 31);
+('6J', 'Japanese Yen', '日圓', 'forex', 0.0000005, 6.25, 31),
+('ETH', 'Ethereum CFD', '以太坊', 'crypto', 0.01, 1, 41);
 
 -- 黃金品種預設止損 / 止盈點位（無指標點位時自動套用：止損 20 點、TP 間隔 12 點）
 UPDATE symbols SET default_stop_points = 20, default_tp_spacing = 12 WHERE symbol IN ('XAUUSD', 'GC');
@@ -602,9 +645,12 @@ INSERT INTO groups (group_name, description) VALUES
 
 -- 預設策略
 INSERT INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}');
+('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":true,"timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_10}}","short_stop_loss":"{{plot_11}}","long_tp1":"{{plot_12}}","short_tp1":"{{plot_13}}","long_tp2":"{{plot_14}}","short_tp2":"{{plot_15}}","long_tp3":"{{plot_16}}","short_tp3":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"Smart directional template: backend selects long_* or short_* by order action."}'),
+('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
+('ict-silver-bullet-2026', 'ICT Silver Bullet 2026', '串接 TradingView ICT Advanced Silver Bullet；需 alert_message 或 hidden plot 回傳 SL/TP。', '["scalp","daytrade"]', '["XAUUSD","GC","USTEC","NQ","ETH"]', 'pro', 5, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"alert_message","requiresExplicitLevels":true,"needsAlertMessage":true}', '{"strategy":"ict-silver-bullet-2026","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{strategy.order.price}}","stop_loss":"ADD_SL_TO_PINE_ALERT","tp1":"ADD_TP1_TO_PINE_ALERT","tp2":"ADD_TP2_TO_PINE_ALERT","tp3":"ADD_TP3_TO_PINE_ALERT","time":"{{time}}","interval":"{{interval}}"}');
 
 -- 系統設定
 INSERT INTO system_config (key, value) VALUES
@@ -621,9 +667,40 @@ INSERT INTO system_config (key, value) VALUES
 ('referral_paid_points', '100'),
 ('points_per_day', '100'),
 ('signals_paused', '0'),
+('auto_trade_enabled', '0'),
+('auto_trade_mode', 'paper'),
+('auto_trade_bridge_url', ''),
+('auto_trade_bridge_secret', ''),
+('auto_trade_account', ''),
+('auto_trade_default_volume', '0.01'),
+('auto_trade_risk_percent', '1'),
+('auto_trade_max_orders_per_day', '20'),
+('auto_trade_allowed_symbols', ''),
+('auto_trade_allowed_strategies', ''),
+('economic_calendar_source_url', 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'),
+('economic_calendar_source_name', 'Forex Factory'),
+('economic_calendar_auto_remind', '1'),
+('economic_calendar_remind_hour', '8'),
+('economic_calendar_target_group', 'paid'),
+('economic_calendar_impacts', 'high,medium'),
+('economic_calendar_currencies', 'USD,EUR,GBP,JPY,CAD,AUD,CNY'),
+('economic_calendar_countries', ''),
+('economic_calendar_pre_event_minutes', '30'),
+('economic_calendar_lookahead_days', '1'),
 ('contact_telegram', '@Admin'),
 ('contact_line', '@dcsignals'),
+('public_base_url', 'https://dc-signals-v91.cc559773.workers.dev'),
+('payment_manual_enabled', '1'),
 ('payment_bank', '國泰世華 (013)'),
+('payment_bank_branch', ''),
 ('payment_account', '123-456-789012'),
 ('payment_name', '王大明'),
+('payment_transfer_note', '轉帳後請在訂單填寫後五碼與付款時間，客服確認後會開通會員。'),
+('payment_crypto_enabled', '0'),
+('payment_crypto_asset', 'USDT'),
+('payment_crypto_network', 'TRC20'),
+('payment_crypto_wallet', ''),
+('payment_crypto_memo', ''),
+('payment_crypto_rate_note', '請依付款當下匯率換算，實收以客服確認為準'),
+('payment_crypto_note', '請務必確認鏈別正確，鏈別錯誤可能無法追回。'),
 ('welcome_message', '歡迎使用 DC Trading Signals！');
