@@ -10520,6 +10520,7 @@ async function createSignalFromTvDraft(db, draft, alertUid, autoSend, env = {}, 
 async function finalizeTvSignalDelivery(env = {}, signalUid, autoClosed = []) {
   const db = env.DB;
   if (!db || !signalUid) return { sent: 0, autoTrade: { status: AUTO_TRADE_STATUS.skipped } };
+  const startedAt = Date.now();
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal || signal.status !== 'active') return { sent: 0, skipped: true };
   for (const closed of autoClosed || []) {
@@ -10533,13 +10534,14 @@ async function finalizeTvSignalDelivery(env = {}, signalUid, autoClosed = []) {
   const delivery = await broadcastSignal(db, signal, env);
   await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
   const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
-  await logAction(db, 'tv:background', 'tv_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}`);
+  await logAction(db, 'tv:background', 'tv_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
   return { delivery, autoTrade };
 }
 
 async function finalizeAdminSignalDelivery(env = {}, signalUid, autoClosed = [], actorId = 'web-admin') {
   const db = env.DB;
   if (!db || !signalUid) return { sent: 0, autoTrade: { status: AUTO_TRADE_STATUS.skipped } };
+  const startedAt = Date.now();
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal || signal.status !== 'active') return { sent: 0, skipped: true };
   for (const closed of autoClosed || []) {
@@ -10553,7 +10555,7 @@ async function finalizeAdminSignalDelivery(env = {}, signalUid, autoClosed = [],
   const delivery = await broadcastSignal(db, signal, env);
   await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
   const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
-  await logAction(db, actorId || 'web-admin', 'admin_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}`);
+  await logAction(db, actorId || 'web-admin', 'admin_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
   return { delivery, autoTrade };
 }
 
