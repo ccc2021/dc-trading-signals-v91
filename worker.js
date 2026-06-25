@@ -67,22 +67,17 @@ function algoProSmartTvTemplateObject() {
     order_price: '{{strategy.order.price}}',
     price: '{{strategy.order.price}}',
     close: '{{close}}',
-    long_stop_loss: '{{plot_10}}',
-    short_stop_loss: '{{plot_11}}',
-    long_tp1: '{{plot_12}}',
-    short_tp1: '{{plot_13}}',
-    long_tp2: '{{plot_14}}',
-    short_tp2: '{{plot_15}}',
-    long_tp3: '{{plot_16}}',
-    short_tp3: '{{plot_17}}',
-    probability: '{{plot("Probability")}}',
+    long_stop_loss: '{{plot("Long SL")}}',
+    short_stop_loss: '{{plot("Short SL")}}',
+    long_tp1: '{{plot("Long TP")}}',
+    short_tp1: '{{plot("Short TP")}}',
     contracts: '{{strategy.order.contracts}}',
     market_position: '{{strategy.market_position}}',
     prev_market_position: '{{strategy.prev_market_position}}',
     time: '{{time}}',
     interval: '{{interval}}',
     alert_id: '{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}',
-    mapping_note: 'Smart directional template: backend selects long_* or short_* by order action.'
+    mapping_note: 'AlgoPro V1.4 confirmed placeholders: Long/Short SL and Long/Short TP. Backend selects the side by action; TP2/TP3 are only shown when TV provides them.'
   };
 }
 
@@ -4974,7 +4969,7 @@ async function ensureAdminSchema(db) {
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
     ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":true,"timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_10}}","short_stop_loss":"{{plot_11}}","long_tp1":"{{plot_12}}","short_tp1":"{{plot_13}}","long_tp2":"{{plot_14}}","short_tp2":"{{plot_15}}","long_tp3":"{{plot_16}}","short_tp3":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"Smart directional template: backend selects long_* or short_* by order action."}'),
+    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":true,"timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot(\"Long SL\")}}","short_stop_loss":"{{plot(\"Short SL\")}}","long_tp1":"{{plot(\"Long TP\")}}","short_tp1":"{{plot(\"Short TP\")}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 confirmed placeholders: Long/Short SL and Long/Short TP. Backend selects the side by action; TP2/TP3 are only shown when TV provides them."}'),
     ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
@@ -11215,7 +11210,7 @@ async function previewFallbackSignalLevels(db, payload = {}) {
     basis: derived.basis,
     strategy: { id: strategy.strategy_id, name: strategy.name },
     liveStrict: true,
-    warning: '此為後台補位預覽，只用來驗證 Claude fallback 計算；正式 TradingView webhook 仍必須由 AlgoPro 指標回傳 SL/TP，缺值或 0 不會推送會員。'
+    warning: '此為後台補位預覽，只用來驗證 fallback 計算；正式 TradingView webhook 仍必須由 AlgoPro 指標至少回傳 SL 與 TP1，缺值或 0 不會推送會員。'
   };
 }
 
@@ -12427,7 +12422,7 @@ function renderTradingViewGeneratorHtml() {
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="preview" id="tvReadiness"></div>
-    <div class="muted">要讓進場、止損、TP 完全等於圖上指標，Alert Message 必須帶入指標實際 plot。後端現在採嚴格模式：entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會自動推算假點位；TP2/TP3 有傳才顯示。</div>
+    <div class="muted">要讓進場、止損、TP 等於圖上指標，Alert Message 必須帶入指標實際 plot。AlgoPro V1.4 目前確認可用 Long/Short SL 與 Long/Short TP；entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會推送會員；TP2/TP3 有傳才顯示。</div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvSmartConfigBtn">全部品種智慧設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button><button class="btn ghost" type="button" id="tvFallbackPreviewBtn">測試補 SL/TP</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
@@ -13845,36 +13840,25 @@ function tvGeneratorLevels(strategy, action) {
   if (id.indexOf('algo-pro') >= 0 || id.indexOf('algopro') >= 0) {
     if (side === 'auto' || !side) {
       return {
-        long_stop_loss: '{{plot_10}}',
-        short_stop_loss: '{{plot_11}}',
-        long_tp1: '{{plot_12}}',
-        short_tp1: '{{plot_13}}',
-        long_tp2: '{{plot_14}}',
-        short_tp2: '{{plot_15}}',
-        long_tp3: '{{plot_16}}',
-        short_tp3: '{{plot_17}}',
-        probability: '{{plot("Probability")}}',
-        note: 'AlgoPro Smart: 同一份 Alert 同時送 long/short SL/TP，後端依 buy/sell 自動選正確欄位；Probability 為候選欄位，請以 Data Window 實際名稱確認。'
+        long_stop_loss: '{{plot("Long SL")}}',
+        short_stop_loss: '{{plot("Short SL")}}',
+        long_tp1: '{{plot("Long TP")}}',
+        short_tp1: '{{plot("Short TP")}}',
+        note: 'AlgoPro V1.4 已確認 TradingView placeholder：Long/Short SL 與 Long/Short TP；此 alert condition 未提供 TP2/TP3 或機率欄位。'
       };
     }
     if (side === 'buy' || side === 'long') {
       return {
-        stop_loss: '{{plot_10}}',
-        tp1: '{{plot_12}}',
-        tp2: '{{plot_14}}',
-        tp3: '{{plot_16}}',
-        probability: '{{plot("Probability")}}',
-        note: 'AlgoPro Data Window: Long SL=plot_10, Long TP1/2/3=plot_12/14/16'
+        stop_loss: '{{plot("Long SL")}}',
+        tp1: '{{plot("Long TP")}}',
+        note: 'AlgoPro V1.4 Data Window: Long SL / Long TP。TP2/TP3 與機率未出現在此 alert placeholder 清單。'
       };
     }
     if (side === 'sell' || side === 'short') {
       return {
-        stop_loss: '{{plot_11}}',
-        tp1: '{{plot_13}}',
-        tp2: '{{plot_15}}',
-        tp3: '{{plot_17}}',
-        probability: '{{plot("Probability")}}',
-        note: 'AlgoPro Data Window: Short SL=plot_11, Short TP1/2/3=plot_13/15/17'
+        stop_loss: '{{plot("Short SL")}}',
+        tp1: '{{plot("Short TP")}}',
+        note: 'AlgoPro V1.4 Data Window: Short SL / Short TP。TP2/TP3 與機率未出現在此 alert placeholder 清單。'
       };
     }
   }
