@@ -84,7 +84,7 @@ function algoProSmartTvTemplateObject() {
     short_stop_loss: '{{plot_6}}',
     long_tp1: '{{plot_7}}',
     short_tp1: '{{plot_8}}',
-    probability: '{{plot("Probability")}}',
+    probability: '{{plot_9}}',
     ...rawPlots,
     contracts: '{{strategy.order.contracts}}',
     market_position: '{{strategy.market_position}}',
@@ -5267,7 +5267,7 @@ async function ensureAdminSchema(db) {
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
     ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":true,"timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. Backend selects the side by action; TP2/TP3 are only shown when TV provides them."}'),
+    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing SL/TP by symbol strategy fallback."}'),
     ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
@@ -5353,6 +5353,8 @@ async function ensureAdminSchema(db) {
         OR tv_alert_template LIKE '%_or_%'
         OR tv_alert_template NOT LIKE '%long_stop_loss%'
         OR tv_alert_template NOT LIKE '%"p17"%'
+        OR tv_alert_template LIKE '%plot("Probability")%'
+        OR tv_alert_template LIKE '%plot(\\"Probability\\")%'
         OR (tv_alert_template NOT LIKE '%probability%' AND tv_alert_template LIKE '%plot_10%' AND tv_alert_template LIKE '%plot_17%')
         OR tv_alert_template LIKE '%plot("Long SL")%'
         OR rules_json LIKE '%"requiresExplicitLevels":true%'
@@ -10678,14 +10680,24 @@ function rawPlotProbabilityCandidate(value) {
 
 function tvRawPlotProbabilityValues(payload = {}) {
   const values = [];
+  const pushCandidate = (value) => {
+    const candidate = rawPlotProbabilityCandidate(value);
+    if (candidate !== '') values.push(candidate);
+  };
+  pushCandidate(firstTvValue(
+    payload.p9,
+    payload.plot_9,
+    payload.plots?.[9],
+    payload.plots?.['9']
+  ));
   for (let i = 0; i <= 17; i++) {
-    const candidate = rawPlotProbabilityCandidate(firstTvValue(
+    if (i === 9) continue;
+    pushCandidate(firstTvValue(
       payload[`p${i}`],
       payload[`plot_${i}`],
       payload.plots?.[i],
       payload.plots?.[String(i)]
     ));
-    if (candidate !== '') values.push(candidate);
   }
   return values;
 }
@@ -10835,7 +10847,9 @@ function tvStopLossValues(payload, action = '') {
         payload.levels?.long_sl, payload.levels?.longSL,
         payload.levels?.buy_stop_loss, payload.levels?.buyStopLoss,
         payload.risk?.long_stop_loss, payload.risk?.longStopLoss,
-        payload.risk?.long_sl, payload.risk?.longSL
+        payload.risk?.long_sl, payload.risk?.longSL,
+        payload.p5, payload.plot_5,
+        payload.plots?.[5], payload.plots?.['5']
       ]
     : side === 'short'
       ? [
@@ -10853,7 +10867,9 @@ function tvStopLossValues(payload, action = '') {
           payload.levels?.short_sl, payload.levels?.shortSL,
           payload.levels?.sell_stop_loss, payload.levels?.sellStopLoss,
           payload.risk?.short_stop_loss, payload.risk?.shortStopLoss,
-          payload.risk?.short_sl, payload.risk?.shortSL
+          payload.risk?.short_sl, payload.risk?.shortSL,
+          payload.p6, payload.plot_6,
+          payload.plots?.[6], payload.plots?.['6']
         ]
       : [];
   return [
@@ -10891,7 +10907,11 @@ function tvDirectionalTargetValues(payload, index, action = '') {
       payload[`target${i}_long`], payload[`target${i}Long`],
       payload.levels?.[`long_tp${i}`], payload.levels?.[`longTp${i}`],
       payload.levels?.[`long_target${i}`], payload.levels?.[`longTarget${i}`],
-      payload.levels?.[`buy_tp${i}`], payload.levels?.[`buyTp${i}`]
+      payload.levels?.[`buy_tp${i}`], payload.levels?.[`buyTp${i}`],
+      i === 1 ? payload.p7 : undefined,
+      i === 1 ? payload.plot_7 : undefined,
+      i === 1 ? payload.plots?.[7] : undefined,
+      i === 1 ? payload.plots?.['7'] : undefined
     ];
   }
   if (side === 'short') {
@@ -10905,7 +10925,11 @@ function tvDirectionalTargetValues(payload, index, action = '') {
       payload[`target${i}_short`], payload[`target${i}Short`],
       payload.levels?.[`short_tp${i}`], payload.levels?.[`shortTp${i}`],
       payload.levels?.[`short_target${i}`], payload.levels?.[`shortTarget${i}`],
-      payload.levels?.[`sell_tp${i}`], payload.levels?.[`sellTp${i}`]
+      payload.levels?.[`sell_tp${i}`], payload.levels?.[`sellTp${i}`],
+      i === 1 ? payload.p8 : undefined,
+      i === 1 ? payload.plot_8 : undefined,
+      i === 1 ? payload.plots?.[8] : undefined,
+      i === 1 ? payload.plots?.['8'] : undefined
     ];
   }
   return [];
@@ -11259,7 +11283,7 @@ async function buildTvSignalDraft(db, source, payload) {
     probability !== null ? `機率: ${fmtProbability(probability)}` : '',
     `點位來源: ${derived.basis}`,
     derived.fallbackFields?.length ? `後台補位: ${derived.fallbackFields.join(',')}` : '',
-    derived.fallbackFields?.length ? `TV原始: ${tvAlertLevelDebug(payload)}` : '',
+    derived.fallbackFields?.length ? `TV原始: ${tvAlertLevelDebug(payload, action)}` : '',
     chartUrl ? `圖表: ${chartUrl}` : '',
     snapshotUrl ? `截圖: ${snapshotUrl}` : ''
   ].filter(Boolean);
@@ -11415,7 +11439,18 @@ async function closeSignalFromTvExit(db, source, payload, alertUid) {
   return { ...result, status: result.status || 'closed', ticker, type, price, reason };
 }
 
-function tvAlertLevelDebug(payload) {
+function tvAlertLevelDebug(payload, action = '') {
+  const side = tvActionSide(action || normalizeTvAction(payload));
+  const stopValue = side === 'long'
+    ? firstTvValue(payload.stop_loss, payload.sl, payload.long_stop_loss, payload.longStopLoss, payload.p5, payload.plot_5, payload.plots?.[5], payload.plots?.['5'])
+    : side === 'short'
+      ? firstTvValue(payload.stop_loss, payload.sl, payload.short_stop_loss, payload.shortStopLoss, payload.p6, payload.plot_6, payload.plots?.[6], payload.plots?.['6'])
+      : firstTvValue(payload.stop_loss, payload.sl, payload.long_stop_loss, payload.short_stop_loss);
+  const tp1Value = side === 'long'
+    ? firstTvValue(payload.tp1, payload.target1, payload.long_tp1, payload.longTp1, payload.p7, payload.plot_7, payload.plots?.[7], payload.plots?.['7'])
+    : side === 'short'
+      ? firstTvValue(payload.tp1, payload.target1, payload.short_tp1, payload.shortTp1, payload.p8, payload.plot_8, payload.plots?.[8], payload.plots?.['8'])
+      : firstTvValue(payload.tp1, payload.target1, payload.long_tp1, payload.short_tp1);
   const rawPlots = [];
   for (let i = 0; i <= 17; i++) {
     const value = firstTvValue(payload[`p${i}`], payload[`plot_${i}`], payload.plots?.[i], payload.plots?.[String(i)]);
@@ -11423,8 +11458,8 @@ function tvAlertLevelDebug(payload) {
   }
   const fields = [
     ['entry', firstTvValue(payload.entry_price, payload.order_price, payload.price, payload.close)],
-    ['sl', firstTvValue(payload.stop_loss, payload.sl, payload.long_stop_loss, payload.short_stop_loss)],
-    ['tp1', firstTvValue(payload.tp1, payload.target1, payload.long_tp1, payload.short_tp1)],
+    ['sl', stopValue],
+    ['tp1', tp1Value],
     ['tp2', firstTvValue(payload.tp2, payload.target2, payload.long_tp2, payload.short_tp2)],
     ['tp3', firstTvValue(payload.tp3, payload.target3, payload.long_tp3, payload.short_tp3)],
     ['prob', fmtProbability(tvProbability(payload, normalizeTvAction(payload) || ''))]
@@ -14354,6 +14389,9 @@ function applySmartTradingViewTemplate(message, strategy, action) {
   var id = String(strategy && strategy.strategy_id || message.strategy || '').toLowerCase();
   if (id.indexOf('algo-pro') < 0 && id.indexOf('algopro') < 0) return message;
   addAlgoProRawPlotPlaceholders(message);
+  if (!message.probability || String(message.probability || '').includes('plot("Probability")')) {
+    message.probability = '{{plot_9}}';
+  }
   var side = String(action || '').toUpperCase();
   var auto = side === 'AUTO' || !side;
   var pairs = [
