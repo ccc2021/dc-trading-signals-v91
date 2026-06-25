@@ -4834,6 +4834,31 @@ async function enforceRateLimit(db, key, limit, windowSeconds, message) {
 async function ensureAdminSchema(db) {
   await ensureConfigSchema(db);
   await db.prepare(`
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      admin_id TEXT,
+      action TEXT,
+      target TEXT,
+      details TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)').run();
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS queued_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      signal_uid TEXT,
+      message TEXT,
+      photo_url TEXT,
+      scheduled_at TEXT DEFAULT (datetime('now')),
+      sent INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_queued_signals_due ON queued_signals(sent, scheduled_at)').run();
+  await db.prepare(`
     CREATE TABLE IF NOT EXISTS strategies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       strategy_id TEXT UNIQUE NOT NULL,
@@ -6052,6 +6077,11 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   };
   const upcomingEconomicEvents = await safe('economic.upcoming', getUpcomingMarketEconomicEvents(db, economicRuntimeConfig, { hours: 72, limit: 60 }), []);
   const economicRows = economicEvents.results || [];
+  const deliveryDiagnostics = await safe(
+    'delivery.diagnostics',
+    getDeliveryDiagnostics(db, env, Math.min(Number(range.limit || 40), 60)),
+    fallbackDeliveryDiagnostics
+  );
 
   return {
     stats: {
@@ -6101,6 +6131,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
     finance,
     economicSettings,
     upcomingEconomicEvents,
+    deliveryDiagnostics,
     autoTrade,
     supportTickets,
     supportStats: {
@@ -6112,6 +6143,274 @@ async function getAdminBootstrap(db, env = {}, request = null) {
     bootstrapErrors,
     serverTime: fmtTime()
   };
+}
+
+function parseTvLogPayload(log = {}) {
+  return parseObject(log.payload, {});
+}
+
+function deliveryLevelSnapshot(payload = {}, action = '') {
+  const resolvedAction = action || normalizeTvAction(payload) || '';
+  return {
+    entry: tvEntryPrice(payload),
+    stopLoss: tvStopLoss(payload, resolvedAction),
+    tp1: tvTargetPrice(payload, 1, resolvedAction),
+    tp2: tvTargetPrice(payload, 2, resolvedAction),
+    tp3: tvTargetPrice(payload, 3, resolvedAction)
+  };
+}
+
+function rawLevelSnapshot(payload = {}, action = '') {
+  const resolvedAction = action || normalizeTvAction(payload) || '';
+  const side = tvActionSide(resolvedAction);
+  const stopValues = tvStopLossValues(payload, resolvedAction);
+  return {
+    entry: firstTvValue(payload.entry_price, payload.entry, payload.order_price, payload.strategy_order_price, payload.price, payload.close),
+    stopLoss: firstTvValue(...stopValues),
+    tp1: firstTvValue(...tvTargetValues(payload, 1, resolvedAction)),
+    tp2: firstTvValue(...tvTargetValues(payload, 2, resolvedAction)),
+    tp3: firstTvValue(...tvTargetValues(payload, 3, resolvedAction)),
+    side
+  };
+}
+
+function levelIssuesFromSnapshot(levels = {}) {
+  const required = [
+    ['entry', levels.entry],
+    ['stopLoss', levels.stopLoss],
+    ['tp1', levels.tp1]
+  ];
+  const optional = [
+    ['tp2', levels.tp2],
+    ['tp3', levels.tp3]
+  ];
+  const missing = required.filter(([, value]) => value === null || value === undefined).map(([name]) => name);
+  const zero = [...required, ...optional]
+    .filter(([, value]) => value !== null && value !== undefined && Number(value) === 0)
+    .map(([name]) => name);
+  return { missing, zero };
+}
+
+function diagnoseDeliveryLog(log = {}, deliveryLog = null) {
+  const payload = parseTvLogPayload(log);
+  const action = log.action || normalizeTvAction(payload) || '';
+  const levels = deliveryLevelSnapshot(payload, action);
+  const rawLevels = rawLevelSnapshot(payload, action);
+  const logAction = String(log.action || '').toUpperCase();
+  const isExit = inferTvEventKind(payload) === 'exit' || ['TP1', 'TP2', 'TP3', 'SL', 'CLOSE', 'AUTO'].includes(logAction);
+  const issues = isExit ? { missing: [], zero: [] } : levelIssuesFromSnapshot(levels);
+  const error = String(log.error || '');
+  const status = String(log.status || '').toLowerCase();
+  let tone = 'green';
+  let title = '已接收';
+  let actionText = log.signal_uid ? '已建立訊號，等待或已完成背景派送。' : '已記錄 alert，尚未建立訊號。';
+  let stage = log.signal_uid ? 'signal_created' : 'received';
+
+  if (isExit) {
+    title = '出場 / 結案 alert';
+    actionText = log.signal_uid ? '已處理既有訊號的出場或結案。' : '已收到出場 alert，尚未對應到訊號。';
+    stage = 'exit';
+  }
+  if (deliveryLog) {
+    title = 'TG 派送完成';
+    actionText = deliveryLog.details || '背景派送已完成。';
+    stage = 'delivered';
+  }
+  if (issues.zero.length) {
+    tone = 'red';
+    title = 'SL/TP 回傳 0';
+    actionText = 'TradingView 已打到後台，但 plot 沒取到指標實際點位；後台已拒絕發給會員。';
+    stage = 'blocked_zero_levels';
+  } else if (issues.missing.length) {
+    tone = 'amber';
+    title = '點位欄位不完整';
+    actionText = 'entry、stopLoss、tp1 是必要欄位；請重貼後台產生的 TradingView Message。';
+    stage = 'missing_levels';
+  }
+  if (error || status === 'error') {
+    tone = 'red';
+    stage = stage === 'blocked_zero_levels' ? stage : 'error';
+    if (error.includes('為 0') || error.includes('plot 沒取到')) {
+      title = 'TV plot 回傳 0';
+      actionText = '請到 TradingView Data Window 核對 AlgoPro SL/TP plot 名稱或 plot_序號。';
+    } else if (error.includes('placeholder') || error.includes('未解析')) {
+      title = 'TV placeholder 未解析';
+      actionText = 'Alert Message 仍是 placeholder，TradingView 沒有轉成數字。';
+    } else if (error.includes('stop_loss') || error.includes('止損')) {
+      title = '缺少止損';
+      actionText = 'Alert Message 必須帶 stop_loss/sl，不能由後端推算。';
+    } else if (error.includes('tp1') || error.includes('target1') || error.includes('止盈') || error.includes('止贏')) {
+      title = '缺少 TP1';
+      actionText = 'Alert Message 必須帶 tp1/target1，不能由後端推算。';
+    } else if (error.includes('secret')) {
+      title = 'Webhook Secret 錯誤';
+      actionText = '確認 TV webhook URL、source_id 與後台來源 secret。';
+    } else {
+      title = 'Alert 錯誤';
+      actionText = error || '請檢查 payload 格式。';
+    }
+  }
+
+  return {
+    stage,
+    tone,
+    title,
+    action: actionText,
+    levels,
+    rawLevels,
+    missing: issues.missing,
+    zero: issues.zero,
+    error
+  };
+}
+
+function fallbackDeliveryDiagnostics() {
+  return {
+    stats: { alerts24: 0, errors24: 0, zero24: 0, delivered24: 0, queuedDue: 0 },
+    items: [],
+    deliveryLogs: [],
+    queue: { due: 0, oldestDueAt: null },
+    adminTargets: 0
+  };
+}
+
+async function getDeliveryDiagnostics(db, env = {}, limit = 40) {
+  await ensureAdminSchema(db);
+  await addColumnIfMissing(db, 'queued_signals', 'photo_url', 'TEXT');
+  loadRuntimeConfig(env);
+  const cappedLimit = Math.max(10, Math.min(100, Number(limit || 40)));
+  const [logs, deliveryLogs, queue, stats] = await Promise.all([
+    db.prepare('SELECT * FROM tv_alert_logs ORDER BY created_at DESC LIMIT ?').bind(cappedLimit).all(),
+    db.prepare(`
+      SELECT admin_id, action, target, details, created_at
+      FROM admin_logs
+      WHERE action IN ('tv_signal_delivery_done','admin_signal_delivery_done','tv_alert_error_notify_failed','admin_auto_close_notify_failed','auto_close_notify_failed')
+      ORDER BY created_at DESC
+      LIMIT 120
+    `).all(),
+    db.prepare(`
+      SELECT COUNT(*) AS due, MIN(scheduled_at) AS oldestDueAt
+      FROM queued_signals
+      WHERE sent = 0 AND scheduled_at <= datetime('now')
+    `).first(),
+    db.prepare(`
+      SELECT
+        COUNT(*) AS alerts24,
+        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors24,
+        SUM(CASE WHEN error LIKE '%為 0%' OR error LIKE '%plot 沒取到%' THEN 1 ELSE 0 END) AS zero24
+      FROM tv_alert_logs
+      WHERE created_at >= datetime('now', '-24 hours')
+    `).first()
+  ]);
+  const deliveryRows = deliveryLogs.results || [];
+  const deliveryBySignal = new Map();
+  for (const row of deliveryRows) {
+    const key = String(row.target || '');
+    if (key && !deliveryBySignal.has(key)) deliveryBySignal.set(key, row);
+  }
+  const delivered24 = deliveryRows.filter((row) => (
+    row.action === 'tv_signal_delivery_done' || row.action === 'admin_signal_delivery_done'
+  ) && Date.now() - Date.parse(String(row.created_at || '').replace(' ', 'T') + 'Z') <= 86400000).length;
+  const items = (logs.results || []).map((log) => {
+    const delivery = log.signal_uid ? deliveryBySignal.get(String(log.signal_uid)) : null;
+    return {
+      id: log.id,
+      created_at: log.created_at,
+      source_id: log.source_id,
+      strategy_id: log.strategy_id,
+      ticker: log.ticker,
+      action: log.action,
+      status: log.status,
+      signal_uid: log.signal_uid,
+      error: log.error,
+      payload: log.payload,
+      delivery,
+      diagnosis: diagnoseDeliveryLog(log, delivery)
+    };
+  });
+  return {
+    stats: {
+      alerts24: Number(stats?.alerts24 || 0),
+      errors24: Number(stats?.errors24 || 0),
+      zero24: Number(stats?.zero24 || 0),
+      delivered24,
+      queuedDue: Number(queue?.due || 0)
+    },
+    items,
+    deliveryLogs: deliveryRows.slice(0, 20),
+    queue: {
+      due: Number(queue?.due || 0),
+      oldestDueAt: queue?.oldestDueAt || null
+    },
+    adminTargets: (CONFIG.ADMIN_IDS || []).filter(isTelegramChatId).length
+  };
+}
+
+async function buildAdminTestSignal(db, payload = {}) {
+  const ticker = String(payload.ticker || payload.symbol || payload.instrument || '').trim().toUpperCase();
+  const action = String(payload.action || '').toUpperCase();
+  const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
+  const entry = asNumber(payload.entry_price ?? payload.entry);
+  const stopLoss = asNumber(payload.stop_loss ?? payload.stop);
+  const tp1 = asNumber(payload.tp1);
+  const tp2 = asNumber(payload.tp2);
+  const tp3 = asNumber(payload.tp3);
+  if (!ticker) throw new Error('請輸入品種');
+  if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
+  if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
+  if (entry === null || stopLoss === null || tp1 === null) throw new Error('測試發送需要進場、止損、TP1');
+  assertNoZeroSignalLevels('管理員測試訊號', { entry, stopLoss, tp1, tp2, tp3 });
+  if (action === 'LONG' && stopLoss >= entry) throw new Error('做多訊號的止損必須低於進場');
+  if (action === 'SHORT' && stopLoss <= entry) throw new Error('做空訊號的止損必須高於進場');
+  const targets = [tp1, tp2, tp3].filter((value) => value !== null);
+  if (action === 'LONG' && targets.some((value) => value <= entry)) throw new Error('做多訊號的目標價必須高於進場');
+  if (action === 'SHORT' && targets.some((value) => value >= entry)) throw new Error('做空訊號的目標價必須低於進場');
+  const symbol = await db.prepare('SELECT symbol FROM symbols WHERE symbol = ? AND is_active = 1').bind(ticker).first();
+  if (!symbol) throw new Error(`${ticker} 尚未啟用，請先到品種管理新增或啟用`);
+  const targetGroup = String(payload.target_group || payload.targetGroup || 'pro').trim().toLowerCase() || 'pro';
+  return {
+    signal_uid: `TEST-${genUID()}`,
+    ticker,
+    action,
+    signal_type: signalType,
+    entry_price: entry,
+    stop_loss: stopLoss,
+    tp1,
+    tp2,
+    tp3,
+    target_group: targetGroup,
+    is_vip_only: targetGroup === 'vip' ? 1 : 0,
+    status: 'test',
+    note: String(payload.note || '管理員測試發送，不會推送會員。').slice(0, 500),
+    created_at: new Date().toISOString()
+  };
+}
+
+async function sendAdminSignalTest(db, adminId, payload = {}, env = {}) {
+  loadRuntimeConfig(env);
+  if (!CONFIG.BOT_TOKEN) throw new Error('BOT_TOKEN 尚未設定，無法發送 Telegram 測試');
+  const admins = (CONFIG.ADMIN_IDS || []).filter(isTelegramChatId);
+  if (!admins.length) throw new Error('ADMIN_IDS 尚未設定可發送的 Telegram ID');
+  const startedAt = Date.now();
+  const signal = await buildAdminTestSignal(db, payload);
+  const card = formatSignalCard(signal, null, true);
+  const message = `🧪 <b>管理員測試發送</b>\n\n${card}\n\n此訊息只發給 ADMIN_IDS，不會發給會員。`;
+  const kb = {
+    inline_keyboard: [[
+      { text: '開啟後台', url: `${publicBaseUrl(env)}/admin` },
+      { text: '會員中心', url: memberPortalUrl(env) }
+    ]]
+  };
+  let sent = 0;
+  const results = [];
+  for (const chatId of admins) {
+    const result = await sendTg(chatId, message, kb, { disablePreview: true });
+    if (result?.ok) sent += 1;
+    results.push({ chatId, ok: !!result?.ok, error: result?.description || '' });
+  }
+  const ms = Date.now() - startedAt;
+  await logAction(db, adminId, 'admin_signal_test', signal.signal_uid, `sent ${sent}/${admins.length}, ms ${ms}`);
+  return { signalUid: signal.signal_uid, sent, total: admins.length, ms, results };
 }
 
 async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
@@ -6128,6 +6427,7 @@ async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
   if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
   if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
   if (entry === null || stopLoss === null || tp1 === null) throw new Error('進場、止損、TP1 為必填數字');
+  assertNoZeroSignalLevels('手動訊號', { entry, stopLoss, tp1, tp2, tp3 });
   if (action === 'LONG' && stopLoss >= entry) throw new Error('做多訊號的止損必須低於進場');
   if (action === 'SHORT' && stopLoss <= entry) throw new Error('做空訊號的止損必須高於進場');
   const targets = [tp1, tp2, tp3].filter((value) => value !== null);
@@ -10192,6 +10492,25 @@ function tvZeroLevelError(fields) {
   return `TradingView alert 的 ${labels.join('/')} 為 0，代表 Alert Message 的 plot 沒取到指標實際點位。請到 TradingView Data Window 確認 SL/TP 對應的 plot 名稱或 plot_序號後重新貼 Message。`;
 }
 
+function signalZeroLevelError(context, fields) {
+  const labels = [...new Set((fields || []).filter(Boolean))];
+  return `${context || '訊號'} 的 ${labels.join('/')} 不可為 0。為避免 TG 點位與圖上指標脫鉤，請先確認 TradingView 或手動輸入的進場、止損與 TP。`;
+}
+
+function assertNoZeroSignalLevels(context, levels = {}) {
+  const zeroFields = [];
+  [
+    ['entry_price', levels.entry],
+    ['stop_loss', levels.stopLoss],
+    ['tp1', levels.tp1],
+    ['tp2', levels.tp2],
+    ['tp3', levels.tp3]
+  ].forEach(([field, value]) => {
+    if (value !== null && value !== undefined && Number(value) === 0) zeroFields.push(field);
+  });
+  if (zeroFields.length) throw new Error(signalZeroLevelError(context, zeroFields));
+}
+
 function tvExitPrice(payload, type = '', action = '') {
   const exitType = String(type || '').toUpperCase();
   const targetIndex = exitType === 'TP3' ? 3 : exitType === 'TP2' ? 2 : exitType === 'TP1' ? 1 : 0;
@@ -10442,6 +10761,7 @@ async function buildTvSignalDraft(db, source, payload) {
   }
   const stopLoss = explicitStop;
   const targets = explicitTargets;
+  assertNoZeroSignalLevels('TradingView alert', { entry, stopLoss, tp1: targets[0], tp2: targets[1], tp3: targets[2] });
   if (action === 'LONG' && stopLoss >= entry) throw new Error('TradingView 做多訊號的止損必須低於進場，請檢查指標輸出的 stop_loss。');
   if (action === 'SHORT' && stopLoss <= entry) throw new Error('TradingView 做空訊號的止損必須高於進場，請檢查指標輸出的 stop_loss。');
   const presentTargets = targets.filter((target) => target !== null);
@@ -10972,6 +11292,15 @@ async function handleAdminApi(request, env, pathname, ctx = null) {
       return json({ ok: true, data: await getAdminBootstrap(db, env, request) });
     }
 
+    if (request.method === 'GET' && parts[0] === 'delivery' && parts[1] === 'diagnostics') {
+      const url = new URL(request.url);
+      return json({ ok: true, data: await getDeliveryDiagnostics(db, env, url.searchParams.get('limit') || 40) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'delivery' && parts[1] === 'test-admin') {
+      return json({ ok: true, data: await sendAdminSignalTest(db, adminId, await readJsonBody(request), env) });
+    }
+
     if (request.method === 'POST' && parts[0] === 'signals' && parts.length === 1) {
       const result = await createAdminSignal(db, adminId, await readJsonBody(request), env, { deferDelivery: Boolean(ctx?.waitUntil) });
       if (result.deferred && ctx?.waitUntil) {
@@ -11425,6 +11754,22 @@ function renderAdminPage(csrfToken = '') {
     .health-card.critical { border-left-color: var(--red); background:#fffafa; }
     .health-card.warning { border-left-color: var(--amber); background:#fffdf5; }
     .health-card.info { border-left-color: var(--blue); }
+    .delivery-grid { display:grid; grid-template-columns: minmax(280px,.78fr) minmax(360px,1.22fr); gap:12px; align-items:start; }
+    .delivery-metrics { display:grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap:8px; }
+    .delivery-card { border:1px solid var(--line); border-radius:8px; background:#fff; padding:11px; display:grid; gap:6px; box-shadow:var(--shadow-soft); }
+    .delivery-card span { color:var(--muted); font-size:11px; font-weight:850; }
+    .delivery-card strong { font-size:22px; line-height:1; }
+    .delivery-card small { color:var(--muted); font-size:11px; line-height:1.35; }
+    .delivery-list { display:grid; gap:9px; max-height:520px; overflow:auto; padding-right:2px; }
+    .delivery-item { border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:8px; background:#fff; padding:11px; display:grid; gap:8px; }
+    .delivery-item.red { border-left-color:var(--red); background:#fffafa; }
+    .delivery-item.amber { border-left-color:var(--amber); background:#fffdf5; }
+    .delivery-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .delivery-head strong { font-size:14px; }
+    .delivery-head span { display:block; margin-top:3px; color:var(--muted); font-size:12px; }
+    .level-pills { display:flex; gap:6px; flex-wrap:wrap; }
+    .level-pills code { border:1px solid var(--line); border-radius:999px; padding:3px 7px; background:#f8fafc; font-size:11px; color:#334155; }
+    .delivery-note { color:var(--muted); font-size:12px; line-height:1.45; }
     .panel-tools { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
     .filter-tabs { display:flex; gap: 6px; flex-wrap: wrap; }
     .filter-tabs button { border: 1px solid var(--line); border-radius: 999px; background:#fff; min-height: 30px; padding: 4px 10px; color: var(--muted); font-size: 12px; font-weight: 800; cursor:pointer; }
@@ -11555,7 +11900,7 @@ function renderAdminPage(csrfToken = '') {
       .range-fields { grid-template-columns: 1fr; }
       .range-actions { justify-content:stretch; }
       .range-actions .btn { flex: 1 1 calc(50% - 4px); }
-      .analytics-grid, .metric-grid { grid-template-columns: 1fr; }
+      .analytics-grid, .metric-grid, .delivery-grid, .delivery-metrics { grid-template-columns: 1fr; }
       .rank-row { grid-template-columns: 76px minmax(0,1fr); }
       .rank-row span { grid-column: 1 / -1; }
       .mobile-quick { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
@@ -11740,7 +12085,7 @@ function renderSignalFormHtml() {
       <div class="full"><label>備註</label><textarea name="note" placeholder="盤勢、策略、風險提醒"></textarea></div>
     </div>
     <div class="preview signal-preview warn" id="signalPreview">載入品種後可建立訊號。</div>
-	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" type="reset">清空</button></div>
+	    <div class="actions"><button class="btn primary" id="createSignalBtn" type="submit" disabled>建立訊號</button><button class="btn ghost" data-admin-test-signal type="button">測試發給管理員</button><button class="btn ghost" type="reset">清空</button></div>
 	  </form>`;
 }
 
@@ -11765,6 +12110,23 @@ function renderStrategyFormHtml() {
 
 function renderTradingViewHtml() {
   return `<div class="grid">
+    <section class="panel">
+      <header>
+        <div><h2>訊號投遞診斷中心</h2><p>追蹤 TV webhook、點位解析、TG 背景派送與管理員測試</p></div>
+        <div class="panel-tools"><button class="btn ghost" type="button" id="deliveryRefreshBtn">刷新診斷</button><button class="btn primary" data-admin-test-signal type="button">測試發給管理員</button></div>
+      </header>
+      <div class="body">
+        <div class="delivery-grid">
+          <div class="stack">
+            <div class="delivery-metrics" id="deliveryMetrics"></div>
+            <div class="preview" id="adminTestResult"><b>尚未測試</b><div>填好左側快速發訊欄位後，可只發給 ADMIN_IDS 驗證 TG 延遲與格式，不會通知會員。</div></div>
+          </div>
+          <div class="delivery-list" id="deliveryDiagnostics"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <div class="grid">
     <section class="panel">
       <header><div><h2>TradingView Gateway</h2><p>多來源 webhook、secret、策略與發送模式</p></div><button class="btn primary" type="button" data-copy="tv-current">複製目前 Webhook</button></header>
       <div class="body"><div class="card-grid two" id="tvSourceCards"></div></div>
@@ -12184,6 +12546,7 @@ function renderAll() {
   renderStrategies();
   renderEconomic();
   renderTradingView();
+  renderDeliveryDiagnostics();
   renderStrategyHealth();
   renderTvGateway();
   renderRevenueSummary();
@@ -13081,6 +13444,55 @@ function tvLogDiagnosis(log) {
   }
   return { title: 'Alert 錯誤', action: log.error || '請檢查 payload 格式。' };
 }
+function deliveryLevelText(levels) {
+  levels = levels || {};
+  return [
+    ['Entry', levels.entry],
+    ['SL', levels.stopLoss],
+    ['TP1', levels.tp1],
+    ['TP2', levels.tp2],
+    ['TP3', levels.tp3]
+  ].map(function (item) {
+    return '<code>' + esc(item[0] + ':' + (item[1] === null || item[1] === undefined || item[1] === '' ? '-' : priceText(item[1]))) + '</code>';
+  }).join('');
+}
+function deliveryItemCard(item) {
+  var diagnosis = item.diagnosis || {};
+  var tone = diagnosis.tone || (item.status === 'error' ? 'red' : 'green');
+  var delivery = item.delivery || {};
+  var title = diagnosis.title || item.status || 'Alert';
+  var subtitle = [item.source_id || '-', item.strategy_id || '-', item.signal_uid || '無訊號'].join(' · ');
+  var deliveryText = delivery.details ? '<div class="delivery-note">TG：' + esc(delivery.details) + ' · ' + esc(dateText(delivery.created_at)) + '</div>' : '';
+  var errorText = item.error ? '<div class="delivery-note">錯誤：' + esc(item.error) + '</div>' : '';
+  return '<article class="delivery-item ' + esc(tone) + '">' +
+    '<div class="delivery-head"><div><strong>' + esc((item.ticker || '-') + ' ' + (item.action || '') + '｜' + title) + '</strong><span>' + esc(dateText(item.created_at)) + ' · ' + esc(subtitle) + '</span></div>' + chip(item.status || '-', tone) + '</div>' +
+    '<div class="level-pills">' + deliveryLevelText(diagnosis.levels || {}) + '</div>' +
+    '<div class="delivery-note">' + esc(diagnosis.action || '等待處理') + '</div>' +
+    errorText + deliveryText +
+  '</article>';
+}
+function renderDeliveryDiagnostics() {
+  var diag = state.data.deliveryDiagnostics || {};
+  var stats = diag.stats || {};
+  var metrics = document.getElementById('deliveryMetrics');
+  if (metrics) {
+    metrics.innerHTML = [
+      ['24h Alert', stats.alerts24 || 0, 'TradingView 進站'],
+      ['24h 錯誤', stats.errors24 || 0, '解析或格式失敗'],
+      ['SL/TP 為 0', stats.zero24 || 0, '已攔截不推會員'],
+      ['TG 完成', stats.delivered24 || 0, '背景派送紀錄'],
+      ['待補送', stats.queuedDue || 0, '安靜時段或重試佇列'],
+      ['管理員', diag.adminTargets || 0, '可測試 TG 目標']
+    ].map(function (item) {
+      return '<div class="delivery-card"><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong><small>' + esc(item[2]) + '</small></div>';
+    }).join('');
+  }
+  var list = document.getElementById('deliveryDiagnostics');
+  if (list) {
+    list.innerHTML = (diag.items || []).slice(0, 18).map(deliveryItemCard).join('') ||
+      '<div class="health-card warning"><strong>尚無投遞紀錄</strong><p>下一筆 TradingView alert 或後台發訊後，這裡會顯示完整生命線。</p></div>';
+  }
+}
 function filteredTvSources() {
   return (state.data.tvSources || []).filter(function (source) {
     return matchesQuery(source, ['source_id', 'name', 'default_strategy_id', 'allowed_symbols', 'default_signal_type', 'target_group', 'notes']);
@@ -13547,6 +13959,19 @@ function currentSignalDraft() {
   var data = formPayload(form);
   var select = document.getElementById('signalTicker');
   if (!data.ticker && select && select.value) data.ticker = select.value;
+  ['entry_price','stop_loss','tp1','tp2','tp3','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
+    if ((data[key] === undefined || data[key] === '') && form.elements[key]) {
+      data[key] = form.elements[key].value;
+    }
+  });
+  ['entry_price','stop_loss','tp1','tp2','tp3'].forEach(function (key) {
+    if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]);
+  });
+  if (data.send !== undefined && data.send !== '') data.send = data.send === true || data.send === 'true';
+  if (!data.action) {
+    var activeAction = document.querySelector('#signalForm [data-action].active');
+    data.action = state.action || (activeAction && activeAction.dataset.action) || 'LONG';
+  }
   return data;
 }
 function signalDraftError(data) {
@@ -13592,8 +14017,49 @@ function signalPayload(form) {
   var data = formPayload(form);
   var select = document.getElementById('signalTicker');
   if (!data.ticker && select && select.value) data.ticker = select.value;
+  ['entry_price','stop_loss','tp1','tp2','tp3','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
+    if ((data[key] === undefined || data[key] === '') && form.elements[key]) {
+      data[key] = form.elements[key].value;
+    }
+  });
+  ['entry_price','stop_loss','tp1','tp2','tp3'].forEach(function (key) {
+    if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]);
+  });
+  if (data.send !== undefined && data.send !== '') data.send = data.send === true || data.send === 'true';
+  if (!data.action) {
+    var activeAction = document.querySelector('#signalForm [data-action].active');
+    data.action = state.action || (activeAction && activeAction.dataset.action) || 'LONG';
+  }
   if (!data.ticker) throw new Error('請先選擇品種');
   return data;
+}
+function renderAdminTestResult(result) {
+  var box = document.getElementById('adminTestResult');
+  if (!box) return;
+  var ok = Number(result.sent || 0) > 0;
+  box.className = 'preview ' + (ok ? '' : 'error');
+  box.innerHTML =
+    '<div>' + chip(ok ? '測試成功' : '測試失敗', ok ? 'green' : 'red') + ' ' + chip('耗時 ' + esc(result.ms || 0) + 'ms', '') + '</div>' +
+    '<b>' + esc((result.sent || 0) + '/' + (result.total || 0) + ' 位管理員收到') + '</b>' +
+    '<div class="muted">Signal ' + esc(result.signalUid || '-') + ' · 此訊息未發送給會員。</div>';
+}
+async function refreshDeliveryDiagnostics() {
+  setMessage('刷新投遞診斷中...');
+  state.data.deliveryDiagnostics = await api('/api/admin/delivery/diagnostics?limit=60');
+  renderDeliveryDiagnostics();
+  setMessage('投遞診斷已刷新', 'ok');
+}
+async function runAdminSignalTest() {
+  var payload = currentSignalDraft();
+  var error = signalDraftError(payload);
+  if (error) throw new Error('測試前請先完成快速發訊欄位：' + error);
+  var ok = await confirmAdminAction('測試發給管理員', '只會發送到 ADMIN_IDS，不會通知會員，也不會建立正式訊號。', '發送測試', 'primary');
+  if (!ok) return;
+  setMessage('發送管理員測試 TG 中...');
+  var result = await api('/api/admin/delivery/test-admin', { method: 'POST', body: JSON.stringify(payload) });
+  renderAdminTestResult(result);
+  await refreshDeliveryDiagnostics();
+  setMessage('管理員測試發送完成：' + (result.sent || 0) + '/' + (result.total || 0) + '，' + (result.ms || 0) + 'ms', result.sent ? 'ok' : 'error');
 }
 function showError(err, fallback) {
   setMessage((err && err.message) || fallback || '操作失敗', 'error');
@@ -13699,6 +14165,11 @@ document.body.addEventListener('click', async function (event) {
     var editEventBtn = event.target.closest('[data-edit-event]');
     if (editEventBtn) {
       editEconomicEvent(editEventBtn.dataset.editEvent);
+      return;
+    }
+    var adminTestSignalBtn = event.target.closest('[data-admin-test-signal]');
+    if (adminTestSignalBtn) {
+      await runAdminSignalTest();
       return;
     }
     var closeBtn = event.target.closest('[data-close]');
@@ -13849,6 +14320,12 @@ document.querySelector('.seg').addEventListener('click', function (event) {
   setSignalAction(btn.dataset.action);
 });
 document.getElementById('refreshBtn').addEventListener('click', function () { load().catch(showError); });
+var deliveryRefreshBtn = document.getElementById('deliveryRefreshBtn');
+if (deliveryRefreshBtn) {
+  deliveryRefreshBtn.addEventListener('click', function () {
+    refreshDeliveryDiagnostics().catch(function (err) { showError(err, '刷新投遞診斷失敗'); });
+  });
+}
 var dateRangeApply = document.getElementById('dateRangeApply');
 if (dateRangeApply) {
   dateRangeApply.addEventListener('click', function () {
