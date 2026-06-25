@@ -747,8 +747,10 @@ function normalizeEconomicImpact(value) {
 function normalizeTradingViewImportance(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return '';
-  if (n >= 1) return 'high';
-  if (n === 0) return 'medium';
+  if (n >= 3) return 'high';
+  if (n === 2) return 'medium';
+  if (n === 1) return 'low';
+  if (n === 0) return 'low';
   return 'low';
 }
 
@@ -757,7 +759,22 @@ function economicImpactLabel(impact) {
   return map[normalizeEconomicImpact(impact)] || impact || '中';
 }
 
-const ECONOMIC_MARKET_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CAD', 'AUD'];
+const ECONOMIC_COUNTRY_TO_CURRENCY = {
+  US: 'USD',
+  EU: 'EUR',
+  EZ: 'EUR',
+  EA: 'EUR',
+  EMU: 'EUR',
+  GB: 'GBP',
+  UK: 'GBP',
+  JP: 'JPY',
+  CN: 'CNY',
+  CA: 'CAD',
+  AU: 'AUD',
+  NZ: 'NZD',
+  CH: 'CHF'
+};
+const ECONOMIC_MARKET_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CAD', 'AUD', 'NZD', 'CHF'];
 const ECONOMIC_MARKET_HIGH_KEYWORDS = [
   'cpi', 'core cpi', 'pce', 'core pce', 'inflation', 'ppi',
   'non-farm', 'nonfarm', 'nfp', 'payroll', 'employment change',
@@ -782,9 +799,18 @@ function economicEventKeywordText(event) {
   ].filter(Boolean).join(' ').toLowerCase();
 }
 
+function normalizeEconomicCurrencyCode(currency, country = '') {
+  const cur = String(currency || '').trim().toUpperCase();
+  const c = String(country || '').trim().toUpperCase();
+  if (/^[A-Z]{3}$/.test(cur)) return cur;
+  if (ECONOMIC_COUNTRY_TO_CURRENCY[c]) return ECONOMIC_COUNTRY_TO_CURRENCY[c];
+  if (/^[A-Z]{3}$/.test(c)) return c;
+  return cur;
+}
+
 function economicEventIsMarketMoving(event) {
   const impact = normalizeEconomicImpact(event?.impact);
-  const currency = String(event?.currency || event?.country || '').toUpperCase();
+  const currency = normalizeEconomicCurrencyCode(event?.currency, event?.country);
   const text = economicEventKeywordText(event);
   if (impact === 'low') return false;
   if (ECONOMIC_MARKET_NOISE_KEYWORDS.some((keyword) => text.includes(keyword))) return false;
@@ -793,20 +819,28 @@ function economicEventIsMarketMoving(event) {
   return ECONOMIC_MARKET_HIGH_KEYWORDS.some((keyword) => text.includes(keyword));
 }
 
-function normalizeEconomicDateTime(timeValue, dateValue = '') {
+function normalizeEconomicDateTime(timeValue, dateValue = '', options = {}) {
+  const assumeTimezone = String(options.assumeTimezone || 'Asia/Taipei');
+  const offset = /utc/i.test(assumeTimezone) ? 'Z' : '+08:00';
+  const rawNumber = typeof timeValue === 'number' ? timeValue : (/^\d{10,13}$/.test(String(timeValue || '').trim()) ? Number(String(timeValue).trim()) : null);
+  if (Number.isFinite(rawNumber)) {
+    const ms = rawNumber > 100000000000 ? rawNumber : rawNumber * 1000;
+    const parsed = new Date(ms);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
   const timeText = String(timeValue || '').trim();
   const dateText = String(dateValue || '').trim();
   if (!timeText && !dateText) return null;
 
   let text = timeText || dateText;
   if (/^\d{1,2}:\d{2}$/.test(timeText) && /^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
-    text = `${dateText}T${timeText}:00+08:00`;
+    text = `${dateText}T${timeText}:00${offset}`;
   } else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(text)) {
-    text = `${text}:00+08:00`;
+    text = `${text}:00${offset}`;
   } else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(text) && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) {
-    text = `${text.replace(' ', 'T')}+08:00`;
+    text = `${text.replace(' ', 'T')}${offset}`;
   } else if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-    text = `${text}T00:00:00+08:00`;
+    text = `${text}T00:00:00${offset}`;
   }
 
   const parsed = new Date(text);
@@ -909,18 +943,20 @@ function buildEconomicCalendarUrl(template, dateKey) {
 
 function normalizeEconomicFeedItem(item, sourceName, fallbackDate) {
   if (!item || typeof item !== 'object') return null;
+  const sourceText = String(firstTvValue(item.source, sourceName)).trim() || 'calendar';
   const title = String(firstTvValue(
     item.title, item.event, item.name, item.indicator, item.release, item.description
   )).trim();
   if (!title) return null;
+  const assumeTimezone = /tradingview/i.test(sourceText) ? 'UTC' : 'Asia/Taipei';
   const eventTime = normalizeEconomicDateTime(firstTvValue(
     item.event_time, item.eventTime, item.datetime, item.dateTime, item.timestamp,
     item.time, item.release_time, item.releaseTime, item.date
-  ), firstTvValue(item.event_date, item.eventDate, item.date, fallbackDate));
+  ), firstTvValue(item.event_date, item.eventDate, item.date, fallbackDate), { assumeTimezone });
   const eventDate = economicEventDate(eventTime, firstTvValue(item.event_date, item.eventDate, item.date, fallbackDate));
   let currency = String(firstTvValue(item.currency, item.currencyCode, item.ticker, item.iso_currency)).trim().toUpperCase();
   let country = String(firstTvValue(item.country, item.countryCode, item.region)).trim().toUpperCase();
-  if (!currency && /^[A-Z]{3}$/.test(country)) currency = country;
+  currency = normalizeEconomicCurrencyCode(currency, country);
   if (!country && currency) country = currency;
   const rawImpact = firstTvValue(item.impact, item.importanceLabel, item.priority, item.volatility);
   const impact = rawImpact ? normalizeEconomicImpact(rawImpact) : normalizeTradingViewImportance(item.importance);
@@ -935,7 +971,7 @@ function normalizeEconomicFeedItem(item, sourceName, fallbackDate) {
     actual: String(firstTvValue(item.actual, item.actual_value, item.actualValue)).trim(),
     forecast: String(firstTvValue(item.forecast, item.consensus, item.estimate)).trim(),
     previous: String(firstTvValue(item.previous, item.prev, item.prior)).trim(),
-    source: String(firstTvValue(item.source, sourceName)).trim() || 'calendar',
+    source: sourceText,
     source_url: cleanUrl(firstTvValue(item.source_url, item.sourceUrl, item.url)),
     status: String(firstTvValue(item.status, 'scheduled')).trim() || 'scheduled',
     notes: String(firstTvValue(item.notes, item.note, item.comment)).trim()
@@ -2082,22 +2118,38 @@ async function broadcastSignal(db, signal, env = {}) {
       AND (u.tier_expires_at IS NULL OR u.tier_expires_at > datetime('now'))
   `).all();
 
-  let sent = 0, queued = 0, skipped = 0;
+  let sent = 0, queued = 0, skipped = 0, failed = 0;
+  const errors = [];
   const recipients = users.results || [];
   const batchSize = Math.max(1, Math.min(25, Number(env.SIGNAL_SEND_BATCH_SIZE || 12)));
 
   for (let i = 0; i < recipients.length; i += batchSize) {
     const batch = recipients.slice(i, i + batchSize);
-    const results = await Promise.all(batch.map((user) => sendSignalRecipient(db, user, signal, env)));
+    const results = await Promise.all(batch.map(async (user) => {
+      try {
+        return await sendSignalRecipient(db, user, signal, env);
+      } catch (e) {
+        const userId = String(user.telegram_user_id || user.user_id || '').slice(0, 32);
+        return { type: 'failed', userId, error: e?.message || String(e) };
+      }
+    }));
     for (const result of results) {
       if (result.type === 'sent') sent++;
       else if (result.type === 'queued') queued++;
+      else if (result.type === 'failed') {
+        failed++;
+        if (errors.length < 5) errors.push(`${result.userId || '-'}:${String(result.error || '').slice(0, 120)}`);
+      }
       else skipped++;
     }
     if (i + batchSize < recipients.length) await new Promise((resolve) => setTimeout(resolve, 120));
   }
 
-  return { sent, queued, skipped, total: recipients.length };
+  if (failed) {
+    await logAction(db, 'telegram:broadcast', 'telegram_signal_recipient_failures', signal.signal_uid, `${failed} failed / ${recipients.length} recipients${errors.length ? `: ${errors.join(' | ')}` : ''}`);
+  }
+
+  return { sent, queued, skipped, failed, total: recipients.length };
 }
 
 async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
@@ -10948,7 +11000,7 @@ async function finalizeTvSignalDelivery(env = {}, signalUid, autoClosed = []) {
   const delivery = await broadcastSignal(db, signal, env);
   await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
   const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
-  await logAction(db, 'tv:background', 'tv_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
+  await logAction(db, 'tv:background', 'tv_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, failed ${delivery.failed || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
   return { delivery, autoTrade };
 }
 
@@ -10969,7 +11021,7 @@ async function finalizeAdminSignalDelivery(env = {}, signalUid, autoClosed = [],
   const delivery = await broadcastSignal(db, signal, env);
   await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
   const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
-  await logAction(db, actorId || 'web-admin', 'admin_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
+  await logAction(db, actorId || 'web-admin', 'admin_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}, queued ${delivery.queued || 0}, skipped ${delivery.skipped || 0}, failed ${delivery.failed || 0}, total ${delivery.total || 0}, ms ${Date.now() - startedAt}`);
   return { delivery, autoTrade };
 }
 
@@ -11373,7 +11425,8 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
     `).bind(alertUid, source.source_id, draft.strategy_id, draft.ticker, draft.action, JSON.stringify(payload), result.signalUid, result.status).run();
     if (result.deferred) {
-      ctx.waitUntil(finalizeTvSignalDelivery(env, result.signalUid, result.autoClosed));
+      ctx.waitUntil(finalizeTvSignalDelivery(env, result.signalUid, result.autoClosed)
+        .catch((e) => logAction(db, 'tv:background', 'tv_signal_delivery_failed', result.signalUid, e?.message || String(e))));
     }
     return json({ ok: true, source: source.source_id, ...result, signal: draft });
   } catch (e) {
@@ -11449,7 +11502,8 @@ async function handleAdminApi(request, env, pathname, ctx = null) {
     if (request.method === 'POST' && parts[0] === 'signals' && parts.length === 1) {
       const result = await createAdminSignal(db, adminId, await readJsonBody(request), env, { deferDelivery: Boolean(ctx?.waitUntil) });
       if (result.deferred && ctx?.waitUntil) {
-        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId));
+        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId)
+          .catch((e) => logAction(db, adminId, 'admin_signal_delivery_failed', result.signalUid, e?.message || String(e))));
       }
       return json({ ok: true, data: result });
     }
@@ -11475,7 +11529,8 @@ async function handleAdminApi(request, env, pathname, ctx = null) {
     if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'send') {
       const result = await sendPendingAdminSignal(db, adminId, parts[1], env, { deferDelivery: Boolean(ctx?.waitUntil) });
       if (result.deferred && ctx?.waitUntil) {
-        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId));
+        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId)
+          .catch((e) => logAction(db, adminId, 'admin_signal_delivery_failed', result.signalUid, e?.message || String(e))));
       }
       return json({ ok: true, data: result });
     }
