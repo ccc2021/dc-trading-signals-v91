@@ -740,6 +740,15 @@ function taipeiDateKey(date = new Date()) {
   return new Date(date).toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
 }
 
+function taipeiWeekStartKey(date = new Date()) {
+  const key = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : taipeiDateKey(date);
+  const [year, month, day] = key.split('-').map(Number);
+  const utc = Date.UTC(year, month - 1, day);
+  const dow = new Date(utc).getUTCDay();
+  const mondayOffset = (dow + 6) % 7;
+  return new Date(utc - mondayOffset * 86400000).toISOString().slice(0, 10);
+}
+
 function taipeiHour(date = new Date()) {
   return Number(new Date(date).toLocaleString('en-US', {
     timeZone: 'Asia/Taipei',
@@ -1099,8 +1108,8 @@ async function economicEventUid(event) {
   return `ECO${(await sha256Hex(raw)).slice(0, 20).toUpperCase()}`;
 }
 
-async function upsertEconomicEvent(db, payload, source = 'manual') {
-  await ensureEconomicEventsSchema(db);
+async function upsertEconomicEvent(db, payload, source = 'manual', options = {}) {
+  if (!options.skipEnsure) await ensureEconomicEventsSchema(db);
   const eventTime = normalizeEconomicDateTime(
     payload.event_time || payload.eventTime || payload.time,
     payload.event_date || payload.eventDate || payload.date
@@ -1193,14 +1202,14 @@ async function fetchEconomicCalendarEvents(env, config, dateKey) {
   return { events, source: config.sourceName, url: usedUrl || url, proxied: usedUrl && usedUrl !== url };
 }
 
-async function syncEconomicEvents(db, env = {}, dateKey = taipeiDateKey()) {
-  await ensureEconomicEventsSchema(db);
-  const config = await getEconomicConfig(db, env);
+async function syncEconomicEvents(db, env = {}, dateKey = taipeiDateKey(), options = {}) {
+  if (!options.skipEnsure) await ensureEconomicEventsSchema(db);
+  const config = options.config || await getEconomicConfig(db, env);
   const fetched = await fetchEconomicCalendarEvents(env, config, dateKey);
   let saved = 0;
   for (const event of fetched.events || []) {
     if (!economicEventMatchesConfig(event, config)) continue;
-    await upsertEconomicEvent(db, event, event.source || config.sourceName);
+    await upsertEconomicEvent(db, event, event.source || config.sourceName, { skipEnsure: true });
     saved++;
   }
   return { synced: saved, total: (fetched.events || []).length, skipped: !!fetched.skipped, reason: fetched.reason || '', source: fetched.source || config.sourceName, url: fetched.url || '', proxied: !!fetched.proxied };
@@ -1210,10 +1219,12 @@ async function syncEconomicEventsRange(db, env = {}, startDateKey = taipeiDateKe
   const total = { synced: 0, total: 0, days: 0, errors: [], skipped: false, source: '' };
   const count = Math.max(1, Math.min(7, Number(days || 1)));
   const base = new Date(`${adminDateKey(startDateKey) || taipeiDateKey()}T00:00:00+08:00`);
+  await ensureEconomicEventsSchema(db);
+  const config = await getEconomicConfig(db, env);
   for (let i = 0; i < count; i++) {
     const key = taipeiDateKey(new Date(base.getTime() + i * 86400000));
     try {
-      const result = await syncEconomicEvents(db, env, key);
+      const result = await syncEconomicEvents(db, env, key, { skipEnsure: true, config });
       total.synced += Number(result.synced || 0);
       total.total += Number(result.total || 0);
       total.days++;
@@ -1283,7 +1294,7 @@ async function sendEconomicEventsReminder(env = {}, options = {}) {
 
   let sync = null;
   try {
-    sync = await syncEconomicEventsRange(db, env, dateKey, config.lookaheadDays || 1);
+    sync = await syncEconomicEvents(db, env, dateKey);
   } catch (e) {
     sync = { synced: 0, error: e.message };
   }
@@ -1352,6 +1363,21 @@ async function sendEconomicPreEventAlerts(env = {}, options = {}) {
     WHERE event_uid IN (${events.map(() => '?').join(',')})
   `).bind(...events.map((event) => event.event_uid)).run();
   return { ...result, eventCount: events.length, targetGroup: config.targetGroup, sync };
+}
+
+async function maybeSyncWeeklyEconomicEvents(env = {}, options = {}) {
+  const db = env.DB;
+  await ensureEconomicEventsSchema(db);
+  const dateKey = options.date || taipeiDateKey();
+  const weekStart = taipeiWeekStartKey(dateKey);
+  const last = await getConfig(db, 'economic_calendar_last_weekly_sync');
+  if (!options.force && last === weekStart) {
+    return { skipped: true, reason: 'already_synced_this_week', weekStart };
+  }
+  const result = await syncEconomicEventsRange(db, env, weekStart, 7);
+  await setConfig(db, 'economic_calendar_last_weekly_sync', weekStart);
+  await logAction(db, 'economic:cron', 'economic_weekly_sync', weekStart, `synced ${result.synced}/${result.total}`);
+  return { ...result, weekStart };
 }
 
 function normalizeUserCallback(data) {
@@ -6383,13 +6409,13 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_auto_remind) config.economic_calendar_auto_remind = '1';
   if (!config.economic_calendar_remind_hour) config.economic_calendar_remind_hour = '8';
   if (!config.economic_calendar_pre_event_minutes) config.economic_calendar_pre_event_minutes = '30';
-  if (!config.economic_calendar_lookahead_days) config.economic_calendar_lookahead_days = '1';
+  if (!config.economic_calendar_lookahead_days) config.economic_calendar_lookahead_days = '7';
   if (!config.economic_calendar_target_group) config.economic_calendar_target_group = 'paid';
   if (!config.economic_calendar_impacts) config.economic_calendar_impacts = 'high';
   if (!config.economic_calendar_currencies) config.economic_calendar_currencies = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
   if (!config.economic_calendar_market_only) config.economic_calendar_market_only = '1';
   if (!config.signal_proxy_rules) config.signal_proxy_rules = DEFAULT_SIGNAL_PROXY_RULES;
-  if (!config.signal_min_probability) config.signal_min_probability = '0';
+  if (!config.signal_min_probability) config.signal_min_probability = '60';
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
   const ops = await safe('ops.health', getOperationalHealth(db, config, startedAt, env), () => fallbackOperationalHealth(config, startedAt, env));
   if (bootstrapErrors.length) {
@@ -11293,20 +11319,31 @@ async function createSignalFromTvDraft(db, draft, alertUid, autoSend, env = {}, 
   return { signalUid: draft.signal_uid, status: shouldSend ? 'active' : 'pending', delivery, paused: paused === '1', autoClosed, autoTrade, deferred: deferDelivery };
 }
 
+async function notifyAutoClosedSignals(env = {}, autoClosed = [], actorId = 'tv:background') {
+  const db = env.DB;
+  if (!db || !Array.isArray(autoClosed) || !autoClosed.length) return { sent: 0, failed: 0 };
+  let sent = 0;
+  let failed = 0;
+  for (const closed of autoClosed) {
+    try {
+      const note = closed.tpHitsText ? `${closed.reason || '新訊號自動結束上一筆'}\n已達 ${closed.tpHitsText}` : (closed.reason || '新訊號自動結束上一筆');
+      const delivery = await broadcastExit(db, 'AUTO', closed.ticker, closed.price, closed.pnl, note, closed.signalUid);
+      sent += delivery?.sent || 0;
+    } catch (e) {
+      failed += 1;
+      await logAction(db, actorId, 'auto_close_notify_failed', closed.signalUid || '', e?.message || String(e));
+    }
+  }
+  return { sent, failed };
+}
+
 async function finalizeTvSignalDelivery(env = {}, signalUid, autoClosed = []) {
   const db = env.DB;
   if (!db || !signalUid) return { sent: 0, autoTrade: { status: AUTO_TRADE_STATUS.skipped } };
   const startedAt = Date.now();
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal || signal.status !== 'active') return { sent: 0, skipped: true };
-  for (const closed of autoClosed || []) {
-    try {
-      const note = closed.tpHitsText ? `${closed.reason || '新訊號自動結束上一筆'}\n已達 ${closed.tpHitsText}` : (closed.reason || '新訊號自動結束上一筆');
-      await broadcastExit(db, 'AUTO', closed.ticker, closed.price, closed.pnl, note, closed.signalUid);
-    } catch (e) {
-      await logAction(db, 'tv:background', 'auto_close_notify_failed', closed.signalUid || '', e.message);
-    }
-  }
+  await notifyAutoClosedSignals(env, autoClosed, 'tv:background');
   const delivery = await broadcastSignal(db, signal, env);
   await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
   const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
@@ -11502,13 +11539,18 @@ async function getSignalMinProbability(db) {
 async function signalProbabilityGate(db, draft = {}) {
   const minProbability = await getSignalMinProbability(db);
   const probability = normalizeProbabilityValue(draft.probability);
-  const ignored = minProbability > 0 && probability !== null && probability < minProbability;
+  const missing = minProbability > 0 && probability === null;
+  const below = minProbability > 0 && probability !== null && probability < minProbability;
+  const ignored = missing || below;
   return {
     enabled: minProbability > 0,
     minProbability,
     probability,
     ignored,
-    reason: ignored ? `機率 ${fmtProbability(probability)} 低於門檻 ${fmtProbability(minProbability)}` : ''
+    status: missing ? 'ignored_missing_probability' : below ? 'ignored_low_probability' : 'accepted',
+    reason: missing
+      ? `未收到機率，門檻為 ${fmtProbability(minProbability)}`
+      : below ? `機率 ${fmtProbability(probability)} 低於門檻 ${fmtProbability(minProbability)}` : ''
   };
 }
 
@@ -11738,7 +11780,7 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
     return json({ ok: true, duplicate: true, signalUid: existingLog.signal_uid, status: existingLog.status });
   }
   const proxyCalibration = isProxyCalibrationPayload(payload);
-  if (existingLog?.status === 'ignored_low_probability') {
+  if (String(existingLog?.status || '').startsWith('ignored_')) {
     return json({ ok: true, duplicate: true, source: source.source_id, ignored: true, status: existingLog.status });
   }
   if (proxyCalibration && existingLog?.status && String(existingLog.status).startsWith('calibration')) {
@@ -11785,9 +11827,19 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
     const draft = await buildTvSignalDraft(db, source, payload);
     const probabilityGate = await signalProbabilityGate(db, draft);
     if (probabilityGate.ignored) {
+      const paused = await getConfig(db, 'signals_paused');
+      const shouldSettlePrevious = Boolean(source.auto_send) && paused !== '1';
+      const canDeferCloseNotice = Boolean(ctx?.waitUntil && shouldSettlePrevious);
+      const autoClosed = shouldSettlePrevious
+        ? await closeActiveSignalsForReplacement(db, draft, `tv:${draft.source}:probability-gate`, env, !canDeferCloseNotice)
+        : [];
+      if (canDeferCloseNotice && autoClosed.length) {
+        ctx.waitUntil(notifyAutoClosedSignals(env, autoClosed, 'tv:probability')
+          .catch((e) => logAction(db, 'tv:probability', 'low_probability_close_notify_failed', alertUid, e?.message || String(e))));
+      }
       await db.prepare(`
         INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, 'ignored_low_probability', ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, datetime('now'))
       `).bind(
         alertUid,
         source.source_id,
@@ -11795,10 +11847,11 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
         draft.ticker,
         draft.action,
         JSON.stringify(payload),
+        probabilityGate.status,
         probabilityGate.reason
       ).run();
-      await logAction(db, 'tv:probability', 'tv_signal_ignored_low_probability', alertUid, `${draft.ticker} ${draft.action} ${probabilityGate.reason}`);
-      return json({ ok: true, source: source.source_id, ignored: true, status: 'ignored_low_probability', probabilityGate, signal: draft });
+      await logAction(db, 'tv:probability', 'tv_signal_ignored_probability_gate', alertUid, `${draft.ticker} ${draft.action} ${probabilityGate.reason}; closed ${autoClosed.length}`);
+      return json({ ok: true, source: source.source_id, ignored: true, status: probabilityGate.status, probabilityGate, autoClosed, paused: paused === '1', signal: draft });
     }
     const canDeferDelivery = Boolean(ctx?.waitUntil && source.auto_send);
     const result = await createSignalFromTvDraft(db, draft, alertUid, source.auto_send, env, {
@@ -12895,7 +12948,7 @@ function renderEconomicConfigFormHtml() {
       <div><label>自動提醒</label><select name="economic_calendar_auto_remind"><option value="1">啟用</option><option value="0">停用</option></select></div>
       <div><label>提醒小時（台北）</label><input name="economic_calendar_remind_hour" inputmode="numeric" placeholder="8"></div>
       <div><label>提前提醒分鐘</label><input name="economic_calendar_pre_event_minutes" inputmode="numeric" placeholder="30"></div>
-      <div><label>同步天數</label><input name="economic_calendar_lookahead_days" inputmode="numeric" placeholder="1"></div>
+      <div><label>同步天數</label><input name="economic_calendar_lookahead_days" inputmode="numeric" placeholder="7"></div>
       <div><label>推送目標</label><select name="economic_calendar_target_group"><option value="paid">全部付費會員</option><option value="pro">Pro 以上</option><option value="vip">VIP</option><option value="all">全部會員</option></select></div>
       <div><label>重要性</label><input name="economic_calendar_impacts" placeholder="high"></div>
       <div><label>幣別篩選</label><input name="economic_calendar_currencies" placeholder="USD,EUR,GBP,JPY,CAD,AUD,CNY"></div>
@@ -12966,7 +13019,7 @@ function renderConfigFormHtml() {
       <div><label>VIP 年費</label><input name="vip_price_12m"></div>
       <div><label>試用天數</label><input name="trial_days"></div>
       <div><label>訊號狀態</label><select name="signals_paused"><option value="0">運行中</option><option value="1">暫停發訊</option></select></div>
-      <div><label>最低機率 %</label><input name="signal_min_probability" inputmode="decimal" placeholder="0 = 不過濾"></div>
+      <div><label>最低機率 %</label><input name="signal_min_probability" inputmode="decimal" placeholder="60；低於門檻只結算上一筆"></div>
       <div class="full"><label>公開短網址 / 自訂網域</label><input name="public_base_url" inputmode="url" placeholder="https://dc-signals.com"></div>
       <div><label>客服 Telegram</label><input name="contact_telegram"></div>
       <div><label>客服 LINE</label><input name="contact_line"></div>
@@ -13985,7 +14038,7 @@ function renderEconomicEvents() {
     if (!form.elements.economic_calendar_auto_remind.value) form.elements.economic_calendar_auto_remind.value = '1';
     if (!form.elements.economic_calendar_remind_hour.value) form.elements.economic_calendar_remind_hour.value = '8';
     if (!form.elements.economic_calendar_pre_event_minutes.value) form.elements.economic_calendar_pre_event_minutes.value = '30';
-    if (!form.elements.economic_calendar_lookahead_days.value) form.elements.economic_calendar_lookahead_days.value = '1';
+    if (!form.elements.economic_calendar_lookahead_days.value) form.elements.economic_calendar_lookahead_days.value = '7';
     if (!form.elements.economic_calendar_target_group.value) form.elements.economic_calendar_target_group.value = 'paid';
     if (!form.elements.economic_calendar_impacts.value) form.elements.economic_calendar_impacts.value = 'high';
     if (!form.elements.economic_calendar_currencies.value) form.elements.economic_calendar_currencies.value = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
@@ -15345,9 +15398,16 @@ async function handleSecurityCleanup(env) {
 }
 
 async function handleEconomicEventsCron(env, options = {}) {
+  let weekly;
+  try {
+    weekly = await maybeSyncWeeklyEconomicEvents(env, { date: options.date, force: options.force || options.forceWeekly });
+  } catch (e) {
+    weekly = { ok: false, error: e?.message || String(e) };
+    await logAction(env.DB, 'economic:cron', 'economic_weekly_sync_failed', options.date || taipeiDateKey(), weekly.error);
+  }
   const daily = await sendEconomicEventsReminder(env, options);
   const upcoming = await sendEconomicPreEventAlerts(env, options);
-  return { daily, upcoming };
+  return { weekly, daily, upcoming };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
