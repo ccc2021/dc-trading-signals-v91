@@ -509,7 +509,7 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
 }
 
 function signalPreviewOptions(signal) {
-  return signalMediaUrl(signal) ? { disablePreview: false } : {};
+  return { disablePreview: true };
 }
 
 function publicBaseUrl(env = {}, config = {}) {
@@ -533,7 +533,8 @@ function signalMediaUrl(signal) {
 }
 
 function signalPhotoUrl(signal, env = {}) {
-  return firstUrl(signal?.snapshot_url) || signalCardPublicUrl(signal, env);
+  if (String(env.SIGNAL_SEND_PHOTOS || '').trim() !== '1') return '';
+  return firstUrl(signal?.snapshot_url);
 }
 
 async function sendSignalTg(chatId, signal, message, kb = null, env = {}) {
@@ -2005,10 +2006,54 @@ async function isInQuietHours(settings) {
   }
 }
 
+function signalRecipientMatches(user, signal) {
+  if (user.tier === 'free') return false;
+  if (signal.is_vip_only && user.tier !== 'vip') return false;
+  if (user.paused) return false;
+  if (!user.notify_entry) return false;
+
+  const subscribedSymbols = parseJSON(user.subscribed_symbols, []);
+  if (subscribedSymbols.length > 0 && !subscribedSymbols.includes(signal.ticker)) return false;
+
+  const signalTypes = parseJSON(user.signal_types, []);
+  if (signalTypes.length > 0 && !signalTypes.includes(signal.signal_type)) return false;
+
+  return true;
+}
+
+async function sendSignalRecipient(db, user, signal, env = {}) {
+  const chatId = isTelegramChatId(user.telegram_user_id) ? user.telegram_user_id : user.user_id;
+  if (!isTelegramChatId(chatId)) return { type: 'skipped' };
+  if (!signalRecipientMatches(user, signal)) return { type: 'skipped' };
+
+  const isVip = user.tier === 'vip';
+  const msg = formatSignalCard(signal, user, isVip);
+  if (await isInQuietHours(user)) {
+    await db.prepare(`
+      INSERT INTO queued_signals (user_id, signal_uid, message, photo_url, scheduled_at)
+      VALUES (?, ?, ?, ?, datetime('now', '+8 hours'))
+    `).bind(chatId, signal.signal_uid, msg, signalPhotoUrl(signal, env) || null).run();
+    return { type: 'queued' };
+  }
+
+  const kb = {
+    inline_keyboard: [
+      [
+        { text: '已執行', callback_data: `exec_${signal.signal_uid}` },
+        { text: '跳過', callback_data: `skip_${signal.signal_uid}` }
+      ],
+      [
+        { text: '訊號卡', url: signalCardPublicUrl(signal, env) },
+        { text: '會員中心', url: memberPortalUrl(env) }
+      ]
+    ]
+  };
+  const result = await sendSignalTg(chatId, signal, msg, kb, env);
+  return result?.ok ? { type: 'sent' } : { type: 'skipped' };
+}
+
 async function broadcastSignal(db, signal, env = {}) {
-  await addColumnIfMissing(db, 'queued_signals', 'photo_url', 'TEXT');
   await ensureTelegramLinkSchema(db);
-  // 取得所有付費會員
   const users = await db.prepare(`
     SELECT u.user_id, u.telegram_user_id, u.tier, us.*
     FROM users u
@@ -2018,65 +2063,21 @@ async function broadcastSignal(db, signal, env = {}) {
   `).all();
 
   let sent = 0, queued = 0, skipped = 0;
+  const recipients = users.results || [];
+  const batchSize = Math.max(1, Math.min(25, Number(env.SIGNAL_SEND_BATCH_SIZE || 12)));
 
-  for (const user of users.results || []) {
-    const chatId = isTelegramChatId(user.telegram_user_id) ? user.telegram_user_id : user.user_id;
-    if (!isTelegramChatId(chatId)) {
-      skipped++;
-      continue;
+  for (let i = 0; i < recipients.length; i += batchSize) {
+    const batch = recipients.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map((user) => sendSignalRecipient(db, user, signal, env)));
+    for (const result of results) {
+      if (result.type === 'sent') sent++;
+      else if (result.type === 'queued') queued++;
+      else skipped++;
     }
-
-    // 檢查是否應該收到
-    const shouldReceive = await shouldReceiveSignal(db, user.user_id, signal);
-    if (!shouldReceive) {
-      skipped++;
-      continue;
-    }
-
-    // 檢查通知設定
-    if (!user.notify_entry) {
-      skipped++;
-      continue;
-    }
-
-    // 格式化訊號（個人化）
-    const isVip = user.tier === 'vip';
-    const msg = formatSignalCard(signal, user, isVip);
-
-    // 檢查安靜時段
-    if (await isInQuietHours(user)) {
-      // 加入待發佇列
-      const quietEnd = user.quiet_end;
-      await db.prepare(`
-        INSERT INTO queued_signals (user_id, signal_uid, message, photo_url, scheduled_at)
-        VALUES (?, ?, ?, ?, datetime('now', '+8 hours'))
-      `).bind(chatId, signal.signal_uid, msg, signalPhotoUrl(signal, env) || null).run();
-      queued++;
-      continue;
-    }
-
-    // 發送訊號
-    const kb = {
-      inline_keyboard: [
-        [
-          { text: '已執行', callback_data: `exec_${signal.signal_uid}` },
-          { text: '跳過', callback_data: `skip_${signal.signal_uid}` }
-        ],
-        [
-          { text: '訊號卡', url: signalCardPublicUrl(signal, env) },
-          { text: '會員中心', url: memberPortalUrl(env) }
-        ]
-      ]
-    };
-
-    const r = await sendSignalTg(chatId, signal, msg, kb, env);
-    if (r?.ok) sent++; else skipped++;
-
-    // 避免頻率限制
-    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    if (i + batchSize < recipients.length) await new Promise((resolve) => setTimeout(resolve, 120));
   }
 
-  return { sent, queued, skipped, total: (users.results || []).length };
+  return { sent, queued, skipped, total: recipients.length };
 }
 
 async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
@@ -6113,7 +6114,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   };
 }
 
-async function createAdminSignal(db, adminId, payload, env = {}) {
+async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
   const ticker = String(payload.ticker || payload.symbol || payload.instrument || '').trim().toUpperCase();
   const action = String(payload.action || '').toUpperCase();
   const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
@@ -6145,9 +6146,10 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
   if (sendNow && paused === '1') throw new Error('訊號目前已暫停，請先恢復或儲存草稿');
 
   const signalUid = genUID();
+  const deferDelivery = Boolean(options.deferDelivery && sendNow);
   let autoClosed = [];
   if (sendNow) {
-    autoClosed = await closeActiveSignalsForReplacement(db, { signal_uid: signalUid, ticker, action, entry_price: entry }, adminId, env, true);
+    autoClosed = await closeActiveSignalsForReplacement(db, { signal_uid: signalUid, ticker, action, entry_price: entry }, adminId, env, !deferDelivery);
   }
   await db.prepare(`
     INSERT INTO signals (
@@ -6179,12 +6181,17 @@ async function createAdminSignal(db, adminId, payload, env = {}) {
   let delivery = { sent: 0, queued: 0, skipped: 0, total: 0 };
   let autoTrade = { status: AUTO_TRADE_STATUS.skipped, reason: 'not_sent' };
   if (sendNow) {
-    delivery = await broadcastSignal(db, signal, env);
-    await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, signalUid).run();
-    autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
+    if (deferDelivery) {
+      delivery = { deferred: true, sent: 0, queued: 0, skipped: 0, total: 0 };
+      autoTrade = { status: AUTO_TRADE_STATUS.queued, deferred: true };
+    } else {
+      delivery = await broadcastSignal(db, signal, env);
+      await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent, signalUid).run();
+      autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
+    }
   }
   await logAction(db, adminId, sendNow ? 'web_signal_send' : 'web_signal_draft', signalUid, `${action} ${ticker} @${targetGroup}`);
-  return { signalUid, delivery, autoClosed, autoTrade };
+  return { signalUid, delivery, autoClosed, autoTrade, deferred: deferDelivery };
 }
 
 // 部分止盈：TP1/TP2 命中 → 移動止損保本續抱，不平倉
@@ -6301,7 +6308,7 @@ async function purgeAdminSignals(db, adminId, payload = {}) {
   return { matched: signals.length, deleted, details };
 }
 
-async function sendPendingAdminSignal(db, adminId, signalUid, env = {}) {
+async function sendPendingAdminSignal(db, adminId, signalUid, env = {}, options = {}) {
   const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
   if (!signal) throw new Error('找不到訊號');
   if (signal.status !== 'pending') throw new Error('只有草稿訊號可以發送');
@@ -6309,17 +6316,22 @@ async function sendPendingAdminSignal(db, adminId, signalUid, env = {}) {
   const paused = await getConfig(db, 'signals_paused');
   if (paused === '1') throw new Error('訊號目前已暫停，請先恢復發訊');
 
-  const autoClosed = await closeActiveSignalsForReplacement(db, signal, adminId, env, true);
-  const delivery = await broadcastSignal(db, signal, env);
+  const deferDelivery = Boolean(options.deferDelivery);
+  const autoClosed = await closeActiveSignalsForReplacement(db, signal, adminId, env, !deferDelivery);
+  let delivery = { deferred: true, sent: 0, queued: 0, skipped: 0, total: 0 };
+  let autoTrade = { status: AUTO_TRADE_STATUS.queued, deferred: true };
+  if (!deferDelivery) {
+    delivery = await broadcastSignal(db, signal, env);
+    autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
+  }
   await db.prepare(`
     UPDATE signals
     SET status = 'active', sent_count = ?, created_at = datetime('now')
     WHERE signal_uid = ?
-  `).bind(delivery.sent, signalUid).run();
-  const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
+  `).bind(delivery.sent || 0, signalUid).run();
   await db.prepare("UPDATE tv_alert_logs SET status = 'active' WHERE signal_uid = ?").bind(signalUid).run();
   await logAction(db, adminId, 'web_signal_release', signalUid, `${signal.action} ${signal.ticker}`);
-  return { signalUid, delivery, autoClosed, autoTrade };
+  return { signalUid, delivery, autoClosed, autoTrade, deferred: deferDelivery };
 }
 
 async function upsertAdminSymbol(db, payload) {
@@ -10525,6 +10537,26 @@ async function finalizeTvSignalDelivery(env = {}, signalUid, autoClosed = []) {
   return { delivery, autoTrade };
 }
 
+async function finalizeAdminSignalDelivery(env = {}, signalUid, autoClosed = [], actorId = 'web-admin') {
+  const db = env.DB;
+  if (!db || !signalUid) return { sent: 0, autoTrade: { status: AUTO_TRADE_STATUS.skipped } };
+  const signal = await db.prepare('SELECT * FROM signals WHERE signal_uid = ?').bind(signalUid).first();
+  if (!signal || signal.status !== 'active') return { sent: 0, skipped: true };
+  for (const closed of autoClosed || []) {
+    try {
+      const note = closed.tpHitsText ? `${closed.reason || '新訊號自動結束上一筆'}\n已達 ${closed.tpHitsText}` : (closed.reason || '新訊號自動結束上一筆');
+      await broadcastExit(db, 'AUTO', closed.ticker, closed.price, closed.pnl, note, closed.signalUid);
+    } catch (e) {
+      await logAction(db, actorId || 'web-admin', 'admin_auto_close_notify_failed', closed.signalUid || '', e.message);
+    }
+  }
+  const delivery = await broadcastSignal(db, signal, env);
+  await db.prepare('UPDATE signals SET sent_count = ? WHERE signal_uid = ?').bind(delivery.sent || 0, signalUid).run();
+  const autoTrade = await dispatchAutoTradeForSignal(env, signal, { autoClosed });
+  await logAction(db, actorId || 'web-admin', 'admin_signal_delivery_done', signalUid, `sent ${delivery.sent || 0}`);
+  return { delivery, autoTrade };
+}
+
 async function closeSignalFromTvExit(db, source, payload, alertUid) {
   const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
   if (!ticker) throw new Error('TradingView exit alert 缺少 ticker');
@@ -10892,7 +10924,7 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
   }
 }
 
-async function handleAdminApi(request, env, pathname) {
+async function handleAdminApi(request, env, pathname, ctx = null) {
   const auth = await requireAdminRequest(request, env, true);
   if (auth) return auth;
 
@@ -10939,7 +10971,11 @@ async function handleAdminApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts.length === 1) {
-      return json({ ok: true, data: await createAdminSignal(db, adminId, await readJsonBody(request), env) });
+      const result = await createAdminSignal(db, adminId, await readJsonBody(request), env, { deferDelivery: Boolean(ctx?.waitUntil) });
+      if (result.deferred && ctx?.waitUntil) {
+        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId));
+      }
+      return json({ ok: true, data: result });
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts[1] === 'rebuild-performance') {
@@ -10961,7 +10997,11 @@ async function handleAdminApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'send') {
-      return json({ ok: true, data: await sendPendingAdminSignal(db, adminId, parts[1], env) });
+      const result = await sendPendingAdminSignal(db, adminId, parts[1], env, { deferDelivery: Boolean(ctx?.waitUntil) });
+      if (result.deferred && ctx?.waitUntil) {
+        ctx.waitUntil(finalizeAdminSignalDelivery(env, result.signalUid, result.autoClosed, adminId));
+      }
+      return json({ ok: true, data: result });
     }
 
     if (request.method === 'POST' && parts[0] === 'signals' && parts[2] === 'cancel') {
@@ -14260,7 +14300,7 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/admin/')) {
-      return handleAdminApi(request, env, url.pathname);
+      return handleAdminApi(request, env, url.pathname, ctx);
     }
 
     if (url.pathname === '/terms' || url.pathname === '/terms/') {
