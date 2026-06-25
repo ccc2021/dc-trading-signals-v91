@@ -49,8 +49,8 @@ const AUTO_TRADE_STATUS = {
   failed: 'failed'
 };
 
-const DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
-const DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME = 'Forex Factory';
+const DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL = 'https://economic-calendar.tradingview.com/events?from={from_iso}&to={to_iso}';
+const DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME = 'TradingView Calendar';
 
 function algoProSmartTvTemplateObject() {
   return {
@@ -413,7 +413,19 @@ async function getConfig(db, key) {
   } catch (e) { return null; }
 }
 
+async function ensureConfigSchema(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS system_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT UNIQUE NOT NULL,
+      value TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+}
+
 async function setConfig(db, key, value) {
+  await ensureConfigSchema(db);
   await db.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_at) VALUES (?, ?, datetime("now"))').bind(key, value).run();
 }
 
@@ -711,9 +723,53 @@ function normalizeEconomicImpact(value) {
   return text || 'medium';
 }
 
+function normalizeTradingViewImportance(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '';
+  if (n >= 1) return 'high';
+  if (n === 0) return 'medium';
+  return 'low';
+}
+
 function economicImpactLabel(impact) {
   const map = { high: '高', medium: '中', low: '低' };
   return map[normalizeEconomicImpact(impact)] || impact || '中';
+}
+
+const ECONOMIC_MARKET_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CAD', 'AUD'];
+const ECONOMIC_MARKET_HIGH_KEYWORDS = [
+  'cpi', 'core cpi', 'pce', 'core pce', 'inflation', 'ppi',
+  'non-farm', 'nonfarm', 'nfp', 'payroll', 'employment change',
+  'unemployment', 'jobless claims', 'initial claims', 'continuing claims',
+  'average hourly earnings', 'jolts',
+  'fomc', 'fed interest rate', 'federal funds', 'fed rate', 'rate decision',
+  'powell', 'fed chair', 'central bank', 'ecb', 'boj', 'boe',
+  'gdp', 'retail sales', 'ism', 'pmi', 'consumer confidence',
+  'consumer sentiment', 'uom', 'durable goods', 'industrial production'
+];
+const ECONOMIC_MARKET_NOISE_KEYWORDS = [
+  'holiday', 'bank holiday', 'bond auction', 'bill auction',
+  'mortgage', 'housing starts', 'building permits', 'wholesale inventories',
+  'natural gas storage', 'crude oil inventories'
+];
+
+function economicEventKeywordText(event) {
+  return [
+    event?.title,
+    event?.notes,
+    event?.source
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function economicEventIsMarketMoving(event) {
+  const impact = normalizeEconomicImpact(event?.impact);
+  const currency = String(event?.currency || event?.country || '').toUpperCase();
+  const text = economicEventKeywordText(event);
+  if (impact === 'low') return false;
+  if (ECONOMIC_MARKET_NOISE_KEYWORDS.some((keyword) => text.includes(keyword))) return false;
+  if (!ECONOMIC_MARKET_CURRENCIES.includes(currency)) return false;
+  if (impact === 'high') return true;
+  return ECONOMIC_MARKET_HIGH_KEYWORDS.some((keyword) => text.includes(keyword));
 }
 
 function normalizeEconomicDateTime(timeValue, dateValue = '') {
@@ -810,11 +866,17 @@ function economicCalendarProxyUrl(sourceUrl) {
 function buildEconomicCalendarUrl(template, dateKey) {
   const from = dateKey;
   const to = dateKey;
+  const start = new Date(`${dateKey}T00:00:00+08:00`);
+  const end = new Date(`${dateKey}T23:59:59.999+08:00`);
+  const fromIso = Number.isNaN(start.getTime()) ? `${dateKey}T00:00:00.000Z` : start.toISOString();
+  const toIso = Number.isNaN(end.getTime()) ? `${dateKey}T23:59:59.999Z` : end.toISOString();
   const original = String(template || '').trim();
   let url = original
     .replace(/\{date\}/g, encodeURIComponent(dateKey))
     .replace(/\{from\}/g, encodeURIComponent(from))
-    .replace(/\{to\}/g, encodeURIComponent(to));
+    .replace(/\{to\}/g, encodeURIComponent(to))
+    .replace(/\{from_iso\}/g, encodeURIComponent(fromIso))
+    .replace(/\{to_iso\}/g, encodeURIComponent(toIso));
   if (!url || /\{/.test(url)) return url;
   const fixedFileFeed = /\.(?:json|xml|csv)(?:$|\?)/i.test(url);
   if (url === original && !fixedFileFeed) {
@@ -839,6 +901,8 @@ function normalizeEconomicFeedItem(item, sourceName, fallbackDate) {
   let country = String(firstTvValue(item.country, item.countryCode, item.region)).trim().toUpperCase();
   if (!currency && /^[A-Z]{3}$/.test(country)) currency = country;
   if (!country && currency) country = currency;
+  const rawImpact = firstTvValue(item.impact, item.importanceLabel, item.priority, item.volatility);
+  const impact = rawImpact ? normalizeEconomicImpact(rawImpact) : normalizeTradingViewImportance(item.importance);
   return {
     event_uid: String(firstTvValue(item.event_uid, item.eventUid, item.id, item.uid)).trim(),
     event_date: eventDate,
@@ -846,7 +910,7 @@ function normalizeEconomicFeedItem(item, sourceName, fallbackDate) {
     country,
     currency,
     title,
-    impact: normalizeEconomicImpact(firstTvValue(item.impact, item.importance, item.priority, item.volatility)),
+    impact: impact || 'medium',
     actual: String(firstTvValue(item.actual, item.actual_value, item.actualValue)).trim(),
     forecast: String(firstTvValue(item.forecast, item.consensus, item.estimate)).trim(),
     previous: String(firstTvValue(item.previous, item.prev, item.prior)).trim(),
@@ -904,7 +968,7 @@ async function ensureEconomicEventsSchema(db) {
 async function getEconomicConfig(db, env = {}) {
   const sourceUrl = String(env.ECONOMIC_CALENDAR_API_URL || env.ECONOMIC_CALENDAR_URL || await getConfig(db, 'economic_calendar_source_url') || DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL).trim();
   const sourceName = String(env.ECONOMIC_CALENDAR_SOURCE || await getConfig(db, 'economic_calendar_source_name') || DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME).trim();
-  const impacts = parseList(await getConfig(db, 'economic_calendar_impacts') || 'high,medium').map(normalizeEconomicImpact).filter(Boolean);
+  const impacts = parseList(await getConfig(db, 'economic_calendar_impacts') || 'high').map(normalizeEconomicImpact).filter(Boolean);
   const currencies = parseList(await getConfig(db, 'economic_calendar_currencies') || 'USD,EUR,GBP,JPY,CAD,AUD,CNY').map((v) => v.toUpperCase());
   const countries = parseList(await getConfig(db, 'economic_calendar_countries') || '').map((v) => v.toUpperCase());
   const targetGroup = String(await getConfig(db, 'economic_calendar_target_group') || 'paid').trim().toLowerCase();
@@ -912,17 +976,19 @@ async function getEconomicConfig(db, env = {}) {
   const preEventMinutes = Number(await getConfig(db, 'economic_calendar_pre_event_minutes') || 30);
   const lookaheadDays = Number(await getConfig(db, 'economic_calendar_lookahead_days') || 1);
   const autoRemind = String(await getConfig(db, 'economic_calendar_auto_remind') || '1') !== '0';
+  const marketOnly = String(await getConfig(db, 'economic_calendar_market_only') || '1') !== '0';
   return {
     sourceUrl,
     sourceName,
-    impacts: impacts.length ? impacts : ['high', 'medium'],
+    impacts: impacts.length ? impacts : ['high'],
     currencies,
     countries,
     targetGroup: ['all', 'pro', 'vip', 'paid'].includes(targetGroup) ? targetGroup : 'paid',
     remindHour: Number.isFinite(remindHour) ? remindHour : 8,
     preEventMinutes: Number.isFinite(preEventMinutes) ? Math.max(0, Math.min(240, preEventMinutes)) : 30,
     lookaheadDays: Number.isFinite(lookaheadDays) ? Math.max(1, Math.min(7, lookaheadDays)) : 1,
-    autoRemind
+    autoRemind,
+    marketOnly
   };
 }
 
@@ -931,7 +997,27 @@ function economicEventMatchesConfig(event, config) {
   if (config.impacts?.length && !config.impacts.includes(impact)) return false;
   if (config.currencies?.length && event.currency && !config.currencies.includes(String(event.currency).toUpperCase())) return false;
   if (config.countries?.length && event.country && !config.countries.includes(String(event.country).toUpperCase())) return false;
+  if (config.marketOnly && !economicEventIsMarketMoving(event)) return false;
   return true;
+}
+
+async function getUpcomingMarketEconomicEvents(db, config, { hours = 48, limit = 30 } = {}) {
+  await ensureEconomicEventsSchema(db);
+  const nowIso = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const untilIso = new Date(Date.now() + Math.max(1, Number(hours || 48)) * 60 * 60 * 1000).toISOString();
+  const rows = await db.prepare(`
+    SELECT *
+    FROM economic_events
+    WHERE COALESCE(status, 'scheduled') != 'cancelled'
+      AND event_time IS NOT NULL
+      AND datetime(event_time) >= datetime(?)
+      AND datetime(event_time) <= datetime(?)
+    ORDER BY datetime(event_time),
+      CASE impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+      title
+    LIMIT ?
+  `).bind(nowIso, untilIso, Math.max(1, Math.min(100, Number(limit || 30)))).all();
+  return (rows.results || []).filter((event) => economicEventMatchesConfig(event, config));
 }
 
 async function economicEventUid(event) {
@@ -1004,8 +1090,12 @@ async function fetchEconomicCalendarEvents(env, config, dateKey) {
   const url = buildEconomicCalendarUrl(config.sourceUrl, dateKey);
   const headers = {
     Accept: 'application/json,text/plain;q=0.9,*/*;q=0.8',
-    'User-Agent': 'DC-Signals-Calendar/9.1'
+    'User-Agent': 'Mozilla/5.0 (compatible; DCSignals/9.1; +https://dc-signals-v91.cc559773.workers.dev)'
   };
+  if (/tradingview\.com/i.test(url)) {
+    headers.Origin = 'https://www.tradingview.com';
+    headers.Referer = 'https://www.tradingview.com/';
+  }
   if (env.ECONOMIC_CALENDAR_API_KEY) {
     headers.Authorization = `Bearer ${env.ECONOMIC_CALENDAR_API_KEY}`;
     headers['X-API-Key'] = env.ECONOMIC_CALENDAR_API_KEY;
@@ -1068,6 +1158,7 @@ async function syncEconomicEventsRange(db, env = {}, startDateKey = taipeiDateKe
       total.errors.push(`${key}: ${e.message}`);
     }
   }
+  await setConfig(db, 'economic_calendar_last_sync', new Date().toISOString());
   return total;
 }
 
@@ -1089,11 +1180,11 @@ async function getEconomicEventsForDate(db, dateKey = taipeiDateKey(), config = 
 function formatEconomicEventsMessage(events, options = {}) {
   const dateKey = options.dateKey || taipeiDateKey();
   const source = options.source || 'Economic Calendar';
-  let msg = `<b>今日重要經濟事件</b>\n`;
-  msg += `${escHtml(dateKey)} · Asia/Taipei\n`;
+  let msg = `<b>今日重要市場事件</b>\n`;
+  msg += `${escHtml(dateKey)} · 台灣時間 UTC+8\n`;
   msg += `來源：${escHtml(source)}\n\n`;
   if (!events.length) {
-    msg += `目前沒有符合條件的高/中重要事件。`;
+    msg += `目前沒有符合條件的重大市場事件。`;
     return msg;
   }
   for (const event of events) {
@@ -1175,8 +1266,8 @@ async function sendEconomicPreEventAlerts(env = {}, options = {}) {
   if (!events.length) return { sent: 0, skipped: true, reason: 'no_upcoming_events', sync };
 
   const msg = [
-    '<b>重要經濟事件即將公布</b>',
-    `${escHtml(dateKey)} · 未來 ${escHtml(windowMinutes)} 分鐘`,
+    '<b>重要市場事件即將公布</b>',
+    `${escHtml(dateKey)} · 台灣時間 UTC+8 · 未來 ${escHtml(windowMinutes)} 分鐘`,
     '',
     ...events.map((event) => {
       const values = [
@@ -2403,7 +2494,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     return sendTg(cid, m, kb);
   }
 
-  if (cmd === '/events' || cmd === '/calendar' || cmd === '/econ') {
+  if (cmd === '/events' || cmd === '/calendar' || cmd === '/econ' || cmd === '/財經') {
     await ensureAdminSchema(db);
     const config = await getEconomicConfig(db, env);
     const dateKey = taipeiDateKey();
@@ -2749,15 +2840,10 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
   // 財經日曆 /calendar
   // ═══════════════════════════════════════════════════════════════════════════
   if (cmd === '/calendar' || cmd === '/events' || cmd === '/econ' || cmd === '/財經') {
-    const settings = await getEconomicSettings(db);
-    // 免費會員只看高影響；付費會員依後台設定的影響等級
-    const impacts = user.tier === 'free' ? ['High'] : settings.impacts;
-    let events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 });
-    if (!events.length) {
-      // 沒有快取資料時即時抓一次
-      try { await syncLegacyEconomicEvents(db, env); events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 }); } catch {}
-    }
-    return sendTg(cid, renderEconomicEventsText(events, '未來 48 小時財經日曆'), {
+    const config = await getEconomicConfig(db, env);
+    if (user.tier === 'free') config.impacts = ['high'];
+    const events = await getUpcomingMarketEconomicEvents(db, config, { hours: 48, limit: 25 });
+    return sendTg(cid, formatEconomicEventsMessage(events, { dateKey: taipeiDateKey(), source: config.sourceName }), {
       inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]]
     });
   }
@@ -4120,7 +4206,7 @@ const ADMIN_CONFIG_KEYS = [
   'economic_calendar_source_url', 'economic_calendar_source_name',
   'economic_calendar_impacts', 'economic_calendar_currencies', 'economic_calendar_countries',
   'economic_calendar_auto_remind', 'economic_calendar_remind_hour', 'economic_calendar_target_group',
-  'economic_calendar_pre_event_minutes', 'economic_calendar_lookahead_days'
+  'economic_calendar_pre_event_minutes', 'economic_calendar_lookahead_days', 'economic_calendar_market_only'
 ];
 const ADMIN_SESSION_COOKIE = 'dc_admin_session';
 const ADMIN_SESSION_MAX_AGE = 60 * 60 * 8;
@@ -4745,6 +4831,7 @@ async function enforceRateLimit(db, key, limit, windowSeconds, message) {
 }
 
 async function ensureAdminSchema(db) {
+  await ensureConfigSchema(db);
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS strategies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5807,7 +5894,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   await ensureAdminSchema(db);
   await ensureOrderPaymentSchema(db);
   await ensureSupportSchema(db);
-  await ensureEconomicSchema(db);
+  await ensureEconomicEventsSchema(db);
   const todayKey = taipeiDateKey();
   const range = adminQueryRange(request);
   const signalWhere = adminDateWhere('created_at', range);
@@ -5928,8 +6015,9 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_pre_event_minutes) config.economic_calendar_pre_event_minutes = '30';
   if (!config.economic_calendar_lookahead_days) config.economic_calendar_lookahead_days = '1';
   if (!config.economic_calendar_target_group) config.economic_calendar_target_group = 'paid';
-  if (!config.economic_calendar_impacts) config.economic_calendar_impacts = 'high,medium';
+  if (!config.economic_calendar_impacts) config.economic_calendar_impacts = 'high';
   if (!config.economic_calendar_currencies) config.economic_calendar_currencies = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
+  if (!config.economic_calendar_market_only) config.economic_calendar_market_only = '1';
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
   const ops = await safe('ops.health', getOperationalHealth(db, config, startedAt, env), () => fallbackOperationalHealth(config, startedAt, env));
   if (bootstrapErrors.length) {
@@ -5946,8 +6034,22 @@ async function getAdminBootstrap(db, env = {}, request = null) {
       ...(ops.issues || [])
     ];
   }
-  const economicSettings = await safe('economic.settings', getEconomicSettings(db), { enabled: true, impacts: ['High'], currencies: ['USD'] });
-  const upcomingEconomicEvents = await safe('economic.upcoming', getUpcomingEconomicEvents(db, { hours: 72, limit: 60 }), []);
+  const economicRuntimeConfig = await safe('economic.config', getEconomicConfig(db, env), {
+    autoRemind: true,
+    impacts: ['high'],
+    currencies: ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CNY'],
+    preEventMinutes: 30,
+    marketOnly: true
+  });
+  const economicSettings = {
+    enabled: !!economicRuntimeConfig.autoRemind,
+    impacts: economicRuntimeConfig.impacts,
+    currencies: economicRuntimeConfig.currencies,
+    leadMinutes: economicRuntimeConfig.preEventMinutes,
+    marketOnly: !!economicRuntimeConfig.marketOnly,
+    lastSync: config.economic_calendar_last_sync || null
+  };
+  const upcomingEconomicEvents = await safe('economic.upcoming', getUpcomingMarketEconomicEvents(db, economicRuntimeConfig, { hours: 72, limit: 60 }), []);
   const economicRows = economicEvents.results || [];
 
   return {
@@ -7776,9 +7878,9 @@ async function getMemberBootstrap(db, userId, env = {}) {
   // 近期重要經濟事件（免費會員看高影響，付費會員依後台關注設定）
   let economicEvents = [];
   try {
-    const econSettings = await getEconomicSettings(db);
-    const econImpacts = (user.tier || 'free') === 'free' ? ['High'] : econSettings.impacts;
-    economicEvents = await getUpcomingEconomicEvents(db, { hours: 48, currencies: econSettings.currencies, impacts: econImpacts, limit: 15 });
+    const econConfig = await getEconomicConfig(db, env);
+    if ((user.tier || 'free') === 'free') econConfig.impacts = ['high'];
+    economicEvents = await getUpcomingMarketEconomicEvents(db, econConfig, { hours: 48, limit: 15 });
   } catch { economicEvents = []; }
 
   return {
@@ -10894,10 +10996,11 @@ async function handleAdminApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'economic' && parts[1] === 'sync') {
-      const result = await syncLegacyEconomicEvents(db, env);
-      await logAction(db, adminId, 'web_economic_sync', '', `fetched ${result.fetched}`);
-      const events = await getUpcomingEconomicEvents(db, { hours: 72, limit: 60 });
-      return json({ ok: true, data: { ...result, events } });
+      const config = await getEconomicConfig(db, env);
+      const result = await syncEconomicEventsRange(db, env, taipeiDateKey(), config.lookaheadDays || 1);
+      await logAction(db, adminId, 'web_economic_sync', '', `synced ${result.synced}/${result.total}`);
+      const events = await getUpcomingMarketEconomicEvents(db, config, { hours: 72, limit: 60 });
+      return json({ ok: true, data: { ...result, fetched: result.total, events } });
     }
 
     if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'sources') {
@@ -11464,7 +11567,6 @@ function renderAdminPage(csrfToken = '') {
         <button data-view="users" data-icon="◎">會員管理</button>
         <button data-view="orders" data-icon="$">訂單管理</button>
         <button data-view="support" data-icon="?">客服工單</button>
-        <button data-view="economic" data-icon="📅">經濟事件</button>
         <button data-view="billing" data-icon="⚙">收費設定</button>
       </nav>
       <div class="admin-foot"><strong>Dan_mix</strong><span>超級管理員</span></div>
@@ -11569,7 +11671,6 @@ function renderAdminPage(csrfToken = '') {
 	    <button data-view-target="users" data-icon="◎">會員</button>
 	    <button data-view-target="orders" data-icon="$">訂單</button>
 	    <button data-view-target="support" data-icon="?">客服</button>
-	    <button data-view-target="economic" data-icon="📅">財經</button>
 	    <button data-view-target="billing" data-icon="⚙">收費</button>
 	  </nav>
   <script>${renderAdminCoreScript()}</script>
@@ -11727,7 +11828,7 @@ function renderEconomicEventsHtml() {
   return `<div class="grid two">
     <section class="panel">
       <header>
-        <div><h2>今日 / 近期事件</h2><p>高、中重要性數據會進入 Telegram 提醒</p></div>
+        <div><h2>今日 / 近期事件</h2><p>只保留會明顯影響市場的事件，時間固定顯示台灣時間</p></div>
         <div class="panel-tools">
           <button class="btn ghost" type="button" id="syncEconomicBtn">同步來源</button>
           <button class="btn primary" type="button" id="sendEconomicBtn">推送提醒</button>
@@ -11786,9 +11887,10 @@ function renderEconomicConfigFormHtml() {
       <div><label>提前提醒分鐘</label><input name="economic_calendar_pre_event_minutes" inputmode="numeric" placeholder="30"></div>
       <div><label>同步天數</label><input name="economic_calendar_lookahead_days" inputmode="numeric" placeholder="1"></div>
       <div><label>推送目標</label><select name="economic_calendar_target_group"><option value="paid">全部付費會員</option><option value="pro">Pro 以上</option><option value="vip">VIP</option><option value="all">全部會員</option></select></div>
-      <div><label>重要性</label><input name="economic_calendar_impacts" placeholder="high,medium"></div>
+      <div><label>重要性</label><input name="economic_calendar_impacts" placeholder="high"></div>
       <div><label>幣別篩選</label><input name="economic_calendar_currencies" placeholder="USD,EUR,GBP,JPY,CAD,AUD,CNY"></div>
       <div><label>國家篩選</label><input name="economic_calendar_countries" placeholder="US,EU,JP，可留空"></div>
+      <div><label>市場事件過濾</label><select name="economic_calendar_market_only"><option value="1">只保留重要市場事件</option><option value="0">依重要性全列</option></select></div>
     </div>
     <button class="btn primary" type="submit">儲存事件設定</button>
   </form>`;
@@ -12610,9 +12712,10 @@ function renderStrategies() {
   if (cards) cards.innerHTML = strategies.map(strategyEditCard).join('') || '<div class="muted">尚無策略</div>';
 }
 function econImpactChip(impact) {
-  if (impact === 'High') return chip('高', 'red');
-  if (impact === 'Medium') return chip('中', 'amber');
-  if (impact === 'Holiday') return chip('休市', '');
+  impact = String(impact || '').toLowerCase();
+  if (impact === 'high') return chip('高', 'red');
+  if (impact === 'medium') return chip('中', 'amber');
+  if (impact === 'holiday') return chip('休市', '');
   return chip('低', 'green');
 }
 function econTaipei(iso) {
@@ -12624,14 +12727,14 @@ function renderEconomic() {
   if (table) {
     var events = state.data.economicEvents || [];
     table.innerHTML = events.map(function (ev) {
-      return '<tr><td>' + esc(econTaipei(ev.event_at)) + '</td><td>' + esc(ev.country || '-') + '</td><td>' + esc(ev.title) + '</td><td>' + econImpactChip(ev.impact) + '</td><td>' + esc(ev.forecast || '-') + '</td><td>' + esc(ev.previous || '-') + '</td><td>' + esc(ev.actual || '-') + '</td></tr>';
+      return '<tr><td>' + esc(econTaipei(ev.event_time || ev.event_at)) + '</td><td>' + esc(ev.currency || ev.country || '-') + '</td><td>' + esc(ev.title) + '</td><td>' + econImpactChip(ev.impact) + '</td><td>' + esc(ev.forecast || '-') + '</td><td>' + esc(ev.previous || '-') + '</td><td>' + esc(ev.actual || '-') + '</td></tr>';
     }).join('') || '<tr><td colspan="7" class="muted">尚無事件，請點「立即同步」</td></tr>';
   }
   var status = document.getElementById('econStatus');
   var settings = state.data.economicSettings || {};
   if (status) {
     var last = settings.lastSync ? econTaipei(settings.lastSync) : '尚未同步';
-    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 提前 ' + (settings.leadMinutes || 60) + ' 分鐘';
+    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 市場事件 ' + (settings.marketOnly ? '啟用' : '關閉') + ' · 提前 ' + (settings.leadMinutes || 30) + ' 分鐘';
   }
   var form = document.getElementById('economicForm');
   if (form) {
@@ -12800,6 +12903,11 @@ function eventTimeText(event) {
   var parsed = parseDbDate(event.event_time);
   return parsed ? parsed.toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false }) : '待定';
 }
+function eventDateTimeText(event) {
+  if (!event || !event.event_time) return (event && event.event_date) || '待定';
+  var parsed = parseDbDate(event.event_time);
+  return parsed ? parsed.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : (event.event_date || '待定');
+}
 function todayKey() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
 }
@@ -12810,7 +12918,7 @@ function eventCard(event, compact) {
     ['實際', event.actual || '-']
   ];
   return '<article class="event-card ' + esc(String(event.impact || 'medium').toLowerCase()) + '">' +
-    '<div class="event-card-head"><div><strong>' + esc(eventTimeText(event) + ' ' + (event.currency || event.country || '-') + '｜' + event.title) + '</strong><span>' + esc(event.event_date || '-') + ' · ' + esc(event.source || 'manual') + '</span></div>' + chip(eventImpactText(event.impact), eventImpactTone(event.impact)) + '</div>' +
+    '<div class="event-card-head"><div><strong>' + esc(eventDateTimeText(event) + ' ' + (event.currency || event.country || '-') + '｜' + event.title) + '</strong><span>台灣時間 UTC+8 · ' + esc(event.source || 'manual') + '</span></div>' + chip(eventImpactText(event.impact), eventImpactTone(event.impact)) + '</div>' +
     '<div class="event-meta">' + values.map(function (item) { return '<div><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>'; }).join('') + '</div>' +
     (compact ? '' : '<div class="muted">' + esc(event.notes || '') + '</div><div class="actions"><button class="btn ghost" type="button" data-edit-event="' + esc(event.event_uid) + '">編輯</button>' + (event.source_url ? '<a class="btn ghost mini" href="' + esc(event.source_url) + '" target="_blank" rel="noopener">來源</a>' : '') + '</div>') +
   '</article>';
@@ -12846,7 +12954,8 @@ function renderEconomicEvents() {
       'economic_calendar_target_group',
       'economic_calendar_impacts',
       'economic_calendar_currencies',
-      'economic_calendar_countries'
+      'economic_calendar_countries',
+      'economic_calendar_market_only'
     ].forEach(function (key) {
       if (form.elements[key]) form.elements[key].value = state.data.config[key] == null ? '' : state.data.config[key];
     });
@@ -12855,8 +12964,9 @@ function renderEconomicEvents() {
     if (!form.elements.economic_calendar_pre_event_minutes.value) form.elements.economic_calendar_pre_event_minutes.value = '30';
     if (!form.elements.economic_calendar_lookahead_days.value) form.elements.economic_calendar_lookahead_days.value = '1';
     if (!form.elements.economic_calendar_target_group.value) form.elements.economic_calendar_target_group.value = 'paid';
-    if (!form.elements.economic_calendar_impacts.value) form.elements.economic_calendar_impacts.value = 'high,medium';
+    if (!form.elements.economic_calendar_impacts.value) form.elements.economic_calendar_impacts.value = 'high';
     if (!form.elements.economic_calendar_currencies.value) form.elements.economic_calendar_currencies.value = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
+    if (form.elements.economic_calendar_market_only && !form.elements.economic_calendar_market_only.value) form.elements.economic_calendar_market_only.value = '1';
   }
 }
 function editEconomicEvent(eventUid) {
@@ -13835,7 +13945,7 @@ document.getElementById('signalForm').addEventListener('change', updateSignalPre
 document.getElementById('configForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); } catch (err) { showError(err, '儲存設定失敗'); } });
 document.getElementById('symbolForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/symbols', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存品種失敗'); } });
 document.getElementById('economicForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); setMessage('經濟事件提醒設定已儲存', 'ok'); } catch (err) { showError(err, '儲存提醒設定失敗'); } });
-document.getElementById('econSyncBtn').addEventListener('click', async function () { var btn = this; btn.disabled = true; setMessage('同步財經日曆中...'); try { var res = await api('/api/admin/economic/sync', { method: 'POST', body: '{}' }); await load(); setMessage('已同步 ' + ((res && res.fetched) || 0) + ' 筆經濟事件', 'ok'); } catch (err) { showError(err, '同步財經日曆失敗'); } finally { btn.disabled = false; } });
+document.getElementById('econSyncBtn').addEventListener('click', async function () { var btn = this; btn.disabled = true; setMessage('同步財經日曆中...'); try { var res = await api('/api/admin/economic/sync', { method: 'POST', body: '{}' }); await load(); setMessage('已同步 ' + ((res && (res.synced || res.fetched)) || 0) + '/' + ((res && res.total) || 0) + ' 筆重要事件', 'ok'); } catch (err) { showError(err, '同步財經日曆失敗'); } finally { btn.disabled = false; } });
 document.getElementById('strategyForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/strategies', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存策略失敗'); } });
 document.getElementById('tvSourceForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/tradingview/sources', { method: 'POST', body: JSON.stringify(formPayload(event.target)) }); event.target.reset(); await load(); } catch (err) { showError(err, '儲存 TradingView 來源失敗'); } });
 document.getElementById('autoTradeForm').addEventListener('submit', async function (event) { event.preventDefault(); try { await api('/api/admin/config', { method: 'PUT', body: JSON.stringify({ config: formPayload(event.target) }) }); await load(); setMessage('自動交易設定已儲存', 'ok'); } catch (err) { showError(err, '儲存自動交易設定失敗'); } });
@@ -14250,7 +14360,10 @@ export default {
     if (url.pathname === '/cron/econ') {
       const auth = requireCronHttp(request, env, url);
       if (auth) return auth;
-      const result = await handleEconomicReminders(env);
+      const result = await handleEconomicEventsCron(env, {
+        force: url.searchParams.get('force') === '1',
+        date: url.searchParams.get('date') || taipeiDateKey()
+      });
       return json({ ok: true, ...result });
     }
 
@@ -14286,11 +14399,6 @@ export default {
     await handleQueuedSignals(env);
     await handleSecurityCleanup(env);
     // 每小時同步財經日曆並在高影響事件前提醒付費會員
-    try {
-      await handleEconomicReminders(env);
-    } catch (e) {
-      // 經濟事件提醒失敗不影響其他排程
-    }
     try {
       await handleEconomicEventsCron(env);
     } catch (e) {
