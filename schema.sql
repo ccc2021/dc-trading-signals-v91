@@ -136,6 +136,7 @@ CREATE TABLE signals (
   tp1 REAL,
   tp2 REAL,
   tp3 REAL,
+  probability REAL,
   
   -- 備註
   note TEXT,

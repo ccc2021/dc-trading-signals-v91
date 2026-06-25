@@ -75,6 +75,7 @@ function algoProSmartTvTemplateObject() {
     short_tp2: '{{plot_15}}',
     long_tp3: '{{plot_16}}',
     short_tp3: '{{plot_17}}',
+    probability: '{{plot("Probability")}}',
     contracts: '{{strategy.order.contracts}}',
     market_position: '{{strategy.market_position}}',
     prev_market_position: '{{strategy.prev_market_position}}',
@@ -141,6 +142,23 @@ const tierEmoji = (t) => CONFIG.TIERS[t]?.emoji || '👤';
 const tierRank = (t) => ({ free: 0, pro: 1, vip: 2 }[String(t || 'free')] || 0);
 const fmtNum = (n) => n?.toLocaleString() || '0';
 const fmtPrice = (n) => n?.toFixed(2) || '0.00';
+function normalizeProbabilityValue(value) {
+  const raw = firstTvValue(value);
+  if (raw === '') return null;
+  const text = String(raw).replace(/,/g, '').trim();
+  const match = text.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  let n = Number(match[0]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n <= 1 && !text.includes('%')) n *= 100;
+  if (n > 100) return null;
+  return Number(n.toFixed(2));
+}
+function fmtProbability(value) {
+  const n = normalizeProbabilityValue(value);
+  if (n === null) return '-';
+  return `${Number.isInteger(n) ? String(n) : n.toFixed(2)}%`;
+}
 const fmtDate = (d) => d ? new Date(d).toLocaleDateString('zh-TW') : '-';
 const fmtDateTime = (d) => d ? new Date(d).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-';
 const fmtTime = () => new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
@@ -477,6 +495,7 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   const tierLine = signal.is_vip_only ? 'VIP 專屬' : (signal.target_group === 'vip' ? 'VIP' : signal.target_group === 'pro' ? 'Pro 以上' : '付費會員');
   const chartUrl = signalMediaUrl(signal);
   const origin = signal.strategy_id || signal.source || 'TradingView';
+  const probability = normalizeProbabilityValue(signal.probability);
 
   let msg = `${actionInfo.emoji || ''} <b>${escHtml(actionInfo.name || action)} ${escHtml(ticker)}</b>\n`;
   msg += `${typeInfo.emoji || ''} ${escHtml(typeInfo.name || signal_type)} · ${escHtml(tierLine)}\n\n`;
@@ -489,6 +508,7 @@ function formatSignalCard(signal, userSettings = null, isVip = false) {
   if (tp3 && isVip) msg += `🎯 TP3　<code>${fmtPrice(tp3)}</code>　VIP\n`;
   const tpText = signalTpHitText(signal);
   if (tpText) msg += `✅ 已達　${escHtml(tpText)}\n`;
+  if (probability !== null) msg += `📌 機率　<code>${fmtProbability(probability)}</code>\n`;
   msg += `\n📊 風險　<code>${fmtPrice(risk)}</code> 點\n`;
   msg += `🎯 報酬　<code>1:${rr}</code>\n`;
 
@@ -4883,6 +4903,7 @@ async function ensureAdminSchema(db) {
   await addColumnIfMissing(db, 'signals', 'tv_alert_uid', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'chart_url', 'TEXT');
   await addColumnIfMissing(db, 'signals', 'snapshot_url', 'TEXT');
+  await addColumnIfMissing(db, 'signals', 'probability', 'REAL');
   // 部分止盈狀態：0=未命中、1=TP1 已命中(保本)、2=TP2 已命中
   await addColumnIfMissing(db, 'signals', 'tp_hit_level', 'INTEGER DEFAULT 0');
   await ensureSignalLifecycleSchema(db);
@@ -4986,6 +5007,7 @@ async function ensureAdminSchema(db) {
         tv_alert_template IS NULL
         OR tv_alert_template LIKE '%_or_%'
         OR tv_alert_template NOT LIKE '%long_stop_loss%'
+        OR (tv_alert_template NOT LIKE '%probability%' AND tv_alert_template LIKE '%plot_10%' AND tv_alert_template LIKE '%plot_17%')
         OR rules_json NOT LIKE '%smart-directional-plot%'
       )
   `).bind(algoProSmartTvTemplateString(), algoProSmartRulesString()).run();
@@ -6156,7 +6178,8 @@ function deliveryLevelSnapshot(payload = {}, action = '') {
     stopLoss: tvStopLoss(payload, resolvedAction),
     tp1: tvTargetPrice(payload, 1, resolvedAction),
     tp2: tvTargetPrice(payload, 2, resolvedAction),
-    tp3: tvTargetPrice(payload, 3, resolvedAction)
+    tp3: tvTargetPrice(payload, 3, resolvedAction),
+    probability: tvProbability(payload, resolvedAction)
   };
 }
 
@@ -6170,6 +6193,7 @@ function rawLevelSnapshot(payload = {}, action = '') {
     tp1: firstTvValue(...tvTargetValues(payload, 1, resolvedAction)),
     tp2: firstTvValue(...tvTargetValues(payload, 2, resolvedAction)),
     tp3: firstTvValue(...tvTargetValues(payload, 3, resolvedAction)),
+    probability: firstTvValue(...tvProbabilityValues(payload, resolvedAction)),
     side
   };
 }
@@ -6355,6 +6379,7 @@ async function buildAdminTestSignal(db, payload = {}) {
   const tp1 = asNumber(payload.tp1);
   const tp2 = asNumber(payload.tp2);
   const tp3 = asNumber(payload.tp3);
+  const probability = normalizeProbabilityValue(payload.probability ?? payload.confidence ?? payload.win_rate ?? payload.winRate);
   if (!ticker) throw new Error('請輸入品種');
   if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
   if (!CONFIG.SIGNAL_TYPES[signalType]) throw new Error('訊號類型不正確');
@@ -6378,6 +6403,7 @@ async function buildAdminTestSignal(db, payload = {}) {
     tp1,
     tp2,
     tp3,
+    probability,
     target_group: targetGroup,
     is_vip_only: targetGroup === 'vip' ? 1 : 0,
     status: 'test',
@@ -6414,6 +6440,7 @@ async function sendAdminSignalTest(db, adminId, payload = {}, env = {}) {
 }
 
 async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
+  await ensureAdminSchema(db);
   const ticker = String(payload.ticker || payload.symbol || payload.instrument || '').trim().toUpperCase();
   const action = String(payload.action || '').toUpperCase();
   const signalType = String(payload.signal_type || payload.signalType || 'scalp').toLowerCase();
@@ -6422,6 +6449,7 @@ async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
   const tp1 = asNumber(payload.tp1);
   const tp2 = asNumber(payload.tp2);
   const tp3 = asNumber(payload.tp3);
+  const probability = normalizeProbabilityValue(payload.probability ?? payload.confidence ?? payload.win_rate ?? payload.winRate);
 
   if (!ticker) throw new Error('請輸入品種');
   if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
@@ -6454,11 +6482,11 @@ async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
-      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      tp1, tp2, tp3, probability, note, chart_url, snapshot_url, target_group, is_vip_only, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     signalUid, ticker, action, signalType, entry, stopLoss,
-    tp1, tp2, tp3, payload.note || null, chartUrl || null, snapshotUrl || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
+    tp1, tp2, tp3, probability, payload.note || null, chartUrl || null, snapshotUrl || null, targetGroup, isVipOnly ? 1 : 0, sendNow ? 'active' : 'pending'
   ).run();
 
   const signal = {
@@ -6471,6 +6499,7 @@ async function createAdminSignal(db, adminId, payload, env = {}, options = {}) {
     tp1,
     tp2,
     tp3,
+    probability,
     note: payload.note || '',
     chart_url: chartUrl,
     snapshot_url: snapshotUrl,
@@ -7995,6 +8024,7 @@ function signalDto(sig, tier = 'free') {
     tp1: sig.tp1,
     tp2: sig.tp2,
     tp3: tier === 'vip' ? sig.tp3 : null,
+    probability: normalizeProbabilityValue(sig.probability),
     status: sig.status,
     result: sig.result,
     tp_hit_level: sig.tp_hit_level || 0,
@@ -9633,6 +9663,13 @@ function statusTone(sig){
   return '';
 }
 function actionText(sig){ return sig.action === 'LONG' ? '⬆️ 做多' : sig.action === 'SHORT' ? '⬇️ 做空' : (sig.action || '-'); }
+function probabilityText(value){
+  var n = Number(value);
+  if(!isFinite(n) || n <= 0) return '-';
+  if(n <= 1) n = n * 100;
+  if(n > 100) return '-';
+  return (Math.round(n * 100) / 100).toString().replace(/\.0+$/,'') + '%';
+}
 function tpHitText(sig){
   var count = Math.max(Number(sig.tp_hit_count || 0), sig.tp3_hit_at ? 3 : sig.tp2_hit_at ? 2 : sig.tp1_hit_at ? 1 : 0);
   var labels = [];
@@ -9658,6 +9695,7 @@ function signalPlainText(sig){
     'TP2 ' + price(sig.tp2)
   ];
   if(sig.tp3 != null) lines.push('TP3 ' + price(sig.tp3));
+  if(sig.probability != null) lines.push('機率 ' + probabilityText(sig.probability));
   if(tpHitText(sig)) lines.push('已達 ' + tpHitText(sig));
   if(sig.exit_price != null) lines.push('結案價 ' + price(sig.exit_price));
   if(sig.strategy_id) lines.push('策略 ' + sig.strategy_id);
@@ -9694,7 +9732,11 @@ function renderSignal(sig){
   ];
   if(sig.tp3 != null) targets.push(['TP3 VIP', sig.tp3]);
   if(sig.exit_price != null) targets.push(['結案價', sig.exit_price]);
-  var levels = targets.map(function(row){ return '<div><span>'+esc(row[0])+'</span><b>'+esc(price(row[1]))+'</b></div>'; }).join('');
+  if(sig.probability != null) targets.push(['機率', sig.probability]);
+  var levels = targets.map(function(row){
+    var text = row[0] === '機率' ? probabilityText(row[1]) : price(row[1]);
+    return '<div><span>'+esc(row[0])+'</span><b>'+esc(text)+'</b></div>';
+  }).join('');
   var actions = '<div class="signal-actions">';
   if(sig.chart_url) actions += '<a class="btn mini primary" target="_blank" rel="noopener" href="'+esc(sig.chart_url)+'">開啟 TV</a>';
   actions += '<a class="btn mini ghost" target="_blank" rel="noopener" href="'+esc(signalCardUrl(sig))+'">訊號卡圖</a>';
@@ -10273,6 +10315,54 @@ function tvExplicitNumber(...values) {
   return tvNumberValue(firstTvValue(...values), null);
 }
 
+function tvProbabilityValues(payload, action = '') {
+  const side = tvActionSide(action);
+  const directional = side === 'long'
+    ? [
+        payload.long_probability, payload.longProbability,
+        payload.long_prob, payload.longProb,
+        payload.long_confidence, payload.longConfidence,
+        payload.buy_probability, payload.buyProbability,
+        payload.buy_prob, payload.buyProb,
+        payload.bull_probability, payload.bullProbability,
+        payload.probability_long, payload.probabilityLong,
+        payload.confidence_long, payload.confidenceLong,
+        payload.levels?.long_probability, payload.levels?.longProbability,
+        payload.levels?.buy_probability, payload.levels?.buyProbability
+      ]
+    : side === 'short'
+      ? [
+          payload.short_probability, payload.shortProbability,
+          payload.short_prob, payload.shortProb,
+          payload.short_confidence, payload.shortConfidence,
+          payload.sell_probability, payload.sellProbability,
+          payload.sell_prob, payload.sellProb,
+          payload.bear_probability, payload.bearProbability,
+          payload.probability_short, payload.probabilityShort,
+          payload.confidence_short, payload.confidenceShort,
+          payload.levels?.short_probability, payload.levels?.shortProbability,
+          payload.levels?.sell_probability, payload.levels?.sellProbability
+        ]
+      : [];
+  return [
+    ...directional,
+    payload.probability, payload.prob,
+    payload.confidence, payload.confidence_score, payload.confidenceScore,
+    payload.score, payload.win_rate, payload.winRate,
+    payload.success_rate, payload.successRate,
+    payload.signal_probability, payload.signalProbability,
+    payload.algo_probability, payload.algoProbability,
+    payload.levels?.probability, payload.levels?.prob,
+    payload.levels?.confidence, payload.levels?.win_rate, payload.levels?.winRate,
+    payload.stats?.probability, payload.stats?.confidence,
+    payload['機率'], payload['勝率'], payload['信心']
+  ];
+}
+
+function tvProbability(payload, action = '') {
+  return normalizeProbabilityValue(firstTvValue(...tvProbabilityValues(payload, action)));
+}
+
 function hasTvPlaceholder(value) {
   if (value == null) return false;
   if (Array.isArray(value)) return value.some(hasTvPlaceholder);
@@ -10333,7 +10423,8 @@ function parseTvLevelsFromText(payload = {}) {
     stop_loss: tvTextNumberAfter(text, ['stop_loss', 'stop loss', 'stoploss', 'stop', 'sl', 'SL', '止損', '停損']),
     tp1: tvTextNumberAfter(text, ['take_profit_1', 'take profit 1', 'takeprofit1', 'target1', 'target 1', 'tp1', 'TP1', 'TP 1', '目標1', '止盈1', '止贏1']),
     tp2: tvTextNumberAfter(text, ['take_profit_2', 'take profit 2', 'takeprofit2', 'target2', 'target 2', 'tp2', 'TP2', 'TP 2', '目標2', '止盈2', '止贏2']),
-    tp3: tvTextNumberAfter(text, ['take_profit_3', 'take profit 3', 'takeprofit3', 'target3', 'target 3', 'tp3', 'TP3', 'TP 3', '目標3', '止盈3', '止贏3'])
+    tp3: tvTextNumberAfter(text, ['take_profit_3', 'take profit 3', 'takeprofit3', 'target3', 'target 3', 'tp3', 'TP3', 'TP 3', '目標3', '止盈3', '止贏3']),
+    probability: normalizeProbabilityValue(tvTextNumberAfter(text, ['probability', 'prob', 'confidence', 'confidence score', 'win rate', 'success rate', 'score', '機率', '勝率', '信心']))
   };
 }
 
@@ -10673,7 +10764,7 @@ async function selectTvStrategy(db, source, payload, ticker, signalType) {
   return scored[0].strategy;
 }
 
-// 依品種推算模式計算止損 / 止盈點位（永遠回傳結果，不會丟錯，確保抓到進場位就能建立訊號）
+// 依品種推算模式計算止損 / 止盈點位；目前只供後台補位預覽與人工備援，正式 TV webhook 仍要求指標回傳實際 SL/TP。
 function deriveSignalLevels({ entry, action, tickSize, explicitStop, explicitTargets, symbol, rules }) {
   const tick = Number(tickSize) || 0.25;
   const signed = action === 'LONG' ? 1 : -1;
@@ -10745,6 +10836,7 @@ async function buildTvSignalDraft(db, source, payload) {
     tvPreferTextLevel(tvTargetPrice(payload, 2, action), textLevels.tp2),
     tvPreferTextLevel(tvTargetPrice(payload, 3, action), textLevels.tp3)
   ];
+  const probability = normalizeProbabilityValue(tvPreferTextLevel(tvProbability(payload, action), textLevels.probability));
   const zeroLevelFields = [];
   if (explicitStop === 0) zeroLevelFields.push('stop_loss');
   explicitTargets.forEach((target, index) => {
@@ -10779,6 +10871,7 @@ async function buildTvSignalDraft(db, source, payload) {
     orderComment ? `Comment: ${orderComment}` : '',
     payload.interval ? `週期: ${payload.interval}` : '',
     payload.time ? `時間: ${payload.time}` : '',
+    probability !== null ? `機率: ${fmtProbability(probability)}` : '',
     chartUrl ? `圖表: ${chartUrl}` : '',
     snapshotUrl ? `截圖: ${snapshotUrl}` : ''
   ].filter(Boolean);
@@ -10793,6 +10886,7 @@ async function buildTvSignalDraft(db, source, payload) {
     tp1: targets[0] !== null ? targets[0] : null,
     tp2: targets[1] !== null ? targets[1] : null,
     tp3: targets[2] !== null ? targets[2] : null,
+    probability,
     note: noteParts.join(' / '),
     chart_url: chartUrl,
     snapshot_url: snapshotUrl,
@@ -10813,12 +10907,12 @@ async function createSignalFromTvDraft(db, draft, alertUid, autoSend, env = {}, 
   await db.prepare(`
     INSERT INTO signals (
       signal_uid, ticker, action, signal_type, entry_price, stop_loss,
-      tp1, tp2, tp3, note, chart_url, snapshot_url, target_group, is_vip_only, status,
+      tp1, tp2, tp3, probability, note, chart_url, snapshot_url, target_group, is_vip_only, status,
       source, strategy_id, tv_alert_uid, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).bind(
     draft.signal_uid, draft.ticker, draft.action, draft.signal_type, draft.entry_price, draft.stop_loss,
-    draft.tp1, draft.tp2, draft.tp3, draft.note, draft.chart_url || null, draft.snapshot_url || null, draft.target_group, draft.is_vip_only,
+    draft.tp1, draft.tp2, draft.tp3, draft.probability, draft.note, draft.chart_url || null, draft.snapshot_url || null, draft.target_group, draft.is_vip_only,
     shouldSend ? 'active' : 'pending', draft.source, draft.strategy_id, alertUid
   ).run();
 
@@ -10928,7 +11022,8 @@ function tvAlertLevelDebug(payload) {
     ['sl', firstTvValue(payload.stop_loss, payload.sl, payload.long_stop_loss, payload.short_stop_loss)],
     ['tp1', firstTvValue(payload.tp1, payload.target1, payload.long_tp1, payload.short_tp1)],
     ['tp2', firstTvValue(payload.tp2, payload.target2, payload.long_tp2, payload.short_tp2)],
-    ['tp3', firstTvValue(payload.tp3, payload.target3, payload.long_tp3, payload.short_tp3)]
+    ['tp3', firstTvValue(payload.tp3, payload.target3, payload.long_tp3, payload.short_tp3)],
+    ['prob', firstTvValue(...tvProbabilityValues(payload, normalizeTvAction(payload) || ''))]
   ];
   return fields
     .map(([label, value]) => `${label}:${value === '' ? '-' : String(value).slice(0, 40)}`)
@@ -11015,10 +11110,60 @@ async function previewTradingViewSignal(db, payload) {
       tp1: draft.tp1,
       tp2: draft.tp2,
       tp3: draft.tp3,
+      probability: draft.probability,
       target_group: draft.target_group,
       strategy_id: draft.strategy_id
     },
     strategy: { id: draft.strategy.strategy_id, name: draft.strategy.name, rules: draft.rules }
+  };
+}
+
+async function previewFallbackSignalLevels(db, payload = {}) {
+  await ensureAdminSchema(db);
+  const ticker = normalizeTvTicker(payload.ticker || payload.symbol || payload.instrument);
+  const action = String(payload.action || '').toUpperCase();
+  const entry = asNumber(payload.entry_price ?? payload.entry ?? payload.price);
+  if (!ticker) throw new Error('請輸入品種');
+  if (!['LONG', 'SHORT'].includes(action)) throw new Error('方向必須是 LONG 或 SHORT');
+  if (entry === null || entry === 0) throw new Error('請輸入有效進場價');
+
+  const symbol = await db.prepare('SELECT * FROM symbols WHERE symbol = ? AND is_active = 1').bind(ticker).first();
+  if (!symbol) throw new Error(`${ticker} 尚未啟用，請先到品種管理新增或啟用`);
+  const requestedStrategy = String(payload.strategy || payload.strategy_id || payload.strategyId || 'algo-pro-v1-4').trim();
+  const strategy = await db.prepare('SELECT * FROM strategies WHERE strategy_id = ? AND is_active = 1').bind(slugify(requestedStrategy, 'algo-pro-v1-4')).first()
+    || await db.prepare('SELECT * FROM strategies WHERE is_active = 1 ORDER BY sort_order, strategy_id LIMIT 1').first();
+  if (!strategy) throw new Error('尚未建立策略');
+
+  const explicitStop = asNumber(payload.stop_loss ?? payload.stop ?? payload.sl, null);
+  const explicitTargets = [
+    asNumber(payload.tp1 ?? payload.target1, null),
+    asNumber(payload.tp2 ?? payload.target2, null),
+    asNumber(payload.tp3 ?? payload.target3, null)
+  ];
+  const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3] });
+  const derived = deriveSignalLevels({
+    entry,
+    action,
+    tickSize: symbol.tick_size,
+    explicitStop,
+    explicitTargets,
+    symbol,
+    rules
+  });
+  return {
+    ticker,
+    action,
+    entry,
+    stop_loss: derived.stopLoss,
+    tp1: derived.targets[0] ?? null,
+    tp2: derived.targets[1] ?? null,
+    tp3: derived.targets[2] ?? null,
+    riskPoints: derived.riskPoints,
+    mode: derived.mode,
+    basis: derived.basis,
+    strategy: { id: strategy.strategy_id, name: strategy.name },
+    liveStrict: true,
+    warning: '此為後台補位預覽，只用來驗證 Claude fallback 計算；正式 TradingView webhook 仍必須由 AlgoPro 指標回傳 SL/TP，缺值或 0 不會推送會員。'
   };
 }
 
@@ -11388,6 +11533,10 @@ async function handleAdminApi(request, env, pathname, ctx = null) {
 
     if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'preview') {
       return json({ ok: true, data: await previewTradingViewSignal(db, await readJsonBody(request)) });
+    }
+
+    if (request.method === 'POST' && parts[0] === 'tradingview' && parts[1] === 'fallback-preview') {
+      return json({ ok: true, data: await previewFallbackSignalLevels(db, await readJsonBody(request)) });
     }
 
     if (request.method === 'POST' && parts[0] === 'users' && parts[1]) {
@@ -12079,6 +12228,7 @@ function renderSignalFormHtml() {
       <div><label>TP1</label><input name="tp1" inputmode="decimal" required></div>
       <div><label>TP2</label><input name="tp2" inputmode="decimal"></div>
       <div><label>TP3</label><input name="tp3" inputmode="decimal"></div>
+      <div><label>機率 %（選填）</label><input name="probability" inputmode="decimal" placeholder="例如 68"></div>
       <div><label>發送模式</label><select name="send"><option value="true">立即發送</option><option value="false">只存草稿</option></select></div>
       <div class="full"><label>TradingView 圖表 URL</label><input name="chart_url" inputmode="url" placeholder="https://www.tradingview.com/chart/..."></div>
       <div class="full"><label>Telegram 截圖 / 快照 URL</label><input name="snapshot_url" inputmode="url" placeholder="https://... 可公開讀取的圖片 URL"></div>
@@ -12223,7 +12373,7 @@ function renderTradingViewGeneratorHtml() {
     </div>
     <div class="preview" id="tvReadiness"></div>
     <div class="muted">要讓進場、止損、TP 完全等於圖上指標，Alert Message 必須帶入指標實際 plot。後端現在採嚴格模式：entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會自動推算假點位；TP2/TP3 有傳才顯示。</div>
-    <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvSmartConfigBtn">全部品種智慧設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button></div>
+    <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvSmartConfigBtn">全部品種智慧設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button><button class="btn ghost" type="button" id="tvFallbackPreviewBtn">測試補 SL/TP</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
 }
@@ -12431,6 +12581,13 @@ function dateText(value) {
 function priceText(value) {
   var n = Number(value);
   return isFinite(n) ? n.toFixed(2) : '-';
+}
+function probabilityText(value) {
+  var n = Number(value);
+  if (!isFinite(n) || n <= 0) return '-';
+  if (n <= 1) n = n * 100;
+  if (n > 100) return '-';
+  return (Math.round(n * 100) / 100).toString().replace(/\.0+$/, '') + '%';
 }
 function paymentMethodText(method) {
   method = String(method || 'manual').toLowerCase();
@@ -12825,7 +12982,7 @@ function signalTargetHtml(sig) {
     .filter(function (row, index) { return index < 2 || row[1] !== null && row[1] !== undefined && row[1] !== ''; });
   return '<div class="target-stack">' + rows.map(function (row) {
     return '<span>' + esc(row[0]) + ' ' + esc(priceText(row[1])) + '</span>';
-  }).join('') + (tpHitText(sig) ? '<span>' + esc('已達 ' + tpHitText(sig)) + '</span>' : '') + '</div>';
+  }).join('') + (sig.probability != null ? '<span>' + esc('機率 ' + probabilityText(sig.probability)) + '</span>' : '') + (tpHitText(sig) ? '<span>' + esc('已達 ' + tpHitText(sig)) + '</span>' : '') + '</div>';
 }
 function signalActionButtons(sig) {
   if (sig.status === 'active') return '<button class="btn warn" data-close="' + esc(sig.signal_uid) + '">結案</button>';
@@ -12851,6 +13008,7 @@ function signalCard(sig) {
       '<div><span>止損</span><strong>' + esc(priceText(sig.stop_loss)) + '</strong></div>' +
       '<div><span>TP1</span><strong>' + esc(priceText(sig.tp1)) + '</strong></div>' +
       '<div><span>TP2 / TP3</span><strong>' + esc(priceText(sig.tp2)) + ' / ' + esc(priceText(sig.tp3)) + '</strong></div>' +
+      '<div><span>機率</span><strong>' + esc(probabilityText(sig.probability)) + '</strong></div>' +
       '<div><span>TP 已達</span><strong>' + esc(tpHitText(sig) || '-') + '</strong></div>' +
       '<div><span>發送</span><strong>' + esc(sig.sent_count || 0) + ' 人</strong></div>' +
       '<div><span>單號</span><strong>' + esc(String(sig.signal_uid || '').slice(0, 8)) + '</strong></div>' +
@@ -13451,9 +13609,11 @@ function deliveryLevelText(levels) {
     ['SL', levels.stopLoss],
     ['TP1', levels.tp1],
     ['TP2', levels.tp2],
-    ['TP3', levels.tp3]
+    ['TP3', levels.tp3],
+    ['Prob', levels.probability]
   ].map(function (item) {
-    return '<code>' + esc(item[0] + ':' + (item[1] === null || item[1] === undefined || item[1] === '' ? '-' : priceText(item[1]))) + '</code>';
+    var value = item[0] === 'Prob' ? probabilityText(item[1]) : priceText(item[1]);
+    return '<code>' + esc(item[0] + ':' + (item[1] === null || item[1] === undefined || item[1] === '' ? '-' : value)) + '</code>';
   }).join('');
 }
 function deliveryItemCard(item) {
@@ -13638,7 +13798,8 @@ function tvGeneratorLevels(strategy, action) {
         short_tp2: '{{plot_15}}',
         long_tp3: '{{plot_16}}',
         short_tp3: '{{plot_17}}',
-        note: 'AlgoPro Smart: 同一份 Alert 同時送 long/short SL/TP，後端依 buy/sell 自動選正確欄位。'
+        probability: '{{plot("Probability")}}',
+        note: 'AlgoPro Smart: 同一份 Alert 同時送 long/short SL/TP，後端依 buy/sell 自動選正確欄位；Probability 為候選欄位，請以 Data Window 實際名稱確認。'
       };
     }
     if (side === 'buy' || side === 'long') {
@@ -13647,6 +13808,7 @@ function tvGeneratorLevels(strategy, action) {
         tp1: '{{plot_12}}',
         tp2: '{{plot_14}}',
         tp3: '{{plot_16}}',
+        probability: '{{plot("Probability")}}',
         note: 'AlgoPro Data Window: Long SL=plot_10, Long TP1/2/3=plot_12/14/16'
       };
     }
@@ -13656,6 +13818,7 @@ function tvGeneratorLevels(strategy, action) {
         tp1: '{{plot_13}}',
         tp2: '{{plot_15}}',
         tp3: '{{plot_17}}',
+        probability: '{{plot("Probability")}}',
         note: 'AlgoPro Data Window: Short SL=plot_11, Short TP1/2/3=plot_13/15/17'
       };
     }
@@ -13674,6 +13837,7 @@ function tvGeneratorLevels(strategy, action) {
     tp1: '{{plot("TP1")}}',
     tp2: '{{plot("TP2")}}',
     tp3: '{{plot("TP3")}}',
+    probability: '{{plot("Probability")}}',
     note: '請確認 Data Window 內存在 SL/TP1/TP2/TP3；若不存在請改用 plot_序號。'
   };
 }
@@ -13853,6 +14017,7 @@ function buildTradingViewPreviewPayload() {
     tp1: price + dir * risk,
     tp2: price + dir * risk * 2,
     tp3: price + dir * risk * 3,
+    probability: 68,
     interval: document.getElementById('tvGenInterval').value,
     alert_id: 'admin-preview-' + ticker + '-' + Date.now()
   };
@@ -13879,7 +14044,7 @@ function parseObject(value, fallback) { try { var parsed = typeof value === 'str
 function formPayload(form) {
   var data = {};
   Array.prototype.slice.call(new FormData(form).entries()).forEach(function (pair) { data[pair[0]] = pair[1]; });
-  ['entry_price','stop_loss','tp1','tp2','tp3','tick_size','tick_value','sort_order','default_stop_points','default_tp_spacing'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
+  ['entry_price','stop_loss','tp1','tp2','tp3','probability','tick_size','tick_value','sort_order','default_stop_points','default_tp_spacing'].forEach(function (key) { if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]); });
   ['send','is_active','auto_send'].forEach(function (key) { if (data[key] !== undefined) data[key] = data[key] === 'true'; });
   return data;
 }
@@ -13959,12 +14124,12 @@ function currentSignalDraft() {
   var data = formPayload(form);
   var select = document.getElementById('signalTicker');
   if (!data.ticker && select && select.value) data.ticker = select.value;
-  ['entry_price','stop_loss','tp1','tp2','tp3','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
+  ['entry_price','stop_loss','tp1','tp2','tp3','probability','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
     if ((data[key] === undefined || data[key] === '') && form.elements[key]) {
       data[key] = form.elements[key].value;
     }
   });
-  ['entry_price','stop_loss','tp1','tp2','tp3'].forEach(function (key) {
+  ['entry_price','stop_loss','tp1','tp2','tp3','probability'].forEach(function (key) {
     if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]);
   });
   if (data.send !== undefined && data.send !== '') data.send = data.send === true || data.send === 'true';
@@ -13983,6 +14148,7 @@ function signalDraftError(data) {
   var targets = [data.tp1, data.tp2, data.tp3].filter(function (value) { return value !== undefined && value !== ''; }).map(Number);
   if (data.action === 'LONG' && targets.some(function (value) { return value <= Number(data.entry_price); })) return '做多時 TP 應高於進場';
   if (data.action === 'SHORT' && targets.some(function (value) { return value >= Number(data.entry_price); })) return '做空時 TP 應低於進場';
+  if (data.probability !== undefined && data.probability !== '' && probabilityText(data.probability) === '-') return '機率需介於 0 到 100';
   return '';
 }
 function updateSignalPreview() {
@@ -14011,18 +14177,19 @@ function updateSignalPreview() {
     '<b>' + esc(data.action + ' ' + data.ticker) + '</b>' +
     '<div>進場 ' + esc(priceText(data.entry_price)) + ' / 止損 ' + esc(priceText(data.stop_loss)) + '</div>' +
     '<div>TP ' + [data.tp1, data.tp2, data.tp3].filter(function (v) { return v !== undefined && v !== ''; }).map(priceText).join(' / ') + '</div>' +
+    (data.probability !== undefined && data.probability !== '' ? '<div>機率 ' + esc(probabilityText(data.probability)) + '</div>' : '') +
     '<div class="muted">風險 ' + esc(priceText(risk)) + ' 點 · RR 1:' + esc(rr) + '</div>';
 }
 function signalPayload(form) {
   var data = formPayload(form);
   var select = document.getElementById('signalTicker');
   if (!data.ticker && select && select.value) data.ticker = select.value;
-  ['entry_price','stop_loss','tp1','tp2','tp3','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
+  ['entry_price','stop_loss','tp1','tp2','tp3','probability','signal_type','target_group','send','chart_url','snapshot_url','note'].forEach(function (key) {
     if ((data[key] === undefined || data[key] === '') && form.elements[key]) {
       data[key] = form.elements[key].value;
     }
   });
-  ['entry_price','stop_loss','tp1','tp2','tp3'].forEach(function (key) {
+  ['entry_price','stop_loss','tp1','tp2','tp3','probability'].forEach(function (key) {
     if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]);
   });
   if (data.send !== undefined && data.send !== '') data.send = data.send === true || data.send === 'true';
@@ -14572,9 +14739,27 @@ document.getElementById('tvPreviewBtn').addEventListener('click', async function
     document.getElementById('tvPreview').innerHTML =
       '<div>' + chip(result.strategy.name, s.target_group === 'vip' ? 'amber' : 'green') + ' ' + chip(s.signal_type, '') + '</div>' +
       '<b>' + esc(s.action + ' ' + s.ticker) + '</b>' +
-      '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>';
+      '<div>Entry ' + esc(s.entry_price) + ' / SL ' + esc(s.stop_loss) + ' / TP ' + esc([s.tp1, s.tp2, s.tp3].filter(Boolean).join(' / ')) + '</div>' +
+      (s.probability != null ? '<div>Prob ' + esc(probabilityText(s.probability)) + '</div>' : '');
   } catch (err) {
     showError(err, '預覽 TradingView 訊號失敗');
+  }
+});
+document.getElementById('tvFallbackPreviewBtn').addEventListener('click', async function () {
+  try {
+    var base = buildTradingViewPreviewPayload();
+    delete base.stop_loss;
+    delete base.tp1;
+    delete base.tp2;
+    delete base.tp3;
+    var result = await api('/api/admin/tradingview/fallback-preview', { method: 'POST', body: JSON.stringify(base) });
+    document.getElementById('tvPreview').innerHTML =
+      '<div>' + chip('補位測試', 'amber') + ' ' + chip(result.basis || '-', result.basis === 'indicator' ? 'green' : 'amber') + ' ' + chip(result.mode || '-', '') + '</div>' +
+      '<b>' + esc(result.action + ' ' + result.ticker) + '</b>' +
+      '<div>Entry ' + esc(priceText(result.entry)) + ' / SL ' + esc(priceText(result.stop_loss)) + ' / TP ' + esc([result.tp1, result.tp2, result.tp3].filter(function (v) { return v != null; }).map(priceText).join(' / ')) + '</div>' +
+      '<div class="muted">' + esc(result.warning || '') + '</div>';
+  } catch (err) {
+    showError(err, '補 SL/TP 測試失敗');
   }
 });
 load().catch(function (err) { setMessage(err.message, 'error'); });
