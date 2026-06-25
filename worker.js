@@ -51,6 +51,17 @@ const AUTO_TRADE_STATUS = {
 
 const DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL = 'https://economic-calendar.tradingview.com/events?from={from_iso}&to={to_iso}';
 const DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME = 'TradingView Calendar';
+const DEFAULT_SIGNAL_PROXY_RULES = JSON.stringify([
+  {
+    enabled: true,
+    source: 'USTEC',
+    target: 'NQ',
+    mode: 'weekly_offset',
+    beta: 1,
+    target_group: 'pro',
+    label: 'USTEC weekly offset'
+  }
+]);
 
 function algoProSmartTvTemplateObject() {
   const rawPlots = {};
@@ -2150,6 +2161,241 @@ async function broadcastSignal(db, signal, env = {}) {
   }
 
   return { sent, queued, skipped, failed, total: recipients.length };
+}
+
+function fmtSignedPoints(value) {
+  const n = Number(value || 0);
+  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
+  return `${sign}${fmtPrice(Math.abs(n))}`;
+}
+
+function normalizeProxyRules(value) {
+  const parsed = parseObject(value, []);
+  const list = Array.isArray(parsed) ? parsed : [];
+  return list.map((rule) => ({
+    enabled: rule?.enabled !== false && String(rule?.enabled ?? '1') !== '0',
+    source: normalizeTvTicker(rule?.source || rule?.source_ticker || rule?.from),
+    target: normalizeTvTicker(rule?.target || rule?.target_ticker || rule?.to),
+    mode: String(rule?.mode || 'weekly_offset').trim().toLowerCase(),
+    beta: Number(rule?.beta || rule?.multiplier || 1) || 1,
+    target_group: String(rule?.target_group || rule?.targetGroup || 'pro').trim().toLowerCase(),
+    label: String(rule?.label || rule?.name || 'proxy').trim()
+  })).filter((rule) => rule.enabled && rule.source && rule.target && rule.source !== rule.target);
+}
+
+async function getSignalProxyRules(db, env = {}) {
+  const raw = env.SIGNAL_PROXY_RULES || await getConfig(db, 'signal_proxy_rules') || DEFAULT_SIGNAL_PROXY_RULES;
+  return normalizeProxyRules(raw);
+}
+
+async function latestSignalProxyCalibration(db, rule) {
+  return db.prepare(`
+    SELECT * FROM signal_proxy_calibrations
+    WHERE source_symbol = ? AND target_symbol = ? AND mode = ? AND status = 'active'
+      AND (valid_until IS NULL OR valid_until > datetime('now'))
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+  `).bind(rule.source, rule.target, rule.mode || 'weekly_offset').first();
+}
+
+function normalizeProxyCalibrationTime(value) {
+  const text = String(firstTvValue(value) || '').trim();
+  if (!text) return '';
+  const numeric = Number(text);
+  if (Number.isFinite(numeric) && numeric > 1000000000) {
+    const ms = numeric > 9999999999 ? numeric : numeric * 1000;
+    return new Date(ms).toISOString();
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? text : parsed.toISOString();
+}
+
+function isProxyCalibrationPayload(payload = {}) {
+  const event = String(firstTvValue(payload.event, payload.event_type, payload.type, payload.kind)).trim().toLowerCase();
+  if (['proxy_calibration', 'proxy-calibration', 'calibration', 'weekly_offset_calibration'].includes(event)) return true;
+  const role = String(firstTvValue(payload.role, payload.calibration_role, payload.anchor_role)).trim().toLowerCase();
+  const hasPair = Boolean(firstTvValue(payload.source, payload.source_symbol, payload.from) || firstTvValue(payload.target, payload.target_symbol, payload.to));
+  return ['source', 'target', 'from', 'to'].includes(role) && hasPair;
+}
+
+async function proxyRuleForPair(db, env, sourceSymbol, targetSymbol, mode = 'weekly_offset') {
+  const rules = await getSignalProxyRules(db, env);
+  return rules.find((rule) => (
+    rule.source === sourceSymbol && rule.target === targetSymbol && (rule.mode || 'weekly_offset') === mode
+  )) || null;
+}
+
+async function handleProxyCalibrationPayload(db, payload = {}, source = {}, env = {}) {
+  const roleRaw = String(firstTvValue(payload.role, payload.calibration_role, payload.anchor_role)).trim().toLowerCase();
+  const role = ['target', 'to'].includes(roleRaw) ? 'target' : 'source';
+  const sourceSymbol = normalizeTvTicker(firstTvValue(
+    payload.source, payload.source_symbol, payload.sourceSymbol, payload.from, role === 'source' ? payload.ticker : ''
+  ) || 'USTEC');
+  const targetSymbol = normalizeTvTicker(firstTvValue(
+    payload.target, payload.target_symbol, payload.targetSymbol, payload.to, role === 'target' ? payload.ticker : ''
+  ) || 'NQ');
+  const mode = String(firstTvValue(payload.mode, payload.calibration_mode) || 'weekly_offset').trim().toLowerCase();
+  if (!sourceSymbol || !targetSymbol || sourceSymbol === targetSymbol) throw new Error('Proxy calibration 缺少有效 source/target');
+
+  const rule = await proxyRuleForPair(db, env, sourceSymbol, targetSymbol, mode);
+  const beta = Number(firstTvValue(payload.beta, payload.multiplier) || rule?.beta || 1) || 1;
+  const sourcePrice = tvExplicitNumber(payload.source_price, payload.sourcePrice, payload.source_close, payload.sourceClose, role === 'source' ? payload.price : '', role === 'source' ? payload.close : '');
+  const targetPrice = tvExplicitNumber(payload.target_price, payload.targetPrice, payload.target_close, payload.targetClose, role === 'target' ? payload.price : '', role === 'target' ? payload.close : '');
+  const capturedSourceAt = normalizeProxyCalibrationTime(firstTvValue(payload.source_time, payload.sourceTime, role === 'source' ? payload.time : ''));
+  const capturedTargetAt = normalizeProxyCalibrationTime(firstTvValue(payload.target_time, payload.targetTime, role === 'target' ? payload.time : ''));
+  const note = String(firstTvValue(payload.note, payload.memo) || '').trim();
+
+  if (sourcePrice !== null && targetPrice !== null) {
+    const offset = Number((targetPrice - sourcePrice).toFixed(4));
+    await db.prepare(`
+      INSERT INTO signal_proxy_calibrations (
+        source_symbol, target_symbol, mode, source_price, target_price, beta, offset,
+        status, captured_source_at, captured_target_at, valid_from, valid_until, note,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, datetime('now'), datetime('now', '+8 days'), ?, datetime('now'), datetime('now'))
+    `).bind(sourceSymbol, targetSymbol, mode, sourcePrice, targetPrice, beta, offset, capturedSourceAt || null, capturedTargetAt || null, note || null).run();
+    const inserted = await latestSignalProxyCalibration(db, { source: sourceSymbol, target: targetSymbol, mode });
+    await logAction(db, 'signal:proxy', 'proxy_calibration_active', `${sourceSymbol}->${targetSymbol}`, `${fmtSignedPoints(offset)} (${sourcePrice} -> ${targetPrice})`);
+    return { status: 'calibration_active', calibration: inserted, rule: rule || null };
+  }
+
+  if (role === 'source') {
+    if (sourcePrice === null) throw new Error('Proxy calibration source 缺少 USTEC 價格');
+    await db.prepare(`
+      INSERT INTO signal_proxy_calibrations (
+        source_symbol, target_symbol, mode, source_price, beta, status,
+        captured_source_at, valid_from, valid_until, note, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?, datetime('now'), datetime('now', '+2 days'), ?, datetime('now'), datetime('now'))
+    `).bind(sourceSymbol, targetSymbol, mode, sourcePrice, beta, capturedSourceAt || null, note || null).run();
+    const inserted = await db.prepare(`
+      SELECT * FROM signal_proxy_calibrations
+      WHERE source_symbol = ? AND target_symbol = ? AND mode = ? AND status = 'pending'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `).bind(sourceSymbol, targetSymbol, mode).first();
+    await logAction(db, 'signal:proxy', 'proxy_calibration_source', `${sourceSymbol}->${targetSymbol}`, `${fmtPrice(sourcePrice)} pending ${targetSymbol}`);
+    return { status: 'calibration_source_pending', calibration: inserted, next: `10 分鐘後送 ${targetSymbol} target calibration` };
+  }
+
+  if (targetPrice === null) throw new Error('Proxy calibration target 缺少 NQ 價格');
+  const pending = await db.prepare(`
+    SELECT * FROM signal_proxy_calibrations
+    WHERE source_symbol = ? AND target_symbol = ? AND mode = ? AND status = 'pending' AND source_price IS NOT NULL
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+  `).bind(sourceSymbol, targetSymbol, mode).first();
+  if (!pending) {
+    await logAction(db, 'signal:proxy', 'proxy_calibration_target_missing_source', `${sourceSymbol}->${targetSymbol}`, fmtPrice(targetPrice));
+    return { status: 'calibration_missing_source', targetPrice, message: '尚未找到本週 USTEC source anchor，未啟用 NQ 週差額' };
+  }
+  const offset = Number((targetPrice - Number(pending.source_price)).toFixed(4));
+  await db.prepare(`
+    UPDATE signal_proxy_calibrations
+    SET target_price = ?, beta = ?, offset = ?, status = 'active',
+        captured_target_at = ?, valid_from = datetime('now'), valid_until = datetime('now', '+8 days'),
+        note = COALESCE(NULLIF(?, ''), note), updated_at = datetime('now')
+    WHERE id = ?
+  `).bind(targetPrice, beta, offset, capturedTargetAt || null, note, pending.id).run();
+  const updated = await db.prepare('SELECT * FROM signal_proxy_calibrations WHERE id = ?').bind(pending.id).first();
+  await logAction(db, 'signal:proxy', 'proxy_calibration_target', `${sourceSymbol}->${targetSymbol}`, `${fmtSignedPoints(offset)} (${pending.source_price} -> ${targetPrice})`);
+  return { status: 'calibration_active', calibration: updated, rule: rule || null };
+}
+
+function proxyConvertedLevel(sourceLevel, calibration, rule) {
+  if (sourceLevel === null || sourceLevel === undefined) return null;
+  const beta = Number(rule.beta || calibration.beta || 1) || 1;
+  const sourceAnchor = Number(calibration.source_price);
+  const targetAnchor = Number(calibration.target_price);
+  const converted = targetAnchor + (Number(sourceLevel) - sourceAnchor) * beta;
+  return Number(converted.toFixed(2));
+}
+
+function buildWeeklyOffsetProxyDraft(sourceSignal, rule, calibration) {
+  const converted = (value) => proxyConvertedLevel(value, calibration, rule);
+  const sourceTime = calibration.captured_source_at || calibration.valid_from || calibration.created_at || '';
+  const targetTime = calibration.captured_target_at || calibration.updated_at || '';
+  const noteParts = [
+    `${rule.label || 'Proxy'}: ${sourceSignal.ticker}->${rule.target}`,
+    `週校正差額 ${fmtSignedPoints(calibration.offset)} 點`,
+    `Source ${fmtPrice(calibration.source_price)} @ ${sourceTime}`,
+    `Delayed ${rule.target} ${fmtPrice(calibration.target_price)} @ ${targetTime}`,
+    `beta ${fmtPrice(rule.beta || calibration.beta || 1)}`,
+    `原始訊號 ${sourceSignal.signal_uid}`
+  ];
+  return {
+    ...sourceSignal,
+    signal_uid: genUID(),
+    ticker: rule.target,
+    entry_price: converted(sourceSignal.entry_price),
+    stop_loss: converted(sourceSignal.stop_loss),
+    tp1: converted(sourceSignal.tp1),
+    tp2: converted(sourceSignal.tp2),
+    tp3: converted(sourceSignal.tp3),
+    note: `${sourceSignal.note || ''}${sourceSignal.note ? ' / ' : ''}${noteParts.join(' / ')}`,
+    chart_url: '',
+    snapshot_url: '',
+    target_group: rule.target_group || sourceSignal.target_group || 'pro',
+    is_vip_only: rule.target_group === 'vip' ? 1 : 0,
+    source: `proxy:${sourceSignal.source || 'tv'}`,
+    strategy_id: sourceSignal.strategy_id || 'proxy-weekly-offset',
+    strategy: sourceSignal.strategy,
+    rules: sourceSignal.rules
+  };
+}
+
+async function createProxySignalsForDraft(db, sourceDraft, alertUid, autoSend, env = {}, options = {}) {
+  const rules = (await getSignalProxyRules(db, env)).filter((rule) => (
+    rule.mode === 'weekly_offset' && rule.source === normalizeTvTicker(sourceDraft.ticker)
+  ));
+  const results = [];
+  for (const rule of rules) {
+    const calibration = await latestSignalProxyCalibration(db, rule);
+    if (!calibration) {
+      await logAction(db, 'signal:proxy', 'proxy_signal_skipped', `${sourceDraft.signal_uid}:${rule.target}`, 'missing weekly calibration');
+      results.push({ target: rule.target, status: 'skipped', reason: 'missing_weekly_calibration' });
+      continue;
+    }
+    const proxyDraft = buildWeeklyOffsetProxyDraft(sourceDraft, rule, calibration);
+    const proxyAlertUid = `${alertUid}:proxy:${rule.target}`;
+    const result = await createSignalFromTvDraft(db, proxyDraft, proxyAlertUid, autoSend, env, options);
+    results.push({ target: rule.target, calibrationId: calibration.id, ...result });
+  }
+  return results;
+}
+
+async function previewProxySignalsForDraft(db, sourceDraft, env = {}) {
+  const rules = (await getSignalProxyRules(db, env)).filter((rule) => (
+    rule.mode === 'weekly_offset' && rule.source === normalizeTvTicker(sourceDraft.ticker)
+  ));
+  const results = [];
+  for (const rule of rules) {
+    const calibration = await latestSignalProxyCalibration(db, rule);
+    if (!calibration) {
+      results.push({ target: rule.target, status: 'skipped', reason: 'missing_weekly_calibration' });
+      continue;
+    }
+    const proxyDraft = buildWeeklyOffsetProxyDraft(sourceDraft, rule, calibration);
+    results.push({
+      target: rule.target,
+      status: 'preview',
+      calibrationId: calibration.id,
+      offset: calibration.offset,
+      signal: {
+        ticker: proxyDraft.ticker,
+        action: proxyDraft.action,
+        signal_type: proxyDraft.signal_type,
+        entry_price: proxyDraft.entry_price,
+        stop_loss: proxyDraft.stop_loss,
+        tp1: proxyDraft.tp1,
+        tp2: proxyDraft.tp2,
+        tp3: proxyDraft.tp3,
+        probability: proxyDraft.probability,
+        target_group: proxyDraft.target_group,
+        strategy_id: proxyDraft.strategy_id
+      }
+    });
+  }
+  return results;
 }
 
 async function broadcastExit(db, type, ticker, price, pnl, note, signalUid) {
@@ -4276,6 +4522,7 @@ const ADMIN_CONFIG_KEYS = [
   'auto_trade_enabled', 'auto_trade_mode', 'auto_trade_bridge_url', 'auto_trade_bridge_secret',
   'auto_trade_account', 'auto_trade_default_volume', 'auto_trade_risk_percent',
   'auto_trade_max_orders_per_day', 'auto_trade_allowed_symbols', 'auto_trade_allowed_strategies',
+  'signal_proxy_rules',
   'economic_calendar_source_url', 'economic_calendar_source_name',
   'economic_calendar_impacts', 'economic_calendar_currencies', 'economic_calendar_countries',
   'economic_calendar_auto_remind', 'economic_calendar_remind_hour', 'economic_calendar_target_group',
@@ -4930,6 +5177,27 @@ async function ensureAdminSchema(db) {
     )
   `).run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_queued_signals_due ON queued_signals(sent, scheduled_at)').run();
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_proxy_calibrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_symbol TEXT NOT NULL,
+      target_symbol TEXT NOT NULL,
+      mode TEXT DEFAULT 'weekly_offset',
+      source_price REAL,
+      target_price REAL,
+      beta REAL DEFAULT 1,
+      offset REAL,
+      status TEXT DEFAULT 'pending',
+      captured_source_at TEXT,
+      captured_target_at TEXT,
+      valid_from TEXT,
+      valid_until TEXT,
+      note TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_proxy_cal_pair ON signal_proxy_calibrations(source_symbol, target_symbol, status, created_at)').run();
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS strategies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6121,6 +6389,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_impacts) config.economic_calendar_impacts = 'high';
   if (!config.economic_calendar_currencies) config.economic_calendar_currencies = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
   if (!config.economic_calendar_market_only) config.economic_calendar_market_only = '1';
+  if (!config.signal_proxy_rules) config.signal_proxy_rules = DEFAULT_SIGNAL_PROXY_RULES;
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
   const ops = await safe('ops.health', getOperationalHealth(db, config, startedAt, env), () => fallbackOperationalHealth(config, startedAt, env));
   if (bootstrapErrors.length) {
@@ -11165,6 +11434,7 @@ async function previewTradingViewSignal(db, payload) {
   const source = await getTradingViewSource(db, sourceId);
   if (!source) throw new Error('找不到 TradingView 來源');
   const draft = await buildTvSignalDraft(db, source, payload);
+  const proxies = await previewProxySignalsForDraft(db, draft);
   return {
     signal: {
       ticker: draft.ticker,
@@ -11179,6 +11449,7 @@ async function previewTradingViewSignal(db, payload) {
       target_group: draft.target_group,
       strategy_id: draft.strategy_id
     },
+    proxies,
     strategy: { id: draft.strategy.strategy_id, name: draft.strategy.name, rules: draft.rules }
   };
 }
@@ -11408,8 +11679,30 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
   if (existingLog?.signal_uid) {
     return json({ ok: true, duplicate: true, signalUid: existingLog.signal_uid, status: existingLog.status });
   }
+  const proxyCalibration = isProxyCalibrationPayload(payload);
+  if (proxyCalibration && existingLog?.status && String(existingLog.status).startsWith('calibration')) {
+    return json({ ok: true, duplicate: true, source: source.source_id, status: existingLog.status });
+  }
 
   try {
+    if (proxyCalibration) {
+      const result = await handleProxyCalibrationPayload(db, payload, source, env);
+      const calibration = result.calibration || {};
+      await db.prepare(`
+        INSERT OR REPLACE INTO tv_alert_logs (alert_uid, source_id, strategy_id, ticker, action, payload, signal_uid, status, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, datetime('now'))
+      `).bind(
+        alertUid,
+        source.source_id,
+        'proxy-weekly-offset',
+        calibration.source_symbol && calibration.target_symbol ? `${calibration.source_symbol}->${calibration.target_symbol}` : null,
+        'CALIBRATION',
+        JSON.stringify(payload),
+        result.status || 'calibration'
+      ).run();
+      return json({ ok: true, source: source.source_id, ...result });
+    }
+
     if (inferTvEventKind(payload) === 'exit') {
       const result = await closeSignalFromTvExit(db, source, payload, alertUid);
       await db.prepare(`
@@ -11441,7 +11734,24 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
       ctx.waitUntil(finalizeTvSignalDelivery(env, result.signalUid, result.autoClosed)
         .catch((e) => logAction(db, 'tv:background', 'tv_signal_delivery_failed', result.signalUid, e?.message || String(e))));
     }
-    return json({ ok: true, source: source.source_id, ...result, signal: draft });
+    let proxies = [];
+    try {
+      proxies = await createProxySignalsForDraft(db, draft, alertUid, source.auto_send, env, {
+        deferDelivery: canDeferDelivery
+      });
+      if (ctx?.waitUntil) {
+        for (const proxy of proxies) {
+          if (proxy.deferred && proxy.signalUid) {
+            ctx.waitUntil(finalizeTvSignalDelivery(env, proxy.signalUid, proxy.autoClosed)
+              .catch((e) => logAction(db, 'tv:background', 'tv_proxy_delivery_failed', proxy.signalUid, e?.message || String(e))));
+          }
+        }
+      }
+    } catch (proxyError) {
+      await logAction(db, 'signal:proxy', 'proxy_signal_error', draft.signal_uid, proxyError?.message || String(proxyError));
+      proxies = [{ status: 'error', error: proxyError?.message || String(proxyError) }];
+    }
+    return json({ ok: true, source: source.source_id, ...result, proxies, signal: draft });
   } catch (e) {
     const errorTicker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source));
     const errorAction = normalizeTvAction(payload) || inferTvExitType(payload) || '';
@@ -12594,6 +12904,7 @@ function renderConfigFormHtml() {
       <div class="full"><label>收款錢包地址</label><input name="payment_crypto_wallet" placeholder="貼上 USDT 錢包地址"></div>
       <div class="full"><label>匯率與確認說明</label><textarea name="payment_crypto_rate_note" placeholder="例如：請依付款當下匯率換算，實收以客服確認為準"></textarea></div>
       <div class="full"><label>虛擬貨幣付款注意事項</label><textarea name="payment_crypto_note" placeholder="例如：請務必選擇正確鏈別，鏈別錯誤可能無法追回"></textarea></div>
+      <div class="full"><label>訊號 Proxy 規則</label><textarea name="signal_proxy_rules" placeholder='[{"enabled":true,"source":"USTEC","target":"NQ","mode":"weekly_offset","beta":1,"target_group":"pro"}]'></textarea></div>
       <div class="full"><label>歡迎訊息</label><textarea name="welcome_message"></textarea></div>
     </div>
     <button class="btn primary" type="submit">儲存設定</button>
@@ -12914,8 +13225,9 @@ function renderConfigSummary() {
   var stripe = integrations.stripe || {};
   var oauth = integrations.oauth || {};
   var cryptoReady = c.payment_crypto_enabled === '1' && !!c.payment_crypto_wallet;
+  var proxyEnabled = String(c.signal_proxy_rules || '').indexOf('"enabled":true') >= 0 || String(c.signal_proxy_rules || '').indexOf('"enabled": true') >= 0;
   summary.innerHTML =
-    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(proxyEnabled ? 'USTEC→NQ 已啟用' : 'Proxy 未啟用', proxyEnabled ? 'green' : 'amber') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
     '<div class="muted">公開網址：' + esc(c.public_base_url || '-') + '</div>' +
     '<div class="muted">轉帳：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">Crypto：' + esc(c.payment_crypto_asset || 'USDT') + ' ' + esc(c.payment_crypto_network || '-') + ' / ' + esc(c.payment_crypto_wallet || '未設定') + '</div>' +

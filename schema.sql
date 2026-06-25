@@ -564,6 +564,29 @@ CREATE TABLE queued_signals (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- 15a. 跨品種訊號週校準 (USTEC -> NQ)
+-- ═══════════════════════════════════════════════════════════════════════════════
+DROP TABLE IF EXISTS signal_proxy_calibrations;
+CREATE TABLE signal_proxy_calibrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_symbol TEXT NOT NULL,
+  target_symbol TEXT NOT NULL,
+  mode TEXT DEFAULT 'weekly_offset',
+  source_price REAL,
+  target_price REAL,
+  beta REAL DEFAULT 1,
+  offset REAL,
+  status TEXT DEFAULT 'pending',
+  captured_source_at TEXT,
+  captured_target_at TEXT,
+  valid_from TEXT,
+  valid_until TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- 索引
 -- ═══════════════════════════════════════════════════════════════════════════════
 CREATE INDEX idx_users_tier ON users(tier);
@@ -615,6 +638,7 @@ CREATE INDEX idx_rate_limits_reset ON rate_limits(reset_at_ms);
 
 CREATE INDEX idx_queued_user ON queued_signals(user_id);
 CREATE INDEX idx_queued_scheduled ON queued_signals(scheduled_at);
+CREATE INDEX idx_proxy_cal_pair ON signal_proxy_calibrations(source_symbol, target_symbol, status, created_at);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 預設資料
@@ -704,4 +728,5 @@ INSERT INTO system_config (key, value) VALUES
 ('payment_crypto_memo', ''),
 ('payment_crypto_rate_note', '請依付款當下匯率換算，實收以客服確認為準'),
 ('payment_crypto_note', '請務必確認鏈別正確，鏈別錯誤可能無法追回。'),
+('signal_proxy_rules', '[{"enabled":true,"source":"USTEC","target":"NQ","mode":"weekly_offset","beta":1,"target_group":"pro","label":"USTEC weekly offset"}]'),
 ('welcome_message', '歡迎使用 DC Trading Signals！');
