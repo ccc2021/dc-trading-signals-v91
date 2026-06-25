@@ -11237,7 +11237,7 @@ async function smartConfigureTradingView(db, request, adminId, payload = {}) {
     sort_order: existingStrategy?.sort_order ?? 2,
     rules_json: algoProSmartRulesString(existingStrategy?.rules_json || ''),
     tv_alert_template: algoProSmartTvTemplateString(),
-    note: '智慧設定：同一份 TradingView Alert Message 支援全部啟用品種與多空方向，後端依 action 自動選 long_* / short_* 欄位。'
+    note: '智慧設定：來源允許全部啟用品種；AlgoPro 指標 alert 建議分別建立 Buy Signal 與 Sell Signal，後台會依方向產生對應 Message。'
   });
 
   const sourceId = slugify(payload.source_id || payload.sourceId || 'default-tv', 'default-tv');
@@ -11252,7 +11252,7 @@ async function smartConfigureTradingView(db, request, adminId, payload = {}) {
     target_group: payload.target_group || payload.targetGroup || existingSource?.target_group || 'pro',
     auto_send: payload.auto_send === false || payload.autoSend === false ? false : true,
     is_active: true,
-    notes: '智慧設定：全部啟用品種共用一份 TV message；請將回傳的 Message 貼到 TradingView alert。'
+    notes: '智慧設定：全部啟用品種已允許；請在後台產生器分別複製 Buy Signal / Sell Signal Message 貼到 TradingView。'
   });
 
   const source = await getTradingViewSource(db, sourceResult.sourceId);
@@ -12346,7 +12346,7 @@ function renderTradingViewHtml() {
       <div class="body">${renderTradingViewSourceFormHtml()}</div>
     </section>
     <section class="panel">
-	      <header><div><h2>現有策略 Alert 產生器</h2><p>給 TradingView Strategy Order fills alert 使用</p></div></header>
+	      <header><div><h2>AlgoPro Alert 產生器</h2><p>依方向產生指標 Buy/Sell alert；AUTO 才用 Strategy Order fills</p></div></header>
       <div class="body">${renderTradingViewGeneratorHtml()}</div>
     </section>
     <section class="panel" style="grid-column:1/-1">
@@ -12415,14 +12415,14 @@ function renderTradingViewGeneratorHtml() {
       <div><label>來源</label><select id="tvGenSource"></select></div>
       <div><label>策略</label><select id="tvGenStrategy"><option value="auto">自動選擇</option></select></div>
       <div><label>品種</label><select id="tvGenTicker"></select></div>
-      <div><label>方向</label><select id="tvGenAction"><option value="AUTO">TradingView 帶入</option><option value="LONG">做多</option><option value="SHORT">做空</option></select></div>
+      <div><label>方向 / 模式</label><select id="tvGenAction"><option value="LONG">Buy Signal 做多</option><option value="SHORT">Sell Signal 做空</option><option value="AUTO">Strategy Order fills</option></select></div>
       <div><label>週期</label><input id="tvGenInterval" value="15"></div>
       <div><label>預覽價格</label><input id="tvGenPrice" inputmode="decimal" value="21500"></div>
       <div class="full"><label>Webhook URL</label><input class="readonly" id="tvWebhookUrl" readonly></div>
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="preview" id="tvReadiness"></div>
-    <div class="muted">要讓進場、止損、TP 等於圖上指標，Alert Message 必須帶入指標實際 plot。AlgoPro V1.4 目前確認可用 Long/Short SL 與 Long/Short TP；entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會推送會員；TP2/TP3 有傳才顯示。</div>
+    <div class="muted">要讓進場、止損、TP 等於圖上指標，Alert Message 必須帶入指標實際 plot。AlgoPro V1.4 已確認可用 Long/Short SL 與 Long/Short TP；Buy/Sell alert 請分別複製做多與做空 Message。entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會推送會員；TP2/TP3 有傳才顯示。</div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvSmartConfigBtn">全部品種智慧設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button><button class="btn ghost" type="button" id="tvFallbackPreviewBtn">測試補 SL/TP</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
@@ -13909,10 +13909,24 @@ function applySmartTradingViewTemplate(message, strategy, action) {
     }
   });
   if (!auto) {
-    message.action = (side === 'LONG' || side === 'BUY') ? 'buy' : 'sell';
-    if (String(message.entry_price || '').includes('strategy.order')) message.entry_price = '{{close}}';
-    if (String(message.order_price || '').includes('strategy.order')) message.order_price = '{{close}}';
-    if (String(message.price || '').includes('strategy.order')) message.price = '{{close}}';
+    var sideAction = (side === 'LONG' || side === 'BUY') ? 'buy' : 'sell';
+    var selectedTickerEl = document.getElementById('tvGenTicker');
+    var selectedIntervalEl = document.getElementById('tvGenInterval');
+    var selectedTicker = selectedTickerEl ? String(selectedTickerEl.value || '').trim() : '';
+    var selectedInterval = selectedIntervalEl ? String(selectedIntervalEl.value || '').trim() : '';
+    message.ticker = selectedTicker || message.ticker || '{{ticker}}';
+    message.action = sideAction;
+    if (!message.entry_price || String(message.entry_price || '').includes('strategy.order')) message.entry_price = '{{close}}';
+    if (!message.order_price || String(message.order_price || '').includes('strategy.order')) message.order_price = '{{close}}';
+    if (!message.price || String(message.price || '').includes('strategy.order')) message.price = '{{close}}';
+    message.close = '{{close}}';
+    message.alert_uid = [message.ticker || '{{ticker}}', selectedInterval || '{{interval}}', sideAction, '{{time}}'].join('-');
+    delete message.alert_id;
+    delete message.order_id;
+    delete message.order_comment;
+    delete message.contracts;
+    delete message.market_position;
+    delete message.prev_market_position;
     delete message.long_tp2;
     delete message.short_tp2;
     delete message.long_tp3;
@@ -14001,6 +14015,7 @@ function renderTradingViewReadiness() {
   if (!box) return;
   var source = getSelectedTvSource();
   var strategy = getEffectiveTvStrategy();
+  var selectedAction = document.getElementById('tvGenAction') ? document.getElementById('tvGenAction').value : 'LONG';
   var tickerEl = document.getElementById('tvGenTicker');
   var ticker = tickerEl ? tickerEl.value : '';
   var allowed = parseJsonList(source && source.allowed_symbols);
@@ -14013,21 +14028,30 @@ function renderTradingViewReadiness() {
   ) && !!(
     parsed.tp1 || parsed.long_tp1 || parsed.short_tp1
   );
+  var hasEntry = !!(parsed.entry_price || parsed.entry || parsed.order_price || parsed.price || parsed.close);
   var isOrderFill = String(parsed.action || '').indexOf('strategy.order.action') >= 0 || String(parsed.order_price || parsed.entry_price || '').indexOf('strategy.order.price') >= 0;
-  var ok = !!source && !!strategy && isAllowed && hasLevels && isOrderFill;
+  var actionText = String(parsed.action || '').toLowerCase();
+  var sideSpecific = selectedAction !== 'AUTO';
+  var sideOk = sideSpecific
+    ? ['buy', 'sell', 'long', 'short'].indexOf(actionText) >= 0 && hasEntry && !isOrderFill
+    : isOrderFill;
+  var ok = !!source && !!strategy && isAllowed && hasLevels && sideOk;
   box.className = 'preview ' + (ok ? '' : 'warn');
   box.innerHTML =
     '<div>' +
       chip(ticker || '-', ok ? 'green' : 'amber') + ' ' +
       chip(source && source.is_active ? '來源啟用' : '來源未啟用', source && source.is_active ? 'green' : 'red') + ' ' +
       chip(isAllowed ? '品種允許' : '品種未允許', isAllowed ? 'green' : 'red') + ' ' +
-      chip(strategy ? strategy.strategy_id : '無策略', strategy ? 'green' : 'red') +
+      chip(strategy ? strategy.strategy_id : '無策略', strategy ? 'green' : 'red') + ' ' +
+      chip(sideSpecific ? '指標 Buy/Sell' : 'Strategy Order', sideOk ? 'green' : 'amber') +
     '</div>' +
     '<b>TradingView 實際設定檢查</b>' +
     '<div>' + (ok
-      ? '後台已可接收此品種；TV 端請在該 ETH 圖表建立「策略 Order fills」alert，Webhook 與 Message 使用下方內容。'
-      : '此組設定尚未完整：請確認來源啟用、允許品種含 ' + esc(ticker || '該品種') + '、策略有效，且 Message 含策略成交方向與 SL/TP 欄位。') + '</div>' +
-    '<div class="muted">目前後台只能保證 webhook 與訊息格式；TradingView 端仍需實際有該品種 alert 才會送訊號。</div>';
+      ? (sideSpecific
+        ? '後台已可接收此品種；TV 端請在該圖表建立 AlgoPro 的 ' + (selectedAction === 'SHORT' ? 'Sell Signal' : 'Buy Signal') + ' alert，Webhook 與 Message 使用下方內容。'
+        : '後台已可接收此品種；TV 端請建立 Strategy Order fills alert，Webhook 與 Message 使用下方內容。')
+      : '此組設定尚未完整：請確認來源啟用、允許品種含 ' + esc(ticker || '該品種') + '、策略有效，且 Message 模式與 TradingView alert condition 一致，並含 entry、SL、TP1。') + '</div>' +
+    '<div class="muted">目前後台只能保證 webhook 與訊息格式；TradingView 端仍需實際有該品種 alert 才會送訊號。AlgoPro 指標 alert 請分別建立 Buy Signal 與 Sell Signal。</div>';
 }
 function setSelectValue(id, value) {
   var el = document.getElementById(id);
@@ -14724,13 +14748,13 @@ document.getElementById('tvSmartConfigBtn').addEventListener('click', async func
     setSelectValue('tvGenSource', result.sourceId);
     setSelectValue('tvGenStrategy', result.strategyId);
     setSelectValue('tvGenTicker', (result.symbols || []).includes('ETH') ? 'ETH' : (result.symbols || [])[0]);
-    setSelectValue('tvGenAction', 'AUTO');
+    setSelectValue('tvGenAction', 'LONG');
+    updateTradingViewGenerator();
     document.getElementById('tvWebhookUrl').value = result.webhookUrl;
-    document.getElementById('tvAlertMessage').value = result.alertMessage;
     document.getElementById('tvPreview').innerHTML =
       '<div>' + chip('智慧設定完成', 'green') + ' ' + chip((result.symbols || []).length + ' 個品種', '') + '</div>' +
       '<b>' + esc(result.strategyId) + '</b>' +
-      '<div>Webhook 與 Message 已產生。請複製到 TradingView Alert。</div>';
+      '<div>來源已允許全部品種。請先複製 Buy Signal Message；切換成 Sell Signal 後再複製一次，分別貼到 TradingView 對應 alert。</div>';
     setMessage('全部品種智慧設定完成', 'ok');
   } catch (err) {
     showError(err, '智慧設定失敗');
@@ -14771,9 +14795,9 @@ document.getElementById('tvSmartImportBtn').addEventListener('click', async func
     setSelectValue('tvGenSource', result.sourceId);
     setSelectValue('tvGenStrategy', result.strategyId);
     if ((result.importedSymbols || []).length) setSelectValue('tvGenTicker', result.importedSymbols[0]);
-    setSelectValue('tvGenAction', 'AUTO');
+    setSelectValue('tvGenAction', 'LONG');
+    updateTradingViewGenerator();
     document.getElementById('tvWebhookUrl').value = result.webhookUrl;
-    document.getElementById('tvAlertMessage').value = result.alertMessage;
     renderTvImportPreview(result);
     setMessage('TV 清單智慧新增完成', 'ok');
   } catch (err) {
