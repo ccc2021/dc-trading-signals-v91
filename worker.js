@@ -13886,10 +13886,8 @@ function applySmartTradingViewTemplate(message, strategy, action) {
   var side = String(action || '').toUpperCase();
   var auto = side === 'AUTO' || !side;
   var pairs = [
-    ['stop_loss', 'long_stop_loss', 'short_stop_loss', '{{plot_10}}', '{{plot_11}}', /plot_10_or_11/i],
-    ['tp1', 'long_tp1', 'short_tp1', '{{plot_12}}', '{{plot_13}}', /plot_12_or_13/i],
-    ['tp2', 'long_tp2', 'short_tp2', '{{plot_14}}', '{{plot_15}}', /plot_14_or_15/i],
-    ['tp3', 'long_tp3', 'short_tp3', '{{plot_16}}', '{{plot_17}}', /plot_16_or_17/i]
+    ['stop_loss', 'long_stop_loss', 'short_stop_loss', '{{plot("Long SL")}}', '{{plot("Short SL")}}'],
+    ['tp1', 'long_tp1', 'short_tp1', '{{plot("Long TP")}}', '{{plot("Short TP")}}']
   ];
   pairs.forEach(function (pair) {
     var key = pair[0];
@@ -13897,18 +13895,30 @@ function applySmartTradingViewTemplate(message, strategy, action) {
     var shortKey = pair[2];
     var longValue = pair[3];
     var shortValue = pair[4];
-    var ambiguous = pair[5].test(String(message[key] || ''));
     if (auto) {
-      if (ambiguous) delete message[key];
       if (!message[longKey]) message[longKey] = longValue;
       if (!message[shortKey]) message[shortKey] = shortValue;
     } else if (side === 'LONG' || side === 'BUY') {
-      if (!message[key] || ambiguous) message[key] = longValue;
+      message[key] = message[longKey] || longValue;
+      delete message[longKey];
+      delete message[shortKey];
     } else if (side === 'SHORT' || side === 'SELL') {
-      if (!message[key] || ambiguous) message[key] = shortValue;
+      message[key] = message[shortKey] || shortValue;
+      delete message[longKey];
+      delete message[shortKey];
     }
   });
-  if (!message.mapping_note) message.mapping_note = 'Smart directional template: backend selects long_* or short_* by order action.';
+  if (!auto) {
+    message.action = (side === 'LONG' || side === 'BUY') ? 'buy' : 'sell';
+    if (String(message.entry_price || '').includes('strategy.order')) message.entry_price = '{{close}}';
+    if (String(message.order_price || '').includes('strategy.order')) message.order_price = '{{close}}';
+    if (String(message.price || '').includes('strategy.order')) message.price = '{{close}}';
+    delete message.long_tp2;
+    delete message.short_tp2;
+    delete message.long_tp3;
+    delete message.short_tp3;
+  }
+  if (!message.mapping_note) message.mapping_note = 'AlgoPro V1.4 confirmed placeholders: Long/Short SL and Long/Short TP.';
   return message;
 }
 function renderTvTemplateString(template, source, strategy) {
