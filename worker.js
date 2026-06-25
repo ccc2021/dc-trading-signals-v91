@@ -2755,7 +2755,7 @@ async function handleUserCommand(cid, uid, cmd, args, env) {
     let events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 });
     if (!events.length) {
       // 沒有快取資料時即時抓一次
-      try { await syncEconomicEvents(db, env); events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 }); } catch {}
+      try { await syncLegacyEconomicEvents(db, env); events = await getUpcomingEconomicEvents(db, { hours: 48, currencies: settings.currencies, impacts, limit: 25 }); } catch {}
     }
     return sendTg(cid, renderEconomicEventsText(events, '未來 48 小時財經日曆'), {
       inline_keyboard: [[{ text: '« 返回', callback_data: 'u_menu' }]]
@@ -4927,7 +4927,7 @@ async function ensureEconomicSchema(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_econ_reminded ON economic_events(reminded, event_at)').run();
 }
 
-function normalizeEconomicImpact(value) {
+function normalizeLegacyEconomicImpact(value) {
   const v = String(value || '').trim().toLowerCase();
   if (v.startsWith('high')) return 'High';
   if (v.startsWith('med')) return 'Medium';
@@ -4954,7 +4954,7 @@ function normalizeEconomicEvent(raw) {
   const parsed = new Date(dateRaw);
   if (Number.isNaN(parsed.getTime())) return null;
   const eventAt = parsed.toISOString();
-  const impact = normalizeEconomicImpact(raw.impact);
+  const impact = normalizeLegacyEconomicImpact(raw.impact);
   const forecast = raw.forecast == null ? '' : String(raw.forecast);
   const previous = raw.previous == null ? '' : String(raw.previous);
   const actual = raw.actual == null ? '' : String(raw.actual);
@@ -4980,7 +4980,7 @@ async function fetchEconomicCalendar(env) {
   return data.map(normalizeEconomicEvent).filter(Boolean);
 }
 
-async function syncEconomicEvents(db, env) {
+async function syncLegacyEconomicEvents(db, env) {
   await ensureEconomicSchema(db);
   const events = await fetchEconomicCalendar(env);
   let upserted = 0;
@@ -5042,7 +5042,7 @@ async function getEconomicSettings(db) {
     leadMinutes: Math.max(5, Number(lead) || 60),
     currencies: parseEconList(currencies, ['USD']),
     // impacts 需正規化成資料庫的 Title-case（High/Medium/Low/Holiday），parseEconList 會轉大寫
-    impacts: [...new Set(parseEconList(impacts, ['High']).map(normalizeEconomicImpact))],
+    impacts: [...new Set(parseEconList(impacts, ['High']).map(normalizeLegacyEconomicImpact))],
     lastSync: lastSync || null
   };
 }
@@ -5165,7 +5165,7 @@ async function handleEconomicReminders(env) {
   const settings = await getEconomicSettings(db);
   let synced = null;
   try {
-    synced = await syncEconomicEvents(db, env);
+    synced = await syncLegacyEconomicEvents(db, env);
   } catch (e) {
     // 同步失敗時仍嘗試用既有資料提醒
     synced = { error: e.message };
@@ -10480,7 +10480,7 @@ function tvAlertLevelDebug(payload) {
 }
 
 async function notifyTradingViewAlertError(env = {}, source = {}, payload = {}, alertUid = '', error = '') {
-  initConfig(env);
+  loadRuntimeConfig(env);
   const admins = CONFIG.ADMIN_IDS || [];
   if (!admins.length || !CONFIG.BOT_TOKEN) return { sent: 0, skipped: true };
   const ticker = normalizeTvTicker(firstTvValue(payload.ticker, payload.symbol, payload.syminfo, payload.source)) || '-';
@@ -10894,7 +10894,7 @@ async function handleAdminApi(request, env, pathname) {
     }
 
     if (request.method === 'POST' && parts[0] === 'economic' && parts[1] === 'sync') {
-      const result = await syncEconomicEvents(db, env);
+      const result = await syncLegacyEconomicEvents(db, env);
       await logAction(db, adminId, 'web_economic_sync', '', `fetched ${result.fetched}`);
       const events = await getUpcomingEconomicEvents(db, { hours: 72, limit: 60 });
       return json({ ok: true, data: { ...result, events } });
