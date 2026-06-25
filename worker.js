@@ -53,6 +53,8 @@ const DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL = 'https://economic-calendar.tradingv
 const DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME = 'TradingView Calendar';
 
 function algoProSmartTvTemplateObject() {
+  const rawPlots = {};
+  for (let i = 0; i <= 17; i++) rawPlots[`p${i}`] = `{{plot_${i}}}`;
   return {
     secret: '{{secret}}',
     source_id: '{{source_id}}',
@@ -71,13 +73,14 @@ function algoProSmartTvTemplateObject() {
     short_stop_loss: '{{plot_6}}',
     long_tp1: '{{plot_7}}',
     short_tp1: '{{plot_8}}',
+    ...rawPlots,
     contracts: '{{strategy.order.contracts}}',
     market_position: '{{strategy.market_position}}',
     prev_market_position: '{{strategy.prev_market_position}}',
     time: '{{time}}',
     interval: '{{interval}}',
     alert_id: '{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}',
-    mapping_note: 'AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. Backend selects the side by action; TP2/TP3 are only shown when TV provides them.'
+    mapping_note: 'AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. Backend uses indicator levels first and fills missing SL/TP by symbol strategy fallback.'
   };
 }
 
@@ -93,7 +96,9 @@ function algoProSmartRulesString(existing = '') {
     targetR: current.targetR || current.target_r || [1, 2, 3],
     entryMode: 'tradingview',
     levelSource: 'smart-directional-plot',
-    requiresExplicitLevels: true,
+    requiresExplicitLevels: false,
+    fallbackEnabled: true,
+    fallbackPolicy: 'indicator-first-symbol-strategy',
     timeframes: current.timeframes || ['1', '3', '5', '15']
   });
 }
@@ -5054,8 +5059,10 @@ async function ensureAdminSchema(db) {
         tv_alert_template IS NULL
         OR tv_alert_template LIKE '%_or_%'
         OR tv_alert_template NOT LIKE '%long_stop_loss%'
+        OR tv_alert_template NOT LIKE '%"p17"%'
         OR (tv_alert_template NOT LIKE '%probability%' AND tv_alert_template LIKE '%plot_10%' AND tv_alert_template LIKE '%plot_17%')
         OR tv_alert_template LIKE '%plot("Long SL")%'
+        OR rules_json LIKE '%"requiresExplicitLevels":true%'
         OR rules_json NOT LIKE '%smart-directional-plot%'
       )
   `).bind(algoProSmartTvTemplateString(), algoProSmartRulesString()).run();
@@ -10825,34 +10832,44 @@ function deriveSignalLevels({ entry, action, tickSize, explicitStop, explicitTar
     : 'auto';
   const targetR = Array.isArray(rules?.targetR) ? rules.targetR : Array.isArray(rules?.target_r) ? rules.target_r : [1, 2, 3];
   const ruleRisk = Number(rules?.riskPoints ?? rules?.risk_points);
+  const cleanStop = explicitStop !== null && explicitStop !== undefined && Number(explicitStop) !== 0 ? Number(explicitStop) : null;
+  const cleanTargets = (explicitTargets || []).slice(0, 3).map((target) => (
+    target !== null && target !== undefined && Number(target) !== 0 ? Number(target) : null
+  ));
+  while (cleanTargets.length < 3) cleanTargets.push(null);
 
   // 風險點數：指標止損 > 品種固定止損 > 策略 riskPoints > tick × 120（保底，永不為 0）
   let riskPoints;
-  if (explicitStop !== null) riskPoints = Math.abs(entry - explicitStop);
+  if (cleanStop !== null) riskPoints = Math.abs(entry - cleanStop);
   else if (hasSymbolStop) riskPoints = symbolStop;
   else if (Number.isFinite(ruleRisk) && ruleRisk > 0) riskPoints = ruleRisk;
   else riskPoints = tick * 120;
   if (!Number.isFinite(riskPoints) || riskPoints <= 0) riskPoints = tick * 120;
 
-  const stopLoss = explicitStop !== null ? explicitStop : roundToTick(entry - signed * riskPoints, tick);
+  const stopLoss = cleanStop !== null ? cleanStop : roundToTick(entry - signed * riskPoints, tick);
 
-  let targets;
-  let basis;
-  if (explicitTargets.some((t) => t !== null)) {
-    targets = explicitTargets;
-    basis = 'indicator';
+  let fallbackTargets;
+  let fallbackBasis;
+  // fixed：強制固定間隔（沒設則退回 R 倍數）；rmultiple：強制 R 倍數；auto：有固定間隔用固定，否則 R 倍數
+  const useFixed = mode === 'rmultiple' ? false : hasSymbolTp;
+  if (useFixed) {
+    fallbackTargets = [1, 2, 3].map((step) => roundToTick(entry + signed * symbolTp * step, tick));
+    fallbackBasis = 'fixed';
   } else {
-    // fixed：強制固定間隔（沒設則退回 R 倍數）；rmultiple：強制 R 倍數；auto：有固定間隔用固定，否則 R 倍數
-    const useFixed = mode === 'rmultiple' ? false : hasSymbolTp;
-    if (useFixed) {
-      targets = [1, 2, 3].map((step) => roundToTick(entry + signed * symbolTp * step, tick));
-      basis = 'fixed';
-    } else {
-      targets = targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tick));
-      basis = 'rmultiple';
-    }
+    fallbackTargets = targetR.slice(0, 3).map((r) => roundToTick(entry + signed * riskPoints * Number(r || 1), tick));
+    while (fallbackTargets.length < 3) fallbackTargets.push(roundToTick(entry + signed * riskPoints * (fallbackTargets.length + 1), tick));
+    fallbackBasis = 'rmultiple';
   }
-  return { stopLoss, targets, riskPoints, mode, basis };
+
+  const targets = cleanTargets.map((target, index) => target !== null ? target : fallbackTargets[index]);
+  const usedIndicator = cleanStop !== null || cleanTargets.some((target) => target !== null);
+  const usedFallback = cleanStop === null || cleanTargets.some((target) => target === null);
+  const basis = usedIndicator && usedFallback ? `mixed:${fallbackBasis}` : usedIndicator ? 'indicator' : fallbackBasis;
+  const fallbackFields = [
+    cleanStop === null ? 'stop_loss' : '',
+    ...cleanTargets.map((target, index) => target === null ? `tp${index + 1}` : '')
+  ].filter(Boolean);
+  return { stopLoss, targets, riskPoints, mode, basis, fallbackBasis, fallbackFields };
 }
 
 async function buildTvSignalDraft(db, source, payload) {
@@ -10872,35 +10889,26 @@ async function buildTvSignalDraft(db, source, payload) {
   const strategy = await selectTvStrategy(db, source, payload, ticker, signalType);
   const rules = parseObject(strategy.rules_json, { riskPoints: 30, targetR: [1, 2, 3], entryMode: 'close' });
   const entry = entryRaw;
-  const explicitStop = tvPreferTextLevel(tvStopLoss(payload, action), textLevels.stop_loss);
-  if (explicitStop === null) {
-    if (hasTvPlaceholder(tvStopLossValues(payload, action))) {
-      throw new Error('TradingView stop_loss/sl placeholder 未解析成數字。請用 Data Window 內實際 plot 名稱，或改用 {{plot_序號}}。');
-    }
-    throw new Error('TradingView alert 缺少 stop_loss/sl。為避免 TG 點位與圖上指標脫鉤，後端不會自動推算止損。');
-  }
-  const explicitTargets = [
+  const rawStop = tvPreferTextLevel(tvStopLoss(payload, action), textLevels.stop_loss);
+  const rawTargets = [
     tvPreferTextLevel(tvTargetPrice(payload, 1, action), textLevels.tp1),
     tvPreferTextLevel(tvTargetPrice(payload, 2, action), textLevels.tp2),
     tvPreferTextLevel(tvTargetPrice(payload, 3, action), textLevels.tp3)
   ];
   const probability = normalizeProbabilityValue(tvPreferTextLevel(tvProbability(payload, action), textLevels.probability));
-  const zeroLevelFields = [];
-  if (explicitStop === 0) zeroLevelFields.push('stop_loss');
-  explicitTargets.forEach((target, index) => {
-    if (target === 0) zeroLevelFields.push(`tp${index + 1}`);
+  const explicitStop = rawStop !== null && rawStop !== 0 ? rawStop : null;
+  const explicitTargets = rawTargets.map((target) => target !== null && target !== 0 ? target : null);
+  const derived = deriveSignalLevels({
+    entry,
+    action,
+    tickSize: symbol?.tick_size,
+    explicitStop,
+    explicitTargets,
+    symbol,
+    rules
   });
-  if (zeroLevelFields.length) {
-    throw new Error(tvZeroLevelError(zeroLevelFields));
-  }
-  if (explicitTargets[0] === null) {
-    if (hasTvPlaceholder(tvTargetValues(payload, 1, action))) {
-      throw new Error('TradingView tp1/target1 placeholder 未解析成數字。請用 Data Window 內實際 plot 名稱，或改用 {{plot_序號}}。');
-    }
-    throw new Error('TradingView alert 缺少 tp1/target1。為避免 TG 點位與圖上指標脫鉤，後端不會自動推算止盈。');
-  }
-  const stopLoss = explicitStop;
-  const targets = explicitTargets;
+  const stopLoss = derived.stopLoss;
+  const targets = derived.targets;
   assertNoZeroSignalLevels('TradingView alert', { entry, stopLoss, tp1: targets[0], tp2: targets[1], tp3: targets[2] });
   if (action === 'LONG' && stopLoss >= entry) throw new Error('TradingView 做多訊號的止損必須低於進場，請檢查指標輸出的 stop_loss。');
   if (action === 'SHORT' && stopLoss <= entry) throw new Error('TradingView 做空訊號的止損必須高於進場，請檢查指標輸出的 stop_loss。');
@@ -10920,6 +10928,9 @@ async function buildTvSignalDraft(db, source, payload) {
     payload.interval ? `週期: ${payload.interval}` : '',
     payload.time ? `時間: ${payload.time}` : '',
     probability !== null ? `機率: ${fmtProbability(probability)}` : '',
+    `點位來源: ${derived.basis}`,
+    derived.fallbackFields?.length ? `後台補位: ${derived.fallbackFields.join(',')}` : '',
+    derived.fallbackFields?.length ? `TV原始: ${tvAlertLevelDebug(payload)}` : '',
     chartUrl ? `圖表: ${chartUrl}` : '',
     snapshotUrl ? `截圖: ${snapshotUrl}` : ''
   ].filter(Boolean);
@@ -11065,6 +11076,11 @@ async function closeSignalFromTvExit(db, source, payload, alertUid) {
 }
 
 function tvAlertLevelDebug(payload) {
+  const rawPlots = [];
+  for (let i = 0; i <= 17; i++) {
+    const value = firstTvValue(payload[`p${i}`], payload[`plot_${i}`], payload.plots?.[i], payload.plots?.[String(i)]);
+    if (value !== '' && value !== null && value !== undefined) rawPlots.push(`p${i}:${String(value).slice(0, 24)}`);
+  }
   const fields = [
     ['entry', firstTvValue(payload.entry_price, payload.order_price, payload.price, payload.close)],
     ['sl', firstTvValue(payload.stop_loss, payload.sl, payload.long_stop_loss, payload.short_stop_loss)],
@@ -11073,9 +11089,10 @@ function tvAlertLevelDebug(payload) {
     ['tp3', firstTvValue(payload.tp3, payload.target3, payload.long_tp3, payload.short_tp3)],
     ['prob', firstTvValue(...tvProbabilityValues(payload, normalizeTvAction(payload) || ''))]
   ];
-  return fields
+  const base = fields
     .map(([label, value]) => `${label}:${value === '' ? '-' : String(value).slice(0, 40)}`)
     .join(' · ');
+  return rawPlots.length ? `${base} · raw:${rawPlots.join(',')}` : base;
 }
 
 async function notifyTradingViewAlertError(env = {}, source = {}, payload = {}, alertUid = '', error = '') {
@@ -12423,7 +12440,7 @@ function renderTradingViewGeneratorHtml() {
 	      <div class="full"><label>TradingView Alert Message</label><textarea class="copybox readonly" id="tvAlertMessage" readonly></textarea></div>
     </div>
     <div class="preview" id="tvReadiness"></div>
-    <div class="muted">要讓進場、止損、TP 等於圖上指標，Alert Message 必須帶入指標實際 plot。AlgoPro V1.4 Add placeholder 順序已對應為 plot_5 Long SL、plot_6 Short SL、plot_7 Long TP、plot_8 Short TP；Buy/Sell alert 請分別複製做多與做空 Message。entry_price、stop_loss/sl、tp1 缺任一欄就只記錄錯誤，不會推送會員；TP2/TP3 有傳才顯示。</div>
+    <div class="muted">TradingView 只要至少送入場、方向與品種，後端會優先使用 AlgoPro 指標實際 plot；若 SL/TP 沒抓到或只抓到局部價位，會依品種預設與策略規則自動補位後推送。AlgoPro V1.4 Add placeholder 順序已對應為 plot_5 Long SL、plot_6 Short SL、plot_7 Long TP、plot_8 Short TP，Message 也會帶 p0-p17 方便後續校正。</div>
     <div class="actions"><button class="btn primary" type="button" id="tvGenerateBtn">產生設定</button><button class="btn ghost" type="button" id="tvSmartConfigBtn">全部品種智慧設定</button><button class="btn ghost" type="button" data-copy-input="tvWebhookUrl">複製 Webhook</button><button class="btn ghost" type="button" data-copy-input="tvAlertMessage">複製 Message</button><button class="btn ghost" type="button" id="tvPreviewBtn">預覽點位</button><button class="btn ghost" type="button" id="tvFallbackPreviewBtn">測試補 SL/TP</button></div>
     <div class="preview" id="tvPreview"></div>
   </div>`;
@@ -13845,21 +13862,21 @@ function tvGeneratorLevels(strategy, action) {
         short_stop_loss: '{{plot_6}}',
         long_tp1: '{{plot_7}}',
         short_tp1: '{{plot_8}}',
-        note: 'AlgoPro V1.4 Add placeholder mapping：plot_5 Long SL、plot_6 Short SL、plot_7 Long TP、plot_8 Short TP；此 alert condition 未提供 TP2/TP3 或機率欄位。'
+        note: 'AlgoPro V1.4 Add placeholder mapping：plot_5 Long SL、plot_6 Short SL、plot_7 Long TP、plot_8 Short TP；後端會優先使用指標點位，缺少 TP2/TP3 時用後台品種/策略規則補位。'
       };
     }
     if (side === 'buy' || side === 'long') {
       return {
         stop_loss: '{{plot_5}}',
         tp1: '{{plot_7}}',
-        note: 'AlgoPro V1.4 Data Window: plot_5 Long SL / plot_7 Long TP。TP2/TP3 與機率未出現在此 alert placeholder 清單。'
+        note: 'AlgoPro V1.4 Data Window: plot_5 Long SL / plot_7 Long TP。TV 未提供的 TP2/TP3 由後台補位，p0-p17 會一併送回方便校正。'
       };
     }
     if (side === 'sell' || side === 'short') {
       return {
         stop_loss: '{{plot_6}}',
         tp1: '{{plot_8}}',
-        note: 'AlgoPro V1.4 Data Window: plot_6 Short SL / plot_8 Short TP。TP2/TP3 與機率未出現在此 alert placeholder 清單。'
+        note: 'AlgoPro V1.4 Data Window: plot_6 Short SL / plot_8 Short TP。TV 未提供的 TP2/TP3 由後台補位，p0-p17 會一併送回方便校正。'
       };
     }
   }
@@ -13881,9 +13898,17 @@ function tvGeneratorLevels(strategy, action) {
     note: '請確認 Data Window 內存在 SL/TP1/TP2/TP3；若不存在請改用 plot_序號。'
   };
 }
+function addAlgoProRawPlotPlaceholders(message) {
+  for (var i = 0; i <= 17; i++) {
+    var key = 'p' + i;
+    if (!message[key]) message[key] = '{{plot_' + i + '}}';
+  }
+  return message;
+}
 function applySmartTradingViewTemplate(message, strategy, action) {
   var id = String(strategy && strategy.strategy_id || message.strategy || '').toLowerCase();
   if (id.indexOf('algo-pro') < 0 && id.indexOf('algopro') < 0) return message;
+  addAlgoProRawPlotPlaceholders(message);
   var side = String(action || '').toUpperCase();
   var auto = side === 'AUTO' || !side;
   var pairs = [
@@ -13933,7 +13958,7 @@ function applySmartTradingViewTemplate(message, strategy, action) {
     delete message.long_tp3;
     delete message.short_tp3;
   }
-  if (!message.mapping_note) message.mapping_note = 'AlgoPro V1.4 Add placeholder mapping: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP.';
+  if (!message.mapping_note) message.mapping_note = 'AlgoPro V1.4 Add placeholder mapping: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. p0-p17 are included for backend debug/fallback.';
   return message;
 }
 function renderTvTemplateString(template, source, strategy) {
@@ -14003,6 +14028,10 @@ function buildTradingViewAlertMessage() {
   Object.keys(levels).forEach(function (key) {
     if (key !== 'note' && message[key] === undefined && levels[key]) message[key] = levels[key];
   });
+  if (String(effectiveTvStrategyId(strategy, source)).toLowerCase().indexOf('algo-pro') >= 0) {
+    addAlgoProRawPlotPlaceholders(message);
+    if (!message.mapping_note) message.mapping_note = 'AlgoPro V1.4 Add placeholder mapping: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. p0-p17 are included for backend debug/fallback.';
+  }
   return JSON.stringify(message, null, 2);
 }
 function updateTradingViewGenerator() {
@@ -14036,7 +14065,7 @@ function renderTradingViewReadiness() {
   var sideOk = sideSpecific
     ? ['buy', 'sell', 'long', 'short'].indexOf(actionText) >= 0 && hasEntry && !isOrderFill
     : isOrderFill;
-  var ok = !!source && !!strategy && isAllowed && hasLevels && sideOk;
+  var ok = !!source && !!strategy && isAllowed && sideOk;
   box.className = 'preview ' + (ok ? '' : 'warn');
   box.innerHTML =
     '<div>' +
@@ -14051,8 +14080,8 @@ function renderTradingViewReadiness() {
       ? (sideSpecific
         ? '後台已可接收此品種；TV 端請在該圖表建立 AlgoPro 的 ' + (selectedAction === 'SHORT' ? 'Sell Signal' : 'Buy Signal') + ' alert，Webhook 與 Message 使用下方內容。'
         : '後台已可接收此品種；TV 端請建立 Strategy Order fills alert，Webhook 與 Message 使用下方內容。')
-      : '此組設定尚未完整：請確認來源啟用、允許品種含 ' + esc(ticker || '該品種') + '、策略有效，且 Message 模式與 TradingView alert condition 一致，並含 entry、SL、TP1。') + '</div>' +
-    '<div class="muted">目前後台只能保證 webhook 與訊息格式；TradingView 端仍需實際有該品種 alert 才會送訊號。AlgoPro 指標 alert 請分別建立 Buy Signal 與 Sell Signal。</div>';
+      : '此組設定尚未完整：請確認來源啟用、允許品種含 ' + esc(ticker || '該品種') + '、策略有效，且 Message 模式與 TradingView alert condition 一致，並含 entry/price/close。') + '</div>' +
+    '<div class="muted">目前後台只能保證 webhook 與訊息格式；TradingView 端仍需實際有該品種 alert 才會送訊號。AlgoPro 指標 alert 請分別建立 Buy Signal 與 Sell Signal。' + (hasLevels ? '目前訊息含指標 SL/TP 欄位。' : '目前訊息未含完整 SL/TP 時，後端會用品種/策略規則補位。') + '</div>';
 }
 function setSelectValue(id, value) {
   var el = document.getElementById(id);
