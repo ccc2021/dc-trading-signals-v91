@@ -707,6 +707,7 @@ INSERT INTO system_config (key, value) VALUES
 ('auto_trade_allowed_symbols', ''),
 ('auto_trade_allowed_strategies', ''),
 ('signal_min_probability', '60'),
+('signal_require_probability', '0'),
 ('economic_calendar_source_url', 'https://economic-calendar.tradingview.com/events?from={from_iso}&to={to_iso}'),
 ('economic_calendar_source_name', 'TradingView Calendar'),
 ('economic_calendar_auto_remind', '1'),

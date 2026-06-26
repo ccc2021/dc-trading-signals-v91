@@ -4765,7 +4765,7 @@ const ADMIN_CONFIG_KEYS = [
   'pro_price_1m', 'pro_price_3m', 'pro_price_12m',
   'vip_price_1m', 'vip_price_3m', 'vip_price_12m',
   'trial_days', 'trial_tier', 'signals_paused',
-  'signal_min_probability',
+  'signal_min_probability', 'signal_require_probability',
   'contact_telegram', 'contact_line',
   'public_base_url',
   'payment_manual_enabled', 'payment_bank', 'payment_bank_branch', 'payment_account', 'payment_name', 'payment_transfer_note',
@@ -6650,6 +6650,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_gemini_model) config.economic_calendar_gemini_model = 'gemini-2.0-flash';
   if (!config.signal_proxy_rules) config.signal_proxy_rules = DEFAULT_SIGNAL_PROXY_RULES;
   if (!config.signal_min_probability) config.signal_min_probability = '60';
+  if (!config.signal_require_probability) config.signal_require_probability = '0';
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
   const ops = await safe('ops.health', getOperationalHealth(db, config, startedAt, env), () => fallbackOperationalHealth(config, startedAt, env));
   if (bootstrapErrors.length) {
@@ -11547,6 +11548,7 @@ async function buildTvSignalDraft(db, source, payload) {
     payload.interval ? `週期: ${payload.interval}` : '',
     payload.time ? `時間: ${payload.time}` : '',
     probability !== null ? `機率: ${fmtProbability(probability)}` : '',
+    probability === null ? '機率: 未收到' : '',
     `點位來源: ${derived.basis}`,
     derived.fallbackFields?.length ? `後台補位: ${derived.fallbackFields.join(',')}` : '',
     invalidRawFields.length ? `TV方向異常補位: ${invalidRawFields.join(',')}` : '',
@@ -11838,20 +11840,26 @@ async function getSignalMinProbability(db) {
   return normalizeProbabilityThreshold(await getConfig(db, 'signal_min_probability'));
 }
 
+async function getSignalRequireProbability(db) {
+  return String(await getConfig(db, 'signal_require_probability') || '0') === '1';
+}
+
 async function signalProbabilityGate(db, draft = {}) {
   const minProbability = await getSignalMinProbability(db);
+  const requireProbability = await getSignalRequireProbability(db);
   const probability = normalizeProbabilityValue(draft.probability);
-  const missing = minProbability > 0 && probability === null;
+  const missing = requireProbability && probability === null;
   const below = minProbability > 0 && probability !== null && probability < minProbability;
   const ignored = missing || below;
   return {
     enabled: minProbability > 0,
     minProbability,
+    requireProbability,
     probability,
     ignored,
-    status: missing ? 'ignored_missing_probability' : below ? 'ignored_low_probability' : 'accepted',
+    status: missing ? 'ignored_missing_probability' : below ? 'ignored_low_probability' : probability === null ? 'accepted_missing_probability' : 'accepted',
     reason: missing
-      ? `未收到機率，門檻為 ${fmtProbability(minProbability)}`
+      ? `未收到機率，且目前設定為缺少機率不發送`
       : below ? `機率 ${fmtProbability(probability)} 低於門檻 ${fmtProbability(minProbability)}` : ''
   };
 }
@@ -13324,6 +13332,7 @@ function renderConfigFormHtml() {
       <div><label>試用天數</label><input name="trial_days"></div>
       <div><label>訊號狀態</label><select name="signals_paused"><option value="0">運行中</option><option value="1">暫停發訊</option></select></div>
       <div><label>最低機率 %</label><input name="signal_min_probability" inputmode="decimal" placeholder="60；低於門檻只結算上一筆"></div>
+      <div><label>缺少機率</label><select name="signal_require_probability"><option value="0">允許發送並標記</option><option value="1">阻擋發送</option></select></div>
       <div class="full"><label>公開短網址 / 自訂網域</label><input name="public_base_url" inputmode="url" placeholder="https://dc-signals.com"></div>
       <div><label>客服 Telegram</label><input name="contact_telegram"></div>
       <div><label>客服 LINE</label><input name="contact_line"></div>
@@ -13687,8 +13696,9 @@ function renderConfigSummary() {
   var cryptoReady = c.payment_crypto_enabled === '1' && !!c.payment_crypto_wallet;
   var proxyEnabled = String(c.signal_proxy_rules || '').indexOf('"enabled":true') >= 0 || String(c.signal_proxy_rules || '').indexOf('"enabled": true') >= 0;
   var minProb = Number(c.signal_min_probability || 0);
+  var requireProb = c.signal_require_probability === '1';
   summary.innerHTML =
-    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip(minProb > 0 ? '機率 >= ' + minProb + '%' : '機率不過濾', minProb > 0 ? 'green' : '') + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(proxyEnabled ? 'USTEC→NQ 已啟用' : 'Proxy 未啟用', proxyEnabled ? 'green' : 'amber') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip(minProb > 0 ? '機率 >= ' + minProb + '%' : '機率不過濾', minProb > 0 ? 'green' : '') + chip(requireProb ? '缺機率阻擋' : '缺機率允許', requireProb ? 'amber' : 'green') + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(proxyEnabled ? 'USTEC→NQ 已啟用' : 'Proxy 未啟用', proxyEnabled ? 'green' : 'amber') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
     '<div class="muted">公開網址：' + esc(c.public_base_url || '-') + '</div>' +
     '<div class="muted">轉帳：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">Crypto：' + esc(c.payment_crypto_asset || 'USDT') + ' ' + esc(c.payment_crypto_network || '-') + ' / ' + esc(c.payment_crypto_wallet || '未設定') + '</div>' +
