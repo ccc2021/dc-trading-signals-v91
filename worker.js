@@ -92,7 +92,7 @@ function algoProSmartTvTemplateObject() {
     time: '{{time}}',
     interval: '{{interval}}',
     alert_id: '{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}',
-    mapping_note: 'AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP. Backend uses indicator levels first and fills missing SL/TP by symbol strategy fallback.'
+    mapping_note: 'AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback.'
   };
 }
 
@@ -777,6 +777,92 @@ function economicImpactLabel(impact) {
   return map[normalizeEconomicImpact(impact)] || impact || '中';
 }
 
+const ECONOMIC_TITLE_ZH_REPLACEMENTS = [
+  [/core cpi/gi, '核心 CPI'],
+  [/\bcpi\b/gi, 'CPI 消費者物價'],
+  [/core pce/gi, '核心 PCE'],
+  [/\bpce\b/gi, 'PCE 物價'],
+  [/non[-\s]?farm payrolls?|nfp/gi, '非農就業'],
+  [/initial jobless claims/gi, '初領失業金人數'],
+  [/continuing jobless claims/gi, '續領失業金人數'],
+  [/unemployment benefit claims/gi, '失業救濟申請'],
+  [/unemployment change/gi, '失業人數變化'],
+  [/unemployment rate/gi, '失業率'],
+  [/average hourly earnings/gi, '平均時薪'],
+  [/fomc/gi, 'FOMC'],
+  [/boj policy rate/gi, '日本央行政策利率'],
+  [/cash rate/gi, '現金利率'],
+  [/rate statement/gi, '利率聲明'],
+  [/press conference/gi, '記者會'],
+  [/fed interest rate decision|federal funds rate/gi, 'Fed 利率決議'],
+  [/fed chair powell speaks?/gi, 'Fed 主席 Powell 談話'],
+  [/interest rate decision|rate decision/gi, '利率決議'],
+  [/\bgdp\b/gi, 'GDP'],
+  [/core retail sales/gi, '核心零售銷售'],
+  [/retail sales/gi, '零售銷售'],
+  [/consumer confidence/gi, '消費者信心'],
+  [/consumer sentiment/gi, '消費者信心'],
+  [/s&p global manufacturing pmi/gi, 'S&P Global 製造業 PMI'],
+  [/s&p global services pmi/gi, 'S&P Global 服務業 PMI'],
+  [/ism manufacturing pmi/gi, 'ISM 製造業 PMI'],
+  [/ism services pmi/gi, 'ISM 服務業 PMI'],
+  [/manufacturing pmi/gi, '製造業 PMI'],
+  [/services pmi/gi, '服務業 PMI'],
+  [/\bpmi\b/gi, 'PMI'],
+  [/durable goods orders/gi, '耐用品訂單'],
+  [/factory orders/gi, '工廠訂單'],
+  [/industrial production/gi, '工業生產'],
+  [/ppi/gi, 'PPI 生產者物價'],
+  [/inflation rate/gi, '通膨率'],
+  [/\bemployment change\b/gi, '就業變化'],
+  [/jolts job openings/gi, 'JOLTS 職缺'],
+  [/crude oil inventories/gi, '原油庫存'],
+  [/natural gas storage/gi, '天然氣庫存'],
+  [/\by\/y\b/gi, '年增率'],
+  [/\bm\/m\b/gi, '月增率'],
+  [/\byoy\b/gi, '年增率'],
+  [/\bmom\b/gi, '月增率'],
+  [/final/gi, '終值']
+];
+
+function fallbackEconomicTitleZh(title = '') {
+  let text = String(title || '').trim();
+  for (const [pattern, replacement] of ECONOMIC_TITLE_ZH_REPLACEMENTS) {
+    text = text.replace(pattern, replacement);
+  }
+  text = text
+    .replace(/\bFed\s+([A-Za-z]+)\s+Speech\b/gi, 'Fed $1 談話')
+    .replace(/\bFed\s+([A-Za-z]+)\s+Speaks?\b/gi, 'Fed $1 談話')
+    .replace(/\bECB\s+President\s+([A-Za-z]+)\s+Speaks?\b/gi, 'ECB 總裁 $1 談話')
+    .replace(/\b([A-Z]{2,5})\s+Gov\s+([A-Za-z]+)\s+Speech\b/g, '$1 總裁 $2 談話')
+    .replace(/\b([A-Z]{2,5})\s+Governor\s+([A-Za-z]+)\s+Speaks?\b/g, '$1 總裁 $2 談話')
+    .replace(/\bMonetary Policy Statement\b/gi, '貨幣政策聲明')
+    .replace(/\bPolicy Rate\b/gi, '政策利率');
+  return text || String(title || '').trim();
+}
+
+function economicEventTitleZh(event = {}) {
+  return String(event.title_zh || event.titleZh || '').trim() || fallbackEconomicTitleZh(event.title);
+}
+
+function economicEventSummaryZh(event = {}) {
+  const existing = String(event.market_summary_zh || event.marketSummaryZh || '').trim();
+  if (existing) return existing;
+  const impact = economicImpactLabel(event.impact);
+  const currency = event.currency || event.country || '-';
+  const title = economicEventTitleZh(event);
+  return `${currency} ${impact}影響：${title}`;
+}
+
+function economicEventTradingNoteZh(event = {}) {
+  const existing = String(event.trading_note_zh || event.tradingNoteZh || '').trim();
+  if (existing) return existing;
+  const impact = normalizeEconomicImpact(event.impact);
+  if (impact === 'high') return '公布前後可能放大點差、滑價與假突破，降低槓桿並等待波動收斂。';
+  if (impact === 'medium') return '留意短線波動，避免在公布瞬間追價。';
+  return '';
+}
+
 const ECONOMIC_COUNTRY_TO_CURRENCY = {
   US: 'USD',
   EU: 'EUR',
@@ -919,6 +1005,95 @@ function extractEconomicJsonFromText(text) {
   return null;
 }
 
+function geminiApiKey(env = {}) {
+  return String(env.GEMINI_API_KEY || env.GOOGLE_GEMINI_API_KEY || env.GOOGLE_AI_API_KEY || '').trim();
+}
+
+function geminiModelName(model = '') {
+  return String(model || 'gemini-2.0-flash').trim().replace(/^models\//, '') || 'gemini-2.0-flash';
+}
+
+async function geminiGenerateJson(env = {}, model = 'gemini-2.0-flash', prompt = '') {
+  const key = geminiApiKey(env);
+  if (!key) throw new Error('GEMINI_API_KEY 未設定');
+  const cleanModel = geminiModelName(model);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent?key=${encodeURIComponent(key)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${text.slice(0, 180)}`);
+  let data = {};
+  try { data = JSON.parse(text); } catch { throw new Error('Gemini 回應不是 JSON'); }
+  const content = data.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('\n').trim() || '';
+  try {
+    return JSON.parse(content);
+  } catch {
+    const extracted = extractEconomicJsonFromText(content);
+    if (extracted) return extracted;
+    throw new Error('Gemini 翻譯結果不是 JSON');
+  }
+}
+
+function fallbackEnrichEconomicEvent(event = {}) {
+  return {
+    ...event,
+    title_zh: String(event.title_zh || '').trim() || fallbackEconomicTitleZh(event.title),
+    market_summary_zh: String(event.market_summary_zh || '').trim() || economicEventSummaryZh(event),
+    trading_note_zh: String(event.trading_note_zh || '').trim() || economicEventTradingNoteZh(event)
+  };
+}
+
+async function enrichEconomicEventsWithGemini(env = {}, events = [], config = {}) {
+  const normalized = events.map(fallbackEnrichEconomicEvent);
+  if (!normalized.length) return normalized;
+  if (!config.geminiEnabled || !geminiApiKey(env)) return normalized;
+  const rows = normalized.slice(0, 24).map((event) => ({
+    event_uid: event.event_uid,
+    time_taipei: event.event_time ? economicEventTimeText(event) : '',
+    currency: event.currency || event.country || '',
+    impact: normalizeEconomicImpact(event.impact),
+    title: event.title,
+    forecast: event.forecast || '',
+    previous: event.previous || '',
+    actual: event.actual || ''
+  }));
+  const prompt = [
+    '你是交易訊號後台的財經日曆編輯。請把以下經濟事件翻成繁體中文，並改寫成台灣交易者能快速理解的格式。',
+    '只輸出 JSON，不要 markdown。格式：{"events":[{"event_uid":"...","title_zh":"...","market_summary_zh":"...","trading_note_zh":"..."}]}',
+    'title_zh 要簡短，例如「美國核心 PCE 物價」。market_summary_zh 20 字內，說明可能影響哪類市場。trading_note_zh 30 字內，提醒操作風險，不要給確定方向。',
+    JSON.stringify(rows)
+  ].join('\n');
+  try {
+    const result = await geminiGenerateJson(env, config.geminiModel, prompt);
+    const translated = Array.isArray(result?.events) ? result.events : (Array.isArray(result) ? result : []);
+    const byUid = new Map(translated.map((item) => [String(item.event_uid || ''), item]));
+    return normalized.map((event) => {
+      const t = byUid.get(String(event.event_uid || '')) || {};
+      return {
+        ...event,
+        title_zh: String(t.title_zh || event.title_zh || '').trim() || fallbackEconomicTitleZh(event.title),
+        market_summary_zh: String(t.market_summary_zh || event.market_summary_zh || '').trim() || economicEventSummaryZh(event),
+        trading_note_zh: String(t.trading_note_zh || event.trading_note_zh || '').trim() || economicEventTradingNoteZh(event),
+        translated_at: new Date().toISOString()
+      };
+    });
+  } catch (e) {
+    return normalized.map((event) => ({
+      ...event,
+      notes: [event.notes, `Gemini 翻譯略過：${e.message}`].filter(Boolean).join(' / ').slice(0, 500)
+    }));
+  }
+}
+
 async function readEconomicCalendarResponse(res, sourceUrl) {
   const text = await res.text();
   try {
@@ -1007,16 +1182,20 @@ async function ensureEconomicEventsSchema(db) {
       country TEXT,
       currency TEXT,
       title TEXT NOT NULL,
+      title_zh TEXT,
       impact TEXT DEFAULT 'medium',
       actual TEXT,
       forecast TEXT,
       previous TEXT,
+      market_summary_zh TEXT,
+      trading_note_zh TEXT,
       source TEXT DEFAULT 'manual',
       source_url TEXT,
       status TEXT DEFAULT 'scheduled',
       notes TEXT,
       reminded_at TEXT,
       pre_reminded_at TEXT,
+      translated_at TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )
@@ -1026,16 +1205,20 @@ async function ensureEconomicEventsSchema(db) {
   await addColumnIfMissing(db, 'economic_events', 'timezone', "TEXT DEFAULT 'Asia/Taipei'");
   await addColumnIfMissing(db, 'economic_events', 'country', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'currency', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'title_zh', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'impact', "TEXT DEFAULT 'medium'");
   await addColumnIfMissing(db, 'economic_events', 'actual', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'forecast', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'previous', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'market_summary_zh', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'trading_note_zh', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'source', "TEXT DEFAULT 'manual'");
   await addColumnIfMissing(db, 'economic_events', 'source_url', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'status', "TEXT DEFAULT 'scheduled'");
   await addColumnIfMissing(db, 'economic_events', 'notes', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'reminded_at', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'pre_reminded_at', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'translated_at', 'TEXT');
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_economic_events_date ON economic_events(event_date)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_economic_events_impact ON economic_events(impact)').run();
 }
@@ -1052,6 +1235,8 @@ async function getEconomicConfig(db, env = {}) {
   const lookaheadDays = Number(await getConfig(db, 'economic_calendar_lookahead_days') || 1);
   const autoRemind = String(await getConfig(db, 'economic_calendar_auto_remind') || '1') !== '0';
   const marketOnly = String(await getConfig(db, 'economic_calendar_market_only') || '1') !== '0';
+  const geminiEnabled = String(await getConfig(db, 'economic_calendar_gemini_enabled') || '1') !== '0';
+  const geminiModel = geminiModelName(env.GEMINI_MODEL || await getConfig(db, 'economic_calendar_gemini_model') || 'gemini-2.0-flash');
   return {
     sourceUrl,
     sourceName,
@@ -1063,7 +1248,9 @@ async function getEconomicConfig(db, env = {}) {
     preEventMinutes: Number.isFinite(preEventMinutes) ? Math.max(0, Math.min(240, preEventMinutes)) : 30,
     lookaheadDays: Number.isFinite(lookaheadDays) ? Math.max(1, Math.min(7, lookaheadDays)) : 1,
     autoRemind,
-    marketOnly
+    marketOnly,
+    geminiEnabled,
+    geminiModel
   };
 }
 
@@ -1092,7 +1279,9 @@ async function getUpcomingMarketEconomicEvents(db, config, { hours = 48, limit =
       title
     LIMIT ?
   `).bind(nowIso, untilIso, Math.max(1, Math.min(100, Number(limit || 30)))).all();
-  return (rows.results || []).filter((event) => economicEventMatchesConfig(event, config));
+  return (rows.results || [])
+    .filter((event) => economicEventMatchesConfig(event, config))
+    .map(fallbackEnrichEconomicEvent);
 }
 
 async function economicEventUid(event) {
@@ -1121,41 +1310,53 @@ async function upsertEconomicEvent(db, payload, source = 'manual', options = {})
     country: String(payload.country || '').trim().toUpperCase(),
     currency: String(payload.currency || '').trim().toUpperCase(),
     title: String(payload.title || payload.event || payload.name || '').trim(),
+    title_zh: String(payload.title_zh || payload.titleZh || '').trim(),
     impact: normalizeEconomicImpact(payload.impact || payload.importance),
     actual: String(payload.actual || '').trim(),
     forecast: String(payload.forecast || payload.consensus || '').trim(),
     previous: String(payload.previous || payload.prev || '').trim(),
+    market_summary_zh: String(payload.market_summary_zh || payload.marketSummaryZh || '').trim(),
+    trading_note_zh: String(payload.trading_note_zh || payload.tradingNoteZh || '').trim(),
     source: String(payload.source || source || 'manual').trim(),
     source_url: cleanUrl(payload.source_url || payload.sourceUrl || payload.url),
     status: String(payload.status || 'scheduled').trim(),
-    notes: String(payload.notes || payload.note || '').trim()
+    notes: String(payload.notes || payload.note || '').trim(),
+    translated_at: String(payload.translated_at || payload.translatedAt || '').trim()
   };
   if (!event.title) throw new Error('請輸入事件名稱');
   event.event_uid = await economicEventUid(event);
+  event.title_zh = event.title_zh || fallbackEconomicTitleZh(event.title);
+  event.market_summary_zh = event.market_summary_zh || economicEventSummaryZh(event);
+  event.trading_note_zh = event.trading_note_zh || economicEventTradingNoteZh(event);
   await db.prepare(`
     INSERT INTO economic_events (
-      event_uid, event_date, event_time, timezone, country, currency, title, impact,
-      actual, forecast, previous, source, source_url, status, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, 'Asia/Taipei', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      event_uid, event_date, event_time, timezone, country, currency, title, title_zh, impact,
+      actual, forecast, previous, market_summary_zh, trading_note_zh, source, source_url, status, notes, translated_at, created_at, updated_at
+    ) VALUES (?, ?, ?, 'Asia/Taipei', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     ON CONFLICT(event_uid) DO UPDATE SET
       event_date = excluded.event_date,
       event_time = excluded.event_time,
       country = excluded.country,
       currency = excluded.currency,
       title = excluded.title,
+      title_zh = excluded.title_zh,
       impact = excluded.impact,
       actual = excluded.actual,
       forecast = excluded.forecast,
       previous = excluded.previous,
+      market_summary_zh = excluded.market_summary_zh,
+      trading_note_zh = excluded.trading_note_zh,
       source = excluded.source,
       source_url = excluded.source_url,
       status = excluded.status,
       notes = excluded.notes,
+      translated_at = COALESCE(excluded.translated_at, translated_at),
       updated_at = datetime('now')
   `).bind(
     event.event_uid, event.event_date, event.event_time, event.country || null, event.currency || null,
-    event.title, event.impact, event.actual || null, event.forecast || null, event.previous || null,
-    event.source || 'manual', event.source_url || null, event.status || 'scheduled', event.notes || null
+    event.title, event.title_zh || null, event.impact, event.actual || null, event.forecast || null, event.previous || null,
+    event.market_summary_zh || null, event.trading_note_zh || null,
+    event.source || 'manual', event.source_url || null, event.status || 'scheduled', event.notes || null, event.translated_at || null
   ).run();
   return event;
 }
@@ -1206,17 +1407,34 @@ async function syncEconomicEvents(db, env = {}, dateKey = taipeiDateKey(), optio
   if (!options.skipEnsure) await ensureEconomicEventsSchema(db);
   const config = options.config || await getEconomicConfig(db, env);
   const fetched = await fetchEconomicCalendarEvents(env, config, dateKey);
-  let saved = 0;
+  const matched = [];
   for (const event of fetched.events || []) {
     if (!economicEventMatchesConfig(event, config)) continue;
+    event.event_uid = await economicEventUid(event);
+    matched.push(event);
+  }
+  const enriched = await enrichEconomicEventsWithGemini(env, matched, config);
+  let saved = 0;
+  for (const event of enriched) {
     await upsertEconomicEvent(db, event, event.source || config.sourceName, { skipEnsure: true });
     saved++;
   }
-  return { synced: saved, total: (fetched.events || []).length, skipped: !!fetched.skipped, reason: fetched.reason || '', source: fetched.source || config.sourceName, url: fetched.url || '', proxied: !!fetched.proxied };
+  return {
+    synced: saved,
+    total: (fetched.events || []).length,
+    matched: matched.length,
+    translated: enriched.filter((event) => event.translated_at).length,
+    gemini: Boolean(config.geminiEnabled && geminiApiKey(env)),
+    skipped: !!fetched.skipped,
+    reason: fetched.reason || '',
+    source: fetched.source || config.sourceName,
+    url: fetched.url || '',
+    proxied: !!fetched.proxied
+  };
 }
 
 async function syncEconomicEventsRange(db, env = {}, startDateKey = taipeiDateKey(), days = 1) {
-  const total = { synced: 0, total: 0, days: 0, errors: [], skipped: false, source: '' };
+  const total = { synced: 0, total: 0, matched: 0, translated: 0, gemini: false, days: 0, errors: [], skipped: false, source: '' };
   const count = Math.max(1, Math.min(7, Number(days || 1)));
   const base = new Date(`${adminDateKey(startDateKey) || taipeiDateKey()}T00:00:00+08:00`);
   await ensureEconomicEventsSchema(db);
@@ -1227,6 +1445,9 @@ async function syncEconomicEventsRange(db, env = {}, startDateKey = taipeiDateKe
       const result = await syncEconomicEvents(db, env, key, { skipEnsure: true, config });
       total.synced += Number(result.synced || 0);
       total.total += Number(result.total || 0);
+      total.matched += Number(result.matched || 0);
+      total.translated += Number(result.translated || 0);
+      total.gemini = total.gemini || !!result.gemini;
       total.days++;
       total.skipped = total.skipped || !!result.skipped;
       if (result.source) total.source = result.source;
@@ -1251,7 +1472,7 @@ async function getEconomicEventsForDate(db, dateKey = taipeiDateKey(), config = 
   `).bind(dateKey).all();
   let events = rows.results || [];
   if (config) events = events.filter((event) => economicEventMatchesConfig(event, config));
-  return events;
+  return events.map(fallbackEnrichEconomicEvent);
 }
 
 function formatEconomicEventsMessage(events, options = {}) {
@@ -1265,15 +1486,20 @@ function formatEconomicEventsMessage(events, options = {}) {
     return msg;
   }
   for (const event of events) {
-    const line1 = `${economicEventTimeText(event)} ${event.currency || event.country || '-'} ${economicImpactLabel(event.impact)}｜${event.title}`;
+    const title = economicEventTitleZh(event);
+    const line1 = `${economicEventTimeText(event)}｜${event.currency || event.country || '-'}｜${economicImpactLabel(event.impact)}影響`;
     msg += `<b>${escHtml(line1)}</b>\n`;
+    msg += `${escHtml(title)}\n`;
     const values = [
       event.forecast ? `預期 ${event.forecast}` : '',
       event.previous ? `前值 ${event.previous}` : '',
       event.actual ? `實際 ${event.actual}` : ''
     ].filter(Boolean).join(' · ');
     if (values) msg += `${escHtml(values)}\n`;
-    if (event.notes) msg += `${escHtml(event.notes)}\n`;
+    const summary = economicEventSummaryZh(event);
+    if (summary) msg += `重點：${escHtml(summary)}\n`;
+    const tradingNote = economicEventTradingNoteZh(event);
+    if (tradingNote) msg += `提醒：${escHtml(tradingNote)}\n`;
     msg += `\n`;
   }
   msg += `提醒：重大數據前後可能擴大點差與滑價，訊號請依風控執行。`;
@@ -1351,7 +1577,10 @@ async function sendEconomicPreEventAlerts(env = {}, options = {}) {
         event.forecast ? `預期 ${event.forecast}` : '',
         event.previous ? `前值 ${event.previous}` : ''
       ].filter(Boolean).join(' · ');
-      return `<b>${escHtml(economicEventTimeText(event) + ' ' + (event.currency || event.country || '-') + '｜' + event.title)}</b>\n${escHtml(economicImpactLabel(event.impact))}${values ? ` · ${escHtml(values)}` : ''}`;
+      const title = economicEventTitleZh(event);
+      const summary = economicEventSummaryZh(event);
+      const tradingNote = economicEventTradingNoteZh(event);
+      return `<b>${escHtml(economicEventTimeText(event) + '｜' + (event.currency || event.country || '-') + '｜' + economicImpactLabel(event.impact) + '影響')}</b>\n${escHtml(title)}${values ? `\n${escHtml(values)}` : ''}${summary ? `\n重點：${escHtml(summary)}` : ''}${tradingNote ? `\n提醒：${escHtml(tradingNote)}` : ''}`;
     }),
     '',
     '提醒：重大數據前後可能擴大點差、滑價與假突破，請降低槓桿並嚴格依風控。'
@@ -4551,7 +4780,8 @@ const ADMIN_CONFIG_KEYS = [
   'economic_calendar_source_url', 'economic_calendar_source_name',
   'economic_calendar_impacts', 'economic_calendar_currencies', 'economic_calendar_countries',
   'economic_calendar_auto_remind', 'economic_calendar_remind_hour', 'economic_calendar_target_group',
-  'economic_calendar_pre_event_minutes', 'economic_calendar_lookahead_days', 'economic_calendar_market_only'
+  'economic_calendar_pre_event_minutes', 'economic_calendar_lookahead_days', 'economic_calendar_market_only',
+  'economic_calendar_gemini_enabled', 'economic_calendar_gemini_model', 'economic_calendar_last_sync'
 ];
 const ADMIN_SESSION_COOKIE = 'dc_admin_session';
 const ADMIN_SESSION_MAX_AGE = 60 * 60 * 8;
@@ -5267,7 +5497,7 @@ async function ensureAdminSchema(db) {
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
     ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing SL/TP by symbol strategy fallback."}'),
+    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback."}'),
     ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
     ('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
@@ -6416,6 +6646,8 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_impacts) config.economic_calendar_impacts = 'high';
   if (!config.economic_calendar_currencies) config.economic_calendar_currencies = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
   if (!config.economic_calendar_market_only) config.economic_calendar_market_only = '1';
+  if (!config.economic_calendar_gemini_enabled) config.economic_calendar_gemini_enabled = '1';
+  if (!config.economic_calendar_gemini_model) config.economic_calendar_gemini_model = 'gemini-2.0-flash';
   if (!config.signal_proxy_rules) config.signal_proxy_rules = DEFAULT_SIGNAL_PROXY_RULES;
   if (!config.signal_min_probability) config.signal_min_probability = '60';
   const winRate = todayPerf?.total > 0 ? Math.round(((todayPerf.wins || 0) / todayPerf.total) * 100) : 0;
@@ -6447,10 +6679,13 @@ async function getAdminBootstrap(db, env = {}, request = null) {
     currencies: economicRuntimeConfig.currencies,
     leadMinutes: economicRuntimeConfig.preEventMinutes,
     marketOnly: !!economicRuntimeConfig.marketOnly,
+    geminiEnabled: !!economicRuntimeConfig.geminiEnabled,
+    geminiConfigured: !!geminiApiKey(env),
+    geminiModel: economicRuntimeConfig.geminiModel,
     lastSync: config.economic_calendar_last_sync || null
   };
   const upcomingEconomicEvents = await safe('economic.upcoming', getUpcomingMarketEconomicEvents(db, economicRuntimeConfig, { hours: 72, limit: 60 }), []);
-  const economicRows = economicEvents.results || [];
+  const economicRows = (economicEvents.results || []).map(fallbackEnrichEconomicEvent);
   const deliveryDiagnostics = await safe(
     'delivery.diagnostics',
     getDeliveryDiagnostics(db, env, Math.min(Number(range.limit || 40), 60)),
@@ -10348,8 +10583,9 @@ function renderMemberEconomic(){
   var box=document.getElementById('economicEvents'); if(!box) return;
   var events=state.economicEvents||[];
   box.innerHTML = events.map(function(ev){
+    var title = ev.title_zh || ev.title || '-';
     var meta=[]; if(ev.forecast) meta.push('預估 '+esc(ev.forecast)); if(ev.previous) meta.push('前值 '+esc(ev.previous)); if(ev.actual) meta.push('公布 '+esc(ev.actual));
-    return '<div style="border:1px solid var(--line);border-radius:7px;padding:9px 11px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong style="font-size:13px">'+esc(ev.title)+'</strong>'+memberEconImpact(ev.impact)+'</div><div class="muted" style="font-size:12px;margin-top:3px">'+esc(memberEconTime(ev))+' · '+esc(ev.currency||ev.country||'')+(meta.length?(' · '+meta.join(' · ')):'')+'</div></div>';
+    return '<div style="border:1px solid var(--line);border-radius:7px;padding:9px 11px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong style="font-size:13px">'+esc(title)+'</strong>'+memberEconImpact(ev.impact)+'</div><div class="muted" style="font-size:12px;margin-top:3px">'+esc(memberEconTime(ev))+' · '+esc(ev.currency||ev.country||'')+(meta.length?(' · '+meta.join(' · ')):'')+'</div>'+(ev.market_summary_zh?'<div style="font-size:12px;margin-top:6px">'+esc(ev.market_summary_zh)+'</div>':'')+(ev.trading_note_zh?'<div class="muted" style="font-size:12px;margin-top:4px">'+esc(ev.trading_note_zh)+'</div>':'')+'</div>';
   }).join('') || '<div class="muted">近期沒有重要經濟事件。</div>';
 }
 appView.addEventListener('click', function(event){
@@ -10665,6 +10901,27 @@ function tvNumberValue(value, fallback = null) {
 
 function tvExplicitNumber(...values) {
   return tvNumberValue(firstTvValue(...values), null);
+}
+
+function tvDirectionalLevelInvalid(action, entry, field, value) {
+  if (value === null || value === undefined || Number(value) === 0) return false;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isFinite(Number(entry))) return false;
+  if (field === 'stop_loss') {
+    if (action === 'LONG') return n >= entry;
+    if (action === 'SHORT') return n <= entry;
+  } else {
+    if (action === 'LONG') return n <= entry;
+    if (action === 'SHORT') return n >= entry;
+  }
+  return false;
+}
+
+function sanitizeTvDirectionalLevel(action, entry, field, value, allowFallback) {
+  if (allowFallback && tvDirectionalLevelInvalid(action, entry, field, value)) {
+    return { value: null, invalid: true };
+  }
+  return { value, invalid: false };
 }
 
 function rawPlotProbabilityCandidate(value) {
@@ -11172,7 +11429,7 @@ async function selectTvStrategy(db, source, payload, ticker, signalType) {
   return scored[0].strategy;
 }
 
-// 依品種推算模式計算止損 / 止盈點位；目前只供後台補位預覽與人工備援，正式 TV webhook 仍要求指標回傳實際 SL/TP。
+// 依品種推算模式計算止損 / 止盈點位；TV 指標缺值或方向明顯異常時會用這套規則補位。
 function deriveSignalLevels({ entry, action, tickSize, explicitStop, explicitTargets, symbol, rules }) {
   const tick = Number(tickSize) || 0.25;
   const signed = action === 'LONG' ? 1 : -1;
@@ -11249,8 +11506,17 @@ async function buildTvSignalDraft(db, source, payload) {
     tvPreferTextLevel(tvTargetPrice(payload, 3, action), textLevels.tp3)
   ];
   const probability = normalizeProbabilityValue(tvPreferTextLevel(tvProbability(payload, action), textLevels.probability));
-  const explicitStop = rawStop !== null && rawStop !== 0 ? rawStop : null;
-  const explicitTargets = rawTargets.map((target) => target !== null && target !== 0 ? target : null);
+  const allowFallback = rules.fallbackEnabled !== false;
+  const invalidRawFields = [];
+  const cleanStop = sanitizeTvDirectionalLevel(action, entry, 'stop_loss', rawStop, allowFallback);
+  if (cleanStop.invalid) invalidRawFields.push('stop_loss');
+  const cleanTargets = rawTargets.map((target, index) => {
+    const clean = sanitizeTvDirectionalLevel(action, entry, `tp${index + 1}`, target, allowFallback);
+    if (clean.invalid) invalidRawFields.push(`tp${index + 1}`);
+    return clean.value;
+  });
+  const explicitStop = cleanStop.value !== null && cleanStop.value !== 0 ? cleanStop.value : null;
+  const explicitTargets = cleanTargets.map((target) => target !== null && target !== 0 ? target : null);
   const derived = deriveSignalLevels({
     entry,
     action,
@@ -11283,6 +11549,7 @@ async function buildTvSignalDraft(db, source, payload) {
     probability !== null ? `機率: ${fmtProbability(probability)}` : '',
     `點位來源: ${derived.basis}`,
     derived.fallbackFields?.length ? `後台補位: ${derived.fallbackFields.join(',')}` : '',
+    invalidRawFields.length ? `TV方向異常補位: ${invalidRawFields.join(',')}` : '',
     derived.fallbackFields?.length ? `TV原始: ${tvAlertLevelDebug(payload, action)}` : '',
     chartUrl ? `圖表: ${chartUrl}` : '',
     snapshotUrl ? `截圖: ${snapshotUrl}` : ''
@@ -11634,7 +11901,7 @@ async function previewFallbackSignalLevels(db, payload = {}) {
     basis: derived.basis,
     strategy: { id: strategy.strategy_id, name: strategy.name },
     liveStrict: true,
-    warning: '此為後台補位預覽，只用來驗證 fallback 計算；正式 TradingView webhook 仍必須由 AlgoPro 指標至少回傳 SL 與 TP1，缺值或 0 不會推送會員。'
+    warning: '此為後台補位預覽，用來驗證 fallback 計算；正式 TradingView webhook 會優先使用 AlgoPro 指標點位，缺值或方向明顯異常時才依此規則補位。'
   };
 }
 
@@ -12989,6 +13256,8 @@ function renderEconomicConfigFormHtml() {
       <div><label>幣別篩選</label><input name="economic_calendar_currencies" placeholder="USD,EUR,GBP,JPY,CAD,AUD,CNY"></div>
       <div><label>國家篩選</label><input name="economic_calendar_countries" placeholder="US,EU,JP，可留空"></div>
       <div><label>市場事件過濾</label><select name="economic_calendar_market_only"><option value="1">只保留重要市場事件</option><option value="0">依重要性全列</option></select></div>
+      <div><label>Gemini 翻譯</label><select name="economic_calendar_gemini_enabled"><option value="1">啟用（有 API key 時）</option><option value="0">停用</option></select></div>
+      <div><label>Gemini 模型</label><input name="economic_calendar_gemini_model" placeholder="gemini-2.0-flash"></div>
     </div>
     <button class="btn primary" type="submit">儲存事件設定</button>
   </form>`;
@@ -13224,40 +13493,64 @@ function adminBootstrapPath() {
 }
 async function load() {
   setMessage('同步後台資料中...');
-  state.data = await api(adminBootstrapPath());
-  if (state.data.range) state.dateRange = Object.assign({}, state.dateRange, state.data.range);
-  syncDateRangeInputs();
-  renderAll();
-  setMessage('已同步 ' + state.data.serverTime, 'ok');
+  try {
+    state.data = await api(adminBootstrapPath());
+    if (state.data.range) state.dateRange = Object.assign({}, state.dateRange, state.data.range);
+    syncDateRangeInputs();
+    renderAll();
+    var renderErrors = state.renderErrors || [];
+    if (renderErrors.length) {
+      setMessage('已同步，但 ' + renderErrors.length + ' 個區塊渲染異常：' + renderErrors.map(function (item) { return item.module; }).join('、'), 'error');
+    } else {
+      setMessage('已同步 ' + state.data.serverTime, 'ok');
+    }
+  } catch (err) {
+    showError(err, '同步後台資料失敗');
+    throw err;
+  }
 }
 function renderAll() {
-  renderSignalSymbolOptions();
-  renderOpsSummary();
-  renderOpsHealth();
-  renderKpis();
-  renderDateRangeSummary();
-  renderSignalAnalytics();
-  renderConfigSummary();
-  renderConfigForm();
-  renderBillingReadiness();
-  renderFinanceDashboard();
-  renderSignals();
-  renderOrders();
-  renderSupport();
-  renderUsers();
-  renderSymbols();
-  renderStrategies();
-  renderEconomic();
-  renderTradingView();
-  renderDeliveryDiagnostics();
-  renderStrategyHealth();
-  renderTvGateway();
-  renderRevenueSummary();
-  renderOverviewTvLogs();
-  renderEconomicEvents();
-  updateSignalPreview();
-  document.getElementById('serverTime').textContent = '最後同步 ' + state.data.serverTime;
-  document.getElementById('dbPill').textContent = 'D1 dc-signals-v91-db';
+  var renderErrors = [];
+  function run(module, fn) {
+    try {
+      fn();
+    } catch (err) {
+      renderErrors.push({ module: module, error: (err && err.message) || String(err) });
+      if (window.console && console.error) console.error('Admin render failed:', module, err);
+    }
+  }
+  run('品種選單', renderSignalSymbolOptions);
+  run('營運摘要', renderOpsSummary);
+  run('健康檢查', renderOpsHealth);
+  run('KPI', renderKpis);
+  run('日期篩選', renderDateRangeSummary);
+  run('訊號統計', renderSignalAnalytics);
+  run('設定摘要', renderConfigSummary);
+  run('設定表單', renderConfigForm);
+  run('收款狀態', renderBillingReadiness);
+  run('財務儀表板', renderFinanceDashboard);
+  run('訊號列表', renderSignals);
+  run('訂單列表', renderOrders);
+  run('客服支援', renderSupport);
+  run('會員管理', renderUsers);
+  run('品種管理', renderSymbols);
+  run('策略管理', renderStrategies);
+  run('財經日曆舊版', renderEconomic);
+  run('TradingView', renderTradingView);
+  run('投遞診斷', renderDeliveryDiagnostics);
+  run('策略健康', renderStrategyHealth);
+  run('TV Gateway', renderTvGateway);
+  run('營收摘要', renderRevenueSummary);
+  run('TV Logs', renderOverviewTvLogs);
+  run('經濟事件', renderEconomicEvents);
+  run('訊號預覽', updateSignalPreview);
+  run('同步狀態', function () {
+    var serverTime = document.getElementById('serverTime');
+    if (serverTime) serverTime.textContent = '最後同步 ' + state.data.serverTime;
+    var dbPill = document.getElementById('dbPill');
+    if (dbPill) dbPill.textContent = 'D1 dc-signals-v91-db';
+  });
+  state.renderErrors = renderErrors;
 }
 function renderOpsSummary() {
   var s = state.data.stats;
@@ -13838,14 +14131,15 @@ function renderEconomic() {
   if (table) {
     var events = state.data.economicEvents || [];
     table.innerHTML = events.map(function (ev) {
-      return '<tr><td>' + esc(econTaipei(ev.event_time || ev.event_at)) + '</td><td>' + esc(ev.currency || ev.country || '-') + '</td><td>' + esc(ev.title) + '</td><td>' + econImpactChip(ev.impact) + '</td><td>' + esc(ev.forecast || '-') + '</td><td>' + esc(ev.previous || '-') + '</td><td>' + esc(ev.actual || '-') + '</td></tr>';
+      var title = ev.title_zh || ev.title || '-';
+      return '<tr><td>' + esc(econTaipei(ev.event_time || ev.event_at)) + '</td><td>' + esc(ev.currency || ev.country || '-') + '</td><td><b>' + esc(title) + '</b>' + (ev.market_summary_zh ? '<div class="muted">' + esc(ev.market_summary_zh) + '</div>' : '') + '</td><td>' + econImpactChip(ev.impact) + '</td><td>' + esc(ev.forecast || '-') + '</td><td>' + esc(ev.previous || '-') + '</td><td>' + esc(ev.actual || '-') + '</td></tr>';
     }).join('') || '<tr><td colspan="7" class="muted">尚無事件，請點「立即同步」</td></tr>';
   }
   var status = document.getElementById('econStatus');
   var settings = state.data.economicSettings || {};
   if (status) {
     var last = settings.lastSync ? econTaipei(settings.lastSync) : '尚未同步';
-    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 市場事件 ' + (settings.marketOnly ? '啟用' : '關閉') + ' · 提前 ' + (settings.leadMinutes || 30) + ' 分鐘';
+    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 市場事件 ' + (settings.marketOnly ? '啟用' : '關閉') + ' · Gemini ' + (settings.geminiEnabled ? (settings.geminiConfigured ? '已啟用' : '待設定 API key') : '關閉') + ' · 提前 ' + (settings.leadMinutes || 30) + ' 分鐘';
   }
   var form = document.getElementById('economicForm');
   if (form) {
@@ -14023,14 +14317,20 @@ function todayKey() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
 }
 function eventCard(event, compact) {
+  var title = event.title_zh || event.title || '-';
+  var rawTitle = event.title && event.title !== title ? '<span>' + esc(event.title) + '</span>' : '';
+  var summary = event.market_summary_zh || '';
+  var tradeNote = event.trading_note_zh || '';
   var values = [
     ['預期', event.forecast || '-'],
     ['前值', event.previous || '-'],
     ['實際', event.actual || '-']
   ];
   return '<article class="event-card ' + esc(String(event.impact || 'medium').toLowerCase()) + '">' +
-    '<div class="event-card-head"><div><strong>' + esc(eventDateTimeText(event) + ' ' + (event.currency || event.country || '-') + '｜' + event.title) + '</strong><span>台灣時間 UTC+8 · ' + esc(event.source || 'manual') + '</span></div>' + chip(eventImpactText(event.impact), eventImpactTone(event.impact)) + '</div>' +
+    '<div class="event-card-head"><div><strong>' + esc(eventDateTimeText(event) + ' ' + (event.currency || event.country || '-') + '｜' + title) + '</strong><span>台灣時間 UTC+8 · ' + esc(event.source || 'manual') + '</span>' + rawTitle + '</div>' + chip(eventImpactText(event.impact), eventImpactTone(event.impact)) + '</div>' +
     '<div class="event-meta">' + values.map(function (item) { return '<div><span>' + esc(item[0]) + '</span><strong>' + esc(item[1]) + '</strong></div>'; }).join('') + '</div>' +
+    (summary ? '<div class="record-note"><b>重點</b> ' + esc(summary) + '</div>' : '') +
+    (tradeNote ? '<div class="record-note"><b>操作提醒</b> ' + esc(tradeNote) + '</div>' : '') +
     (compact ? '' : '<div class="muted">' + esc(event.notes || '') + '</div><div class="actions"><button class="btn ghost" type="button" data-edit-event="' + esc(event.event_uid) + '">編輯</button>' + (event.source_url ? '<a class="btn ghost mini" href="' + esc(event.source_url) + '" target="_blank" rel="noopener">來源</a>' : '') + '</div>') +
   '</article>';
 }
@@ -14066,7 +14366,9 @@ function renderEconomicEvents() {
       'economic_calendar_impacts',
       'economic_calendar_currencies',
       'economic_calendar_countries',
-      'economic_calendar_market_only'
+      'economic_calendar_market_only',
+      'economic_calendar_gemini_enabled',
+      'economic_calendar_gemini_model'
     ].forEach(function (key) {
       if (form.elements[key]) form.elements[key].value = state.data.config[key] == null ? '' : state.data.config[key];
     });
@@ -14078,6 +14380,8 @@ function renderEconomicEvents() {
     if (!form.elements.economic_calendar_impacts.value) form.elements.economic_calendar_impacts.value = 'high';
     if (!form.elements.economic_calendar_currencies.value) form.elements.economic_calendar_currencies.value = 'USD,EUR,GBP,JPY,CAD,AUD,CNY';
     if (form.elements.economic_calendar_market_only && !form.elements.economic_calendar_market_only.value) form.elements.economic_calendar_market_only.value = '1';
+    if (form.elements.economic_calendar_gemini_enabled && !form.elements.economic_calendar_gemini_enabled.value) form.elements.economic_calendar_gemini_enabled.value = '1';
+    if (form.elements.economic_calendar_gemini_model && !form.elements.economic_calendar_gemini_model.value) form.elements.economic_calendar_gemini_model.value = 'gemini-2.0-flash';
   }
 }
 function editEconomicEvent(eventUid) {
@@ -15228,7 +15532,7 @@ document.getElementById('syncEconomicBtn').addEventListener('click', async funct
     setMessage('同步經濟事件中...');
     var result = await api('/api/admin/economic-events/sync', { method: 'POST', body: JSON.stringify({ date: (state.data.economic && state.data.economic.today) || todayKey() }) });
     await load();
-    setMessage('事件同步完成：' + (result.synced || 0) + '/' + (result.total || 0), 'ok');
+    setMessage('事件同步完成：' + (result.synced || 0) + '/' + (result.total || 0) + (result.gemini ? '，Gemini 整理 ' + (result.translated || 0) + ' 筆' : ''), 'ok');
   } catch (err) { showError(err, '同步事件失敗'); }
 });
 document.getElementById('sendEconomicBtn').addEventListener('click', async function () {
