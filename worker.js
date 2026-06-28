@@ -390,7 +390,7 @@ async function getUserSettings(db, id) {
       user_id: String(id),
       capital: 10000,
       risk_percent: 1.0,
-      subscribed_symbols: '["NQ","ES","GC","USTEC","XAUUSD","ETH"]',
+      subscribed_symbols: '["NQ","ES","GC","USTEC","XAUUSD","BTC","ETH"]',
       signal_types: '["scalp","swing"]',
       notify_entry: 1,
       notify_tp: 1,
@@ -768,7 +768,8 @@ function normalizeEconomicImpact(value) {
 function normalizeTradingViewImportance(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return '';
-  if (n >= 0) return 'high';
+  if (n >= 1) return 'high';
+  if (n === 0) return 'medium';
   return 'low';
 }
 
@@ -1196,10 +1197,15 @@ async function ensureEconomicEventsSchema(db) {
       reminded_at TEXT,
       pre_reminded_at TEXT,
       translated_at TEXT,
+      vip_analyzed_at TEXT,
+      vip_analysis_zh TEXT,
+      vip_analysis_error TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )
   `).run();
+  const existingEconomicColumns = (await db.prepare("PRAGMA table_info(economic_events)").all()).results || [];
+  const vipAnalyzedColumnExisted = existingEconomicColumns.some((row) => row.name === 'vip_analyzed_at');
   await addColumnIfMissing(db, 'economic_events', 'event_date', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'event_time', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'timezone', "TEXT DEFAULT 'Asia/Taipei'");
@@ -1219,6 +1225,18 @@ async function ensureEconomicEventsSchema(db) {
   await addColumnIfMissing(db, 'economic_events', 'reminded_at', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'pre_reminded_at', 'TEXT');
   await addColumnIfMissing(db, 'economic_events', 'translated_at', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'vip_analyzed_at', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'vip_analysis_zh', 'TEXT');
+  await addColumnIfMissing(db, 'economic_events', 'vip_analysis_error', 'TEXT');
+  if (!vipAnalyzedColumnExisted) {
+    await db.prepare(`
+      UPDATE economic_events
+      SET vip_analyzed_at = COALESCE(vip_analyzed_at, datetime('now')),
+          vip_analysis_error = COALESCE(vip_analysis_error, 'migration_existing_released_event'),
+          updated_at = datetime('now')
+      WHERE actual IS NOT NULL AND TRIM(actual) != ''
+    `).run();
+  }
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_economic_events_date ON economic_events(event_date)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_economic_events_impact ON economic_events(impact)').run();
 }
@@ -1234,9 +1252,13 @@ async function getEconomicConfig(db, env = {}) {
   const preEventMinutes = Number(await getConfig(db, 'economic_calendar_pre_event_minutes') || 30);
   const lookaheadDays = Number(await getConfig(db, 'economic_calendar_lookahead_days') || 1);
   const autoRemind = String(await getConfig(db, 'economic_calendar_auto_remind') || '1') !== '0';
+  const dailyDigestEnabled = String(await getConfig(db, 'economic_calendar_daily_digest_enabled') || '0') === '1';
   const marketOnly = String(await getConfig(db, 'economic_calendar_market_only') || '1') !== '0';
   const geminiEnabled = String(await getConfig(db, 'economic_calendar_gemini_enabled') || '1') !== '0';
   const geminiModel = geminiModelName(env.GEMINI_MODEL || await getConfig(db, 'economic_calendar_gemini_model') || 'gemini-2.0-flash');
+  const vipAnalysisAutoSend = String(await getConfig(db, 'vip_analysis_auto_send') || '1') !== '0';
+  const vipAnalysisGeminiEnabled = String(await getConfig(db, 'vip_analysis_gemini_enabled') || '1') !== '0';
+  const vipAnalysisGeminiModel = geminiModelName(env.GEMINI_MODEL || await getConfig(db, 'vip_analysis_gemini_model') || geminiModel);
   return {
     sourceUrl,
     sourceName,
@@ -1248,9 +1270,13 @@ async function getEconomicConfig(db, env = {}) {
     preEventMinutes: Number.isFinite(preEventMinutes) ? Math.max(0, Math.min(240, preEventMinutes)) : 30,
     lookaheadDays: Number.isFinite(lookaheadDays) ? Math.max(1, Math.min(7, lookaheadDays)) : 1,
     autoRemind,
+    dailyDigestEnabled,
     marketOnly,
     geminiEnabled,
-    geminiModel
+    geminiModel,
+    vipAnalysisAutoSend,
+    vipAnalysisGeminiEnabled,
+    vipAnalysisGeminiModel
   };
 }
 
@@ -1261,6 +1287,10 @@ function economicEventMatchesConfig(event, config) {
   if (config.countries?.length && event.country && !config.countries.includes(String(event.country).toUpperCase())) return false;
   if (config.marketOnly && !economicEventIsMarketMoving(event)) return false;
   return true;
+}
+
+function filterHighImpactEconomicEvents(events = []) {
+  return (events || []).filter((event) => normalizeEconomicImpact(event.impact) === 'high');
 }
 
 async function getUpcomingMarketEconomicEvents(db, config, { hours = 48, limit = 30 } = {}) {
@@ -1281,6 +1311,7 @@ async function getUpcomingMarketEconomicEvents(db, config, { hours = 48, limit =
   `).bind(nowIso, untilIso, Math.max(1, Math.min(100, Number(limit || 30)))).all();
   return (rows.results || [])
     .filter((event) => economicEventMatchesConfig(event, config))
+    .filter((event) => normalizeEconomicImpact(event.impact) === 'high')
     .map(fallbackEnrichEconomicEvent);
 }
 
@@ -1409,6 +1440,7 @@ async function syncEconomicEvents(db, env = {}, dateKey = taipeiDateKey(), optio
   const fetched = await fetchEconomicCalendarEvents(env, config, dateKey);
   const matched = [];
   for (const event of fetched.events || []) {
+    if (normalizeEconomicImpact(event.impact) !== 'high') continue;
     if (!economicEventMatchesConfig(event, config)) continue;
     event.event_uid = await economicEventUid(event);
     matched.push(event);
@@ -1513,6 +1545,7 @@ async function sendEconomicEventsReminder(env = {}, options = {}) {
   const config = await getEconomicConfig(db, env);
   if (!options.force) {
     if (!config.autoRemind) return { sent: 0, skipped: true, reason: 'auto_remind_disabled' };
+    if (!config.dailyDigestEnabled) return { sent: 0, skipped: true, reason: 'daily_digest_disabled' };
     if (taipeiHour() !== config.remindHour) return { sent: 0, skipped: true, reason: 'outside_remind_hour', remindHour: config.remindHour };
     const last = await getConfig(db, `economic_calendar_last_reminded_${dateKey}`);
     if (last === '1') return { sent: 0, skipped: true, reason: 'already_reminded' };
@@ -1524,15 +1557,15 @@ async function sendEconomicEventsReminder(env = {}, options = {}) {
   } catch (e) {
     sync = { synced: 0, error: e.message };
   }
-  const events = await getEconomicEventsForDate(db, dateKey, config);
+  const events = filterHighImpactEconomicEvents(await getEconomicEventsForDate(db, dateKey, config));
   if (!events.length) return { sent: 0, skipped: true, reason: 'no_events', sync };
   const msg = formatEconomicEventsMessage(events, { dateKey, source: config.sourceName });
   const result = await broadcastMessage(db, msg, config.targetGroup, 'alert');
   await db.prepare(`
     UPDATE economic_events
     SET reminded_at = COALESCE(reminded_at, datetime('now')), updated_at = datetime('now')
-    WHERE event_date = ? AND COALESCE(status, 'scheduled') != 'cancelled'
-  `).bind(dateKey).run();
+    WHERE event_uid IN (${events.map(() => '?').join(',')})
+  `).bind(...events.map((event) => event.event_uid)).run();
   if (!options.force) await setConfig(db, `economic_calendar_last_reminded_${dateKey}`, '1');
   return { ...result, eventCount: events.length, targetGroup: config.targetGroup, sync };
 }
@@ -1565,7 +1598,9 @@ async function sendEconomicPreEventAlerts(env = {}, options = {}) {
     ORDER BY datetime(event_time), CASE impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, title
     LIMIT 12
   `).bind(nowIso, cutoffIso).all();
-  const events = (rows.results || []).filter((event) => economicEventMatchesConfig(event, config));
+  let events = (rows.results || []).filter((event) => economicEventMatchesConfig(event, config));
+  if (!options.force) events = events.filter((event) => !event.reminded_at);
+  events = filterHighImpactEconomicEvents(events);
   if (!events.length) return { sent: 0, skipped: true, reason: 'no_upcoming_events', sync };
 
   const msg = [
@@ -1592,6 +1627,173 @@ async function sendEconomicPreEventAlerts(env = {}, options = {}) {
     WHERE event_uid IN (${events.map(() => '?').join(',')})
   `).bind(...events.map((event) => event.event_uid)).run();
   return { ...result, eventCount: events.length, targetGroup: config.targetGroup, sync };
+}
+
+function vipEconomicValuesText(event = {}) {
+  return [
+    event.actual ? `實際 ${event.actual}` : '',
+    event.forecast ? `預期 ${event.forecast}` : '',
+    event.previous ? `前值 ${event.previous}` : ''
+  ].filter(Boolean).join(' / ') || '數值待確認';
+}
+
+function fallbackVipEconomicAnalysis(event = {}) {
+  const title = economicEventTitleZh(event);
+  const analysis = analyzeEconomicEvent({
+    ...event,
+    country: event.currency || event.country,
+    title: event.title || title
+  });
+  if (!analysis) {
+    return {
+      summary_zh: `${title} 已公布，${vipEconomicValuesText(event)}。`,
+      bias_zh: '缺少可比較的預期值，先視為方向未定。',
+      market_impact_zh: '重大數據公布後仍可能放大黃金、指數與外匯短線波動。',
+      risk_note_zh: '等待第一波波動收斂，避免在點差擴大時追價。'
+    };
+  }
+  const verdict = analysis.beat > 0 ? '優於預期' : analysis.beat < 0 ? '不如預期' : '符合預期';
+  const currency = analysis.cur || event.currency || event.country || '-';
+  const usdText = currency === 'USD'
+    ? (analysis.beat > 0 ? '美元偏強，黃金與美股指數短線較容易承壓。' : analysis.beat < 0 ? '美元偏弱，黃金與美股指數短線較容易獲得支撐。' : '美元方向中性，等待市場選邊。')
+    : `${currency} 相關資產影響較直接，美元計價商品影響相對間接。`;
+  return {
+    summary_zh: `${economicEventTitleZh(event)}：實際 ${event.actual || '-'} / 預期 ${event.forecast || '-'}，${verdict}。`,
+    bias_zh: `${currency} ${analysis.beat > 0 ? '偏多' : analysis.beat < 0 ? '偏空' : '中性'}。`,
+    market_impact_zh: usdText,
+    risk_note_zh: '事件公布後先確認點差、滑價與第一根波動方向，再依策略訊號執行。'
+  };
+}
+
+function vipEconomicAnalysisPrompt(event = {}) {
+  return [
+    '你是交易訊號系統的 VIP 財經事件分析助理。請用繁體中文，根據經濟數據實際值、預期值、前值，產出給交易者看的精簡分析。',
+    '只輸出 JSON，不要 markdown。格式：{"summary_zh":"...","bias_zh":"...","market_impact_zh":"...","risk_note_zh":"..."}',
+    'summary_zh 25 字內；bias_zh 說明貨幣或風險資產傾向；market_impact_zh 說明對黃金、指數、美元或相關貨幣的可能影響；risk_note_zh 必須提醒風控，不要承諾必漲必跌。',
+    JSON.stringify({
+      time_taipei: economicEventTimeText(event),
+      currency: event.currency || event.country || '',
+      impact: normalizeEconomicImpact(event.impact),
+      title: event.title,
+      title_zh: economicEventTitleZh(event),
+      actual: event.actual || '',
+      forecast: event.forecast || '',
+      previous: event.previous || ''
+    })
+  ].join('\n');
+}
+
+async function buildVipEconomicAnalysis(env = {}, event = {}, config = {}) {
+  const fallback = fallbackVipEconomicAnalysis(event);
+  let error = '';
+  if (config.vipAnalysisGeminiEnabled && geminiApiKey(env)) {
+    try {
+      const result = await geminiGenerateJson(env, config.vipAnalysisGeminiModel, vipEconomicAnalysisPrompt(event));
+      return {
+        analysis: {
+          summary_zh: String(result.summary_zh || fallback.summary_zh || '').trim(),
+          bias_zh: String(result.bias_zh || fallback.bias_zh || '').trim(),
+          market_impact_zh: String(result.market_impact_zh || fallback.market_impact_zh || '').trim(),
+          risk_note_zh: String(result.risk_note_zh || fallback.risk_note_zh || '').trim()
+        },
+        usedGemini: true,
+        error: ''
+      };
+    } catch (e) {
+      error = e?.message || String(e);
+    }
+  }
+  return { analysis: fallback, usedGemini: false, error };
+}
+
+function formatVipEconomicAnalysisMessage(event = {}, result = {}) {
+  const analysis = result.analysis || fallbackVipEconomicAnalysis(event);
+  const title = economicEventTitleZh(event);
+  const source = result.usedGemini ? 'Gemini 進階分析' : '系統解讀';
+  return [
+    '<b>VIP 進階事件分析</b>',
+    `${escHtml(economicEventTimeText(event))}｜${escHtml(event.currency || event.country || '-')}｜紅色重大影響`,
+    `<b>${escHtml(title)}</b>`,
+    escHtml(vipEconomicValuesText(event)),
+    '',
+    `解讀：${escHtml(analysis.summary_zh || '-')}`,
+    `傾向：${escHtml(analysis.bias_zh || '-')}`,
+    `可能影響：${escHtml(analysis.market_impact_zh || '-')}`,
+    `風控：${escHtml(analysis.risk_note_zh || '-')}`,
+    '',
+    `<i>${escHtml(source)}，非投資建議。</i>`
+  ].join('\n');
+}
+
+async function sendVipEconomicAnalyses(env = {}, options = {}) {
+  const db = env.DB;
+  await ensureEconomicEventsSchema(db);
+  const config = await getEconomicConfig(db, env);
+  if (!options.force && !config.vipAnalysisAutoSend) return { sent: 0, skipped: true, reason: 'vip_analysis_disabled' };
+  const dateKey = options.date || taipeiDateKey();
+  let sync = null;
+  try {
+    sync = await syncEconomicEvents(db, env, dateKey);
+  } catch (e) {
+    sync = { synced: 0, error: e.message };
+  }
+  const sinceIso = new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString();
+  const untilIso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const rows = await db.prepare(`
+    SELECT *
+    FROM economic_events
+    WHERE COALESCE(status, 'scheduled') != 'cancelled'
+      AND (vip_analyzed_at IS NULL OR vip_analyzed_at = '')
+      AND LOWER(COALESCE(impact, '')) = 'high'
+      AND actual IS NOT NULL
+      AND TRIM(actual) != ''
+      AND event_time IS NOT NULL
+      AND datetime(event_time) >= datetime(?)
+      AND datetime(event_time) <= datetime(?)
+    ORDER BY datetime(event_time) DESC, title
+    LIMIT 8
+  `).bind(sinceIso, untilIso).all();
+  const events = filterHighImpactEconomicEvents((rows.results || [])
+    .filter((event) => economicEventMatchesConfig(event, { ...config, impacts: ['high'] }))
+    .map(fallbackEnrichEconomicEvent));
+  if (!events.length) return { sent: 0, skipped: true, reason: 'no_released_high_impact_events', sync };
+  let sent = 0;
+  const errors = [];
+  for (const event of events) {
+    const analysisResult = await buildVipEconomicAnalysis(env, event, config);
+    const message = formatVipEconomicAnalysisMessage(event, analysisResult);
+    const storedAnalysis = [
+      analysisResult.analysis?.summary_zh,
+      analysisResult.analysis?.bias_zh,
+      analysisResult.analysis?.market_impact_zh,
+      analysisResult.analysis?.risk_note_zh
+    ].filter(Boolean).join('\n');
+    try {
+      const result = await broadcastMessage(db, message, 'vip', 'alert');
+      sent += Number(result.sent || 0);
+      await db.prepare(`
+        UPDATE economic_events
+        SET vip_analyzed_at = datetime('now'), vip_analysis_zh = ?, vip_analysis_error = ?, updated_at = datetime('now')
+        WHERE event_uid = ?
+      `).bind(storedAnalysis.slice(0, 2000), analysisResult.error || null, event.event_uid).run();
+    } catch (e) {
+      const error = e?.message || String(e);
+      errors.push(`${event.event_uid}: ${error}`);
+      await db.prepare(`
+        UPDATE economic_events
+        SET vip_analysis_error = ?, updated_at = datetime('now')
+        WHERE event_uid = ?
+      `).bind(error.slice(0, 500), event.event_uid).run();
+    }
+  }
+  return {
+    sent,
+    eventCount: events.length,
+    targetGroup: 'vip',
+    gemini: Boolean(config.vipAnalysisGeminiEnabled && geminiApiKey(env)),
+    sync,
+    errors
+  };
 }
 
 async function maybeSyncWeeklyEconomicEvents(env = {}, options = {}) {
@@ -4779,9 +4981,11 @@ const ADMIN_CONFIG_KEYS = [
   'signal_proxy_rules',
   'economic_calendar_source_url', 'economic_calendar_source_name',
   'economic_calendar_impacts', 'economic_calendar_currencies', 'economic_calendar_countries',
-  'economic_calendar_auto_remind', 'economic_calendar_remind_hour', 'economic_calendar_target_group',
+  'economic_calendar_auto_remind', 'economic_calendar_daily_digest_enabled', 'economic_calendar_remind_hour', 'economic_calendar_target_group',
   'economic_calendar_pre_event_minutes', 'economic_calendar_lookahead_days', 'economic_calendar_market_only',
-  'economic_calendar_gemini_enabled', 'economic_calendar_gemini_model', 'economic_calendar_last_sync'
+  'economic_calendar_gemini_enabled', 'economic_calendar_gemini_model',
+  'vip_analysis_auto_send', 'vip_analysis_gemini_enabled', 'vip_analysis_gemini_model',
+  'economic_calendar_last_sync'
 ];
 const ADMIN_SESSION_COOKIE = 'dc_admin_session';
 const ADMIN_SESSION_MAX_AGE = 60 * 60 * 8;
@@ -5496,12 +5700,12 @@ async function ensureAdminSchema(db) {
   }
   await db.prepare(`
     INSERT OR IGNORE INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback."}'),
-    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-    ('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
-    ('ict-silver-bullet-2026', 'ICT Silver Bullet 2026', '串接 TradingView ICT Advanced Silver Bullet；需 alert_message 或 hidden plot 回傳 SL/TP。', '["scalp","daytrade"]', '["XAUUSD","GC","USTEC","NQ","ETH"]', 'pro', 5, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"alert_message","requiresExplicitLevels":true,"needsAlertMessage":true}', '{"strategy":"ict-silver-bullet-2026","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{strategy.order.price}}","stop_loss":"ADD_SL_TO_PINE_ALERT","tp1":"ADD_TP1_TO_PINE_ALERT","tp2":"ADD_TP2_TO_PINE_ALERT","tp3":"ADD_TP3_TO_PINE_ALERT","time":"{{time}}","interval":"{{interval}}"}')
+    ('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","BTC","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","BTC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback."}'),
+    ('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","BTC","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","BTC","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+    ('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","BTC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
+    ('ict-silver-bullet-2026', 'ICT Silver Bullet 2026', '串接 TradingView ICT Advanced Silver Bullet；需 alert_message 或 hidden plot 回傳 SL/TP。', '["scalp","daytrade"]', '["XAUUSD","GC","USTEC","NQ","BTC","ETH"]', 'pro', 5, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"alert_message","requiresExplicitLevels":true,"needsAlertMessage":true}', '{"strategy":"ict-silver-bullet-2026","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{strategy.order.price}}","stop_loss":"ADD_SL_TO_PINE_ALERT","tp1":"ADD_TP1_TO_PINE_ALERT","tp2":"ADD_TP2_TO_PINE_ALERT","tp3":"ADD_TP3_TO_PINE_ALERT","time":"{{time}}","interval":"{{interval}}"}')
   `).run();
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS tradingview_sources (
@@ -5544,7 +5748,7 @@ async function ensureAdminSchema(db) {
     await db.prepare(`
       INSERT INTO tradingview_sources (source_id, name, webhook_secret, default_strategy_id, allowed_symbols, default_signal_type, target_group, auto_send, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'auto', 'pro', 1, '預設來源，抓到進場位即自動發送訊號。可在後台改回草稿模式。').run();
+    `).bind('default-tv', 'Default TradingView', genUID(), 'scalp-core', '["NQ","ES","GC","CL","USTEC","XAUUSD","BTC","ETH"]', 'auto', 'pro', 1, '預設來源，抓到進場位即自動發送訊號。可在後台改回草稿模式。').run();
   }
   // 一次性遷移：把既有來源改為自動發送（抓到進場位即推播）
   const autoSendMigrated = await getConfig(db, 'tv_autosend_migrated');
@@ -5554,12 +5758,18 @@ async function ensureAdminSchema(db) {
   }
   await db.prepare(`
     INSERT OR IGNORE INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order)
+    VALUES ('BTC', 'Bitcoin CFD', '比特幣', 'crypto', 0.01, 1, 1, 40)
+  `).run();
+  await db.prepare(`
+    INSERT OR IGNORE INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, is_active, sort_order)
     VALUES ('ETH', 'Ethereum CFD', '以太坊', 'crypto', 0.01, 1, 1, 41)
   `).run();
+  await db.prepare("UPDATE symbols SET default_stop_points = 500, default_tp_spacing = 500 WHERE symbol = 'BTC' AND (default_stop_points IS NULL OR default_stop_points = 0)").run();
   const strategyRows = await db.prepare('SELECT strategy_id, symbols FROM strategies').all();
   for (const row of strategyRows.results || []) {
     if (!parseList(row.symbols).length) continue;
-    const nextSymbols = appendListItemValue(row.symbols, 'ETH');
+    let nextSymbols = row.symbols;
+    for (const symbol of ['BTC', 'ETH']) nextSymbols = appendListItemValue(nextSymbols, symbol);
     if (nextSymbols !== cleanListValue(row.symbols)) {
       await db.prepare('UPDATE strategies SET symbols = ?, updated_at = datetime("now") WHERE strategy_id = ?').bind(nextSymbols, row.strategy_id).run();
     }
@@ -5567,7 +5777,8 @@ async function ensureAdminSchema(db) {
   const sourceRows = await db.prepare('SELECT source_id, allowed_symbols FROM tradingview_sources').all();
   for (const row of sourceRows.results || []) {
     if (!parseList(row.allowed_symbols).length) continue;
-    const nextSymbols = appendListItemValue(row.allowed_symbols, 'ETH');
+    let nextSymbols = row.allowed_symbols;
+    for (const symbol of ['BTC', 'ETH']) nextSymbols = appendListItemValue(nextSymbols, symbol);
     if (nextSymbols !== cleanListValue(row.allowed_symbols)) {
       await db.prepare('UPDATE tradingview_sources SET allowed_symbols = ?, updated_at = datetime("now") WHERE source_id = ?').bind(nextSymbols, row.source_id).run();
     }
@@ -6639,6 +6850,7 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_source_url) config.economic_calendar_source_url = DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL;
   if (!config.economic_calendar_source_name) config.economic_calendar_source_name = DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME;
   if (!config.economic_calendar_auto_remind) config.economic_calendar_auto_remind = '1';
+  if (!config.economic_calendar_daily_digest_enabled) config.economic_calendar_daily_digest_enabled = '0';
   if (!config.economic_calendar_remind_hour) config.economic_calendar_remind_hour = '8';
   if (!config.economic_calendar_pre_event_minutes) config.economic_calendar_pre_event_minutes = '30';
   if (!config.economic_calendar_lookahead_days) config.economic_calendar_lookahead_days = '7';
@@ -6648,6 +6860,9 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   if (!config.economic_calendar_market_only) config.economic_calendar_market_only = '1';
   if (!config.economic_calendar_gemini_enabled) config.economic_calendar_gemini_enabled = '1';
   if (!config.economic_calendar_gemini_model) config.economic_calendar_gemini_model = 'gemini-2.0-flash';
+  if (!config.vip_analysis_auto_send) config.vip_analysis_auto_send = '1';
+  if (!config.vip_analysis_gemini_enabled) config.vip_analysis_gemini_enabled = '1';
+  if (!config.vip_analysis_gemini_model) config.vip_analysis_gemini_model = config.economic_calendar_gemini_model || 'gemini-2.0-flash';
   if (!config.signal_proxy_rules) config.signal_proxy_rules = DEFAULT_SIGNAL_PROXY_RULES;
   if (!config.signal_min_probability) config.signal_min_probability = '60';
   if (!config.signal_require_probability) config.signal_require_probability = '0';
@@ -6669,13 +6884,20 @@ async function getAdminBootstrap(db, env = {}, request = null) {
   }
   const economicRuntimeConfig = await safe('economic.config', getEconomicConfig(db, env), {
     autoRemind: true,
+    dailyDigestEnabled: false,
     impacts: ['high'],
     currencies: ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CNY'],
     preEventMinutes: 30,
-    marketOnly: true
+    marketOnly: true,
+    geminiEnabled: true,
+    geminiModel: 'gemini-2.0-flash',
+    vipAnalysisAutoSend: true,
+    vipAnalysisGeminiEnabled: true,
+    vipAnalysisGeminiModel: 'gemini-2.0-flash'
   });
   const economicSettings = {
     enabled: !!economicRuntimeConfig.autoRemind,
+    dailyDigestEnabled: !!economicRuntimeConfig.dailyDigestEnabled,
     impacts: economicRuntimeConfig.impacts,
     currencies: economicRuntimeConfig.currencies,
     leadMinutes: economicRuntimeConfig.preEventMinutes,
@@ -6683,10 +6905,17 @@ async function getAdminBootstrap(db, env = {}, request = null) {
     geminiEnabled: !!economicRuntimeConfig.geminiEnabled,
     geminiConfigured: !!geminiApiKey(env),
     geminiModel: economicRuntimeConfig.geminiModel,
+    vipAnalysisEnabled: !!economicRuntimeConfig.vipAnalysisAutoSend,
+    vipAnalysisGeminiEnabled: !!economicRuntimeConfig.vipAnalysisGeminiEnabled,
+    vipAnalysisGeminiConfigured: !!geminiApiKey(env),
+    vipAnalysisGeminiModel: economicRuntimeConfig.vipAnalysisGeminiModel,
     lastSync: config.economic_calendar_last_sync || null
   };
   const upcomingEconomicEvents = await safe('economic.upcoming', getUpcomingMarketEconomicEvents(db, economicRuntimeConfig, { hours: 72, limit: 60 }), []);
-  const economicRows = (economicEvents.results || []).map(fallbackEnrichEconomicEvent);
+  const economicRows = (economicEvents.results || [])
+    .filter((event) => economicEventMatchesConfig(event, economicRuntimeConfig))
+    .filter((event) => normalizeEconomicImpact(event.impact) === 'high')
+    .map(fallbackEnrichEconomicEvent);
   const deliveryDiagnostics = await safe(
     'delivery.diagnostics',
     getDeliveryDiagnostics(db, env, Math.min(Number(range.limit || 40), 60)),
@@ -9990,7 +10219,7 @@ function renderMemberPage() {
         <div class="chart-stage">
           <div class="chart-grid"></div>
           <div class="chart-line"></div>
-          <div class="chart-labels">${['USTEC','XAUUSD','NQ','GC'].map((item) => `<span class="chip">${item}</span>`).join('')}</div>
+          <div class="chart-labels">${['USTEC','XAUUSD','NQ','BTC','GC'].map((item) => `<span class="chip">${item}</span>`).join('')}</div>
         </div>
         <div class="signal-preview-card">
           <div class="signal-preview-head">
@@ -10840,6 +11069,10 @@ function renderRefundPolicyPage() {
 function normalizeTvTicker(value) {
   const raw = String(value || '').trim().toUpperCase().split(':').pop().replace(/[^A-Z0-9]/g, '');
   const aliases = [
+    ['BTCUSDT', 'BTC'],
+    ['BTCUSD', 'BTC'],
+    ['XBTUSD', 'BTC'],
+    ['BTC', 'BTC'],
     ['ETHUSDT', 'ETH'],
     ['ETHUSD', 'ETH'],
     ['ETH', 'ETH'],
@@ -11975,6 +12208,7 @@ async function smartConfigureTradingView(db, request, adminId, payload = {}) {
 function tvImportAliases(symbol) {
   const s = String(symbol || '').toUpperCase();
   const aliases = new Set([s]);
+  if (s === 'BTC') ['BTCUSD', 'BTCUSDT', 'XBTUSD', 'BTCPERP', 'BTC.P', 'BINANCE:BTCUSDT', 'BYBIT:BTCUSDT', 'COINBASE:BTCUSD'].forEach((v) => aliases.add(v));
   if (s === 'ETH') ['ETHUSD', 'ETHUSDT', 'ETHPERP', 'ETH.P', 'BINANCE:ETHUSDT', 'BYBIT:ETHUSDT', 'COINBASE:ETHUSD'].forEach((v) => aliases.add(v));
   if (s === 'USTEC') ['US100', 'NAS100', 'USTEC.F', 'BLACKBULL:USTEC.F', 'OANDA:NAS100USD'].forEach((v) => aliases.add(v));
   if (s === 'XAUUSD') ['XAU', 'GOLD', 'OANDA:XAUUSD', 'FX:XAUUSD'].forEach((v) => aliases.add(v));
@@ -13123,7 +13357,7 @@ function renderTradingViewHtml() {
       <div class="body stack">
         <textarea class="copybox" id="tvImportText" placeholder="在 TradingView Alerts / Bots 清單頁執行掃描助手後貼上，或直接貼上清單文字。"></textarea>
         <div class="actions"><button class="btn primary" type="button" id="tvSmartImportBtn">智慧新增清單</button><button class="btn ghost" type="button" id="tvClearImportBtn">清空</button></div>
-        <div class="preview" id="tvImportPreview"><b>尚未匯入</b><div>可辨識 ETHUSDT/ETHUSD、USTEC/US100/NAS100、XAUUSD/GOLD、NQ/ES/GC/CL 等常見寫法。</div></div>
+        <div class="preview" id="tvImportPreview"><b>尚未匯入</b><div>可辨識 BTCUSDT/BTCUSD、ETHUSDT/ETHUSD、USTEC/US100/NAS100、XAUUSD/GOLD、NQ/ES/GC/CL 等常見寫法。</div></div>
       </div>
     </section>
     <section class="panel has-mobile-cards" style="grid-column:1/-1">
@@ -13151,7 +13385,7 @@ function renderAutoTradeHtml() {
         <div><label>預設口數</label><input name="auto_trade_default_volume" inputmode="decimal" placeholder="0.01"></div>
         <div><label>單筆風險 %</label><input name="auto_trade_risk_percent" inputmode="decimal" placeholder="1"></div>
         <div><label>每日上限</label><input name="auto_trade_max_orders_per_day" inputmode="numeric" placeholder="20"></div>
-        <div class="full"><label>允許自動交易品種</label><input name="auto_trade_allowed_symbols" placeholder="XAUUSD,USTEC,NQ,ETH；空白代表全部"></div>
+        <div class="full"><label>允許自動交易品種</label><input name="auto_trade_allowed_symbols" placeholder="XAUUSD,USTEC,NQ,BTC,ETH；空白代表全部"></div>
         <div class="full"><label>允許自動交易策略</label><input name="auto_trade_allowed_strategies" placeholder="algo-pro-v1-4；空白代表全部"></div>
       </div>
       <div class="health-card warning"><strong>正式交易保護</strong><p>Worker 只產生受控指令，不保存券商密碼。Exness 使用 MT5 EA 輪詢 /auto-trade/poll 後執行，或由你自己的 bridge 接收 webhook。</p><small>建議先 Paper 測通，再切 Live。MT5 EA 請把本網站加入 WebRequest 允許清單。</small></div>
@@ -13255,8 +13489,9 @@ function renderEconomicConfigFormHtml() {
     <div class="form-grid">
       <div class="full"><label>JSON Feed URL</label><input name="economic_calendar_source_url" inputmode="url" placeholder="${DEFAULT_ECONOMIC_CALENDAR_SOURCE_URL}"></div>
       <div><label>來源名稱</label><input name="economic_calendar_source_name" placeholder="${DEFAULT_ECONOMIC_CALENDAR_SOURCE_NAME} / TradingView proxy"></div>
-      <div><label>自動提醒</label><select name="economic_calendar_auto_remind"><option value="1">啟用</option><option value="0">停用</option></select></div>
-      <div><label>提醒小時（台北）</label><input name="economic_calendar_remind_hour" inputmode="numeric" placeholder="8"></div>
+      <div><label>提前提醒</label><select name="economic_calendar_auto_remind"><option value="1">啟用</option><option value="0">停用</option></select></div>
+      <div><label>每日摘要</label><select name="economic_calendar_daily_digest_enabled"><option value="0">關閉避免重複推播</option><option value="1">啟用每日摘要</option></select></div>
+      <div><label>摘要小時（台北）</label><input name="economic_calendar_remind_hour" inputmode="numeric" placeholder="8"></div>
       <div><label>提前提醒分鐘</label><input name="economic_calendar_pre_event_minutes" inputmode="numeric" placeholder="30"></div>
       <div><label>同步天數</label><input name="economic_calendar_lookahead_days" inputmode="numeric" placeholder="7"></div>
       <div><label>推送目標</label><select name="economic_calendar_target_group"><option value="paid">全部付費會員</option><option value="pro">Pro 以上</option><option value="vip">VIP</option><option value="all">全部會員</option></select></div>
@@ -13266,6 +13501,9 @@ function renderEconomicConfigFormHtml() {
       <div><label>市場事件過濾</label><select name="economic_calendar_market_only"><option value="1">只保留重要市場事件</option><option value="0">依重要性全列</option></select></div>
       <div><label>Gemini 翻譯</label><select name="economic_calendar_gemini_enabled"><option value="1">啟用（有 API key 時）</option><option value="0">停用</option></select></div>
       <div><label>Gemini 模型</label><input name="economic_calendar_gemini_model" placeholder="gemini-2.0-flash"></div>
+      <div><label>VIP 事件分析</label><select name="vip_analysis_auto_send"><option value="1">實際值公布後推送 VIP</option><option value="0">停用 VIP 分析</option></select></div>
+      <div><label>VIP Gemini</label><select name="vip_analysis_gemini_enabled"><option value="1">啟用（有 API key 時）</option><option value="0">改用系統解讀</option></select></div>
+      <div><label>VIP Gemini 模型</label><input name="vip_analysis_gemini_model" placeholder="gemini-2.0-flash"></div>
     </div>
     <button class="btn primary" type="submit">儲存事件設定</button>
   </form>`;
@@ -13697,8 +13935,10 @@ function renderConfigSummary() {
   var proxyEnabled = String(c.signal_proxy_rules || '').indexOf('"enabled":true') >= 0 || String(c.signal_proxy_rules || '').indexOf('"enabled": true') >= 0;
   var minProb = Number(c.signal_min_probability || 0);
   var requireProb = c.signal_require_probability === '1';
+  var econAuto = c.economic_calendar_auto_remind !== '0';
+  var vipGemini = c.vip_analysis_auto_send !== '0' && c.vip_analysis_gemini_enabled !== '0';
   summary.innerHTML =
-    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip(minProb > 0 ? '機率 >= ' + minProb + '%' : '機率不過濾', minProb > 0 ? 'green' : '') + chip(requireProb ? '缺機率阻擋' : '缺機率允許', requireProb ? 'amber' : 'green') + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(proxyEnabled ? 'USTEC→NQ 已啟用' : 'Proxy 未啟用', proxyEnabled ? 'green' : 'amber') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
+    '<div class="actions">' + (c.signals_paused === '1' ? chip('訊號暫停', 'amber') : chip('訊號運行中', 'green')) + chip(minProb > 0 ? '機率 >= ' + minProb + '%' : '機率不過濾', minProb > 0 ? 'green' : '') + chip(requireProb ? '缺機率阻擋' : '缺機率允許', requireProb ? 'amber' : 'green') + chip(econAuto ? '紅色事件提前提醒' : '事件提醒關閉', econAuto ? 'green' : 'amber') + chip(vipGemini ? 'VIP Gemini 分析' : 'VIP 系統解讀', vipGemini ? 'green' : 'amber') + chip('Pro ' + money(c.pro_price_1m), '') + chip('VIP ' + money(c.vip_price_1m), '') + chip(proxyEnabled ? 'USTEC→NQ 已啟用' : 'Proxy 未啟用', proxyEnabled ? 'green' : 'amber') + chip(stripe.enabled ? '線上付款已啟用' : '線上付款未啟用', stripe.enabled ? 'green' : 'amber') + chip(c.payment_manual_enabled === '0' ? '轉帳關閉' : '轉帳開放', c.payment_manual_enabled === '0' ? 'amber' : 'green') + chip(cryptoReady ? 'Crypto 已啟用' : 'Crypto 未完成', cryptoReady ? 'green' : 'amber') + chip(oauth.enabledCount ? 'Google 登入已啟用' : 'Google 登入未啟用', oauth.enabledCount ? 'green' : 'amber') + '</div>' +
     '<div class="muted">公開網址：' + esc(c.public_base_url || '-') + '</div>' +
     '<div class="muted">轉帳：' + esc(c.payment_bank || '-') + ' / ' + esc(c.payment_account || '-') + '</div>' +
     '<div class="muted">Crypto：' + esc(c.payment_crypto_asset || 'USDT') + ' ' + esc(c.payment_crypto_network || '-') + ' / ' + esc(c.payment_crypto_wallet || '未設定') + '</div>' +
@@ -14149,7 +14389,7 @@ function renderEconomic() {
   var settings = state.data.economicSettings || {};
   if (status) {
     var last = settings.lastSync ? econTaipei(settings.lastSync) : '尚未同步';
-    status.textContent = '最後同步：' + last + ' · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 影響 ' + ((settings.impacts || []).join('/') || '全部') + ' · 市場事件 ' + (settings.marketOnly ? '啟用' : '關閉') + ' · Gemini ' + (settings.geminiEnabled ? (settings.geminiConfigured ? '已啟用' : '待設定 API key') : '關閉') + ' · 提前 ' + (settings.leadMinutes || 30) + ' 分鐘';
+    status.textContent = '最後同步：' + last + ' · 只推紅色重大事件 · 關注 ' + ((settings.currencies || []).join('/') || '全部') + ' · 每日摘要 ' + (settings.dailyDigestEnabled ? '啟用' : '關閉') + ' · Gemini翻譯 ' + (settings.geminiEnabled ? (settings.geminiConfigured ? '已啟用' : '待設定 API key') : '關閉') + ' · VIP分析 ' + (settings.vipAnalysisEnabled ? (settings.vipAnalysisGeminiEnabled ? (settings.vipAnalysisGeminiConfigured ? 'Gemini已啟用' : '待設定 API key') : '系統解讀') : '關閉') + ' · 提前 ' + (settings.leadMinutes || 30) + ' 分鐘';
   }
   var form = document.getElementById('economicForm');
   if (form) {
@@ -14369,6 +14609,7 @@ function renderEconomicEvents() {
       'economic_calendar_source_url',
       'economic_calendar_source_name',
       'economic_calendar_auto_remind',
+      'economic_calendar_daily_digest_enabled',
       'economic_calendar_remind_hour',
       'economic_calendar_pre_event_minutes',
       'economic_calendar_lookahead_days',
@@ -14378,11 +14619,15 @@ function renderEconomicEvents() {
       'economic_calendar_countries',
       'economic_calendar_market_only',
       'economic_calendar_gemini_enabled',
-      'economic_calendar_gemini_model'
+      'economic_calendar_gemini_model',
+      'vip_analysis_auto_send',
+      'vip_analysis_gemini_enabled',
+      'vip_analysis_gemini_model'
     ].forEach(function (key) {
       if (form.elements[key]) form.elements[key].value = state.data.config[key] == null ? '' : state.data.config[key];
     });
     if (!form.elements.economic_calendar_auto_remind.value) form.elements.economic_calendar_auto_remind.value = '1';
+    if (form.elements.economic_calendar_daily_digest_enabled && !form.elements.economic_calendar_daily_digest_enabled.value) form.elements.economic_calendar_daily_digest_enabled.value = '0';
     if (!form.elements.economic_calendar_remind_hour.value) form.elements.economic_calendar_remind_hour.value = '8';
     if (!form.elements.economic_calendar_pre_event_minutes.value) form.elements.economic_calendar_pre_event_minutes.value = '30';
     if (!form.elements.economic_calendar_lookahead_days.value) form.elements.economic_calendar_lookahead_days.value = '7';
@@ -14392,6 +14637,9 @@ function renderEconomicEvents() {
     if (form.elements.economic_calendar_market_only && !form.elements.economic_calendar_market_only.value) form.elements.economic_calendar_market_only.value = '1';
     if (form.elements.economic_calendar_gemini_enabled && !form.elements.economic_calendar_gemini_enabled.value) form.elements.economic_calendar_gemini_enabled.value = '1';
     if (form.elements.economic_calendar_gemini_model && !form.elements.economic_calendar_gemini_model.value) form.elements.economic_calendar_gemini_model.value = 'gemini-2.0-flash';
+    if (form.elements.vip_analysis_auto_send && !form.elements.vip_analysis_auto_send.value) form.elements.vip_analysis_auto_send.value = '1';
+    if (form.elements.vip_analysis_gemini_enabled && !form.elements.vip_analysis_gemini_enabled.value) form.elements.vip_analysis_gemini_enabled.value = '1';
+    if (form.elements.vip_analysis_gemini_model && !form.elements.vip_analysis_gemini_model.value) form.elements.vip_analysis_gemini_model.value = 'gemini-2.0-flash';
   }
 }
 function editEconomicEvent(eventUid) {
@@ -14889,6 +15137,7 @@ function setSelectValue(id, value) {
 }
 function sampleRiskForTicker(ticker, price) {
   var symbol = String(ticker || '').toUpperCase();
+  if (symbol === 'BTC') return Math.max(150, Math.round(Number(price || 0) * 0.006));
   if (symbol === 'ETH') return Math.max(10, Math.round(Number(price || 0) * 0.006));
   if (symbol === 'XAUUSD' || symbol === 'GC') return 30;
   if (symbol === 'USTEC' || symbol === 'NQ') return 30;
@@ -14923,7 +15172,7 @@ function buildTradingViewPreviewPayload() {
   };
 }
 function tradingViewScanHelperScript() {
-  return "(function(){var selectors='[role=row],[data-name*=alert],[class*=alert],[class*=Alert],div,span';var rows=Array.prototype.slice.call(document.querySelectorAll(selectors)).map(function(el){return (el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim();}).filter(function(text){return text.length>8&&/(ETH|USDT|USTEC|US100|NAS100|XAU|GOLD|NQ|ES|GC|CL|RTY|YM|alert|strategy|bot)/i.test(text);});var uniq=[];rows.forEach(function(text){if(uniq.indexOf(text)<0)uniq.push(text);});var out=uniq.join('\\n');navigator.clipboard.writeText(out).then(function(){alert('已複製 TradingView 可見清單 '+uniq.length+' 行，回 DC 後台貼上即可智慧新增。');},function(){prompt('複製以下內容回 DC 後台：',out);});})();";
+  return "(function(){var selectors='[role=row],[data-name*=alert],[class*=alert],[class*=Alert],div,span';var rows=Array.prototype.slice.call(document.querySelectorAll(selectors)).map(function(el){return (el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim();}).filter(function(text){return text.length>8&&/(BTC|XBT|ETH|USDT|USTEC|US100|NAS100|XAU|GOLD|NQ|ES|GC|CL|RTY|YM|alert|strategy|bot)/i.test(text);});var uniq=[];rows.forEach(function(text){if(uniq.indexOf(text)<0)uniq.push(text);});var out=uniq.join('\\n');navigator.clipboard.writeText(out).then(function(){alert('已複製 TradingView 可見清單 '+uniq.length+' 行，回 DC 後台貼上即可智慧新增。');},function(){prompt('複製以下內容回 DC 後台：',out);});})();";
 }
 function renderTvImportPreview(result) {
   var box = document.getElementById('tvImportPreview');
@@ -15574,7 +15823,7 @@ document.getElementById('tvSmartConfigBtn').addEventListener('click', async func
     await load();
     setSelectValue('tvGenSource', result.sourceId);
     setSelectValue('tvGenStrategy', result.strategyId);
-    setSelectValue('tvGenTicker', (result.symbols || []).includes('ETH') ? 'ETH' : (result.symbols || [])[0]);
+    setSelectValue('tvGenTicker', (result.symbols || []).includes('BTC') ? 'BTC' : ((result.symbols || []).includes('ETH') ? 'ETH' : (result.symbols || [])[0]));
     setSelectValue('tvGenAction', 'LONG');
     updateTradingViewGenerator();
     document.getElementById('tvWebhookUrl').value = result.webhookUrl;
@@ -15759,7 +16008,8 @@ async function handleEconomicEventsCron(env, options = {}) {
   }
   const daily = await sendEconomicEventsReminder(env, options);
   const upcoming = await sendEconomicPreEventAlerts(env, options);
-  return { weekly, daily, upcoming };
+  const vipAnalysis = await sendVipEconomicAnalyses(env, options);
+  return { weekly, daily, upcoming, vipAnalysis };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

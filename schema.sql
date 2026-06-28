@@ -57,7 +57,7 @@ CREATE TABLE user_settings (
   risk_percent REAL DEFAULT 1.0,
   
   -- 訂閱品種 (JSON陣列)
-  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC","USTEC","XAUUSD","ETH"]',
+  subscribed_symbols TEXT DEFAULT '["NQ","ES","GC","USTEC","XAUUSD","BTC","ETH"]',
   
   -- 訊號類型偏好 (JSON陣列)
   signal_types TEXT DEFAULT '["scalp","swing"]',
@@ -292,6 +292,9 @@ CREATE TABLE economic_events (
   reminded_at TEXT,
   pre_reminded_at TEXT,
   translated_at TEXT,
+  vip_analyzed_at TEXT,
+  vip_analysis_zh TEXT,
+  vip_analysis_error TEXT,
   synced_at TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
@@ -661,10 +664,12 @@ INSERT INTO symbols (symbol, name, name_zh, category, tick_size, tick_value, sor
 ('NG', 'Natural Gas', '天然氣', 'energy', 0.001, 10, 21),
 ('6E', 'Euro FX', '歐元', 'forex', 0.00005, 6.25, 30),
 ('6J', 'Japanese Yen', '日圓', 'forex', 0.0000005, 6.25, 31),
+('BTC', 'Bitcoin CFD', '比特幣', 'crypto', 0.01, 1, 40),
 ('ETH', 'Ethereum CFD', '以太坊', 'crypto', 0.01, 1, 41);
 
 -- 黃金品種預設止損 / 止盈點位（無指標點位時自動套用：止損 20 點、TP 間隔 12 點）
 UPDATE symbols SET default_stop_points = 20, default_tp_spacing = 12 WHERE symbol IN ('XAUUSD', 'GC');
+UPDATE symbols SET default_stop_points = 500, default_tp_spacing = 500 WHERE symbol = 'BTC';
 
 -- 預設群組
 INSERT INTO groups (group_name, description) VALUES 
@@ -674,12 +679,12 @@ INSERT INTO groups (group_name, description) VALUES
 
 -- 預設策略
 INSERT INTO strategies (strategy_id, name, description, signal_types, symbols, tier, sort_order, rules_json, tv_alert_template) VALUES
-('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback."}'),
-('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
-('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
-('ict-silver-bullet-2026', 'ICT Silver Bullet 2026', '串接 TradingView ICT Advanced Silver Bullet；需 alert_message 或 hidden plot 回傳 SL/TP。', '["scalp","daytrade"]', '["XAUUSD","GC","USTEC","NQ","ETH"]', 'pro', 5, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"alert_message","requiresExplicitLevels":true,"needsAlertMessage":true}', '{"strategy":"ict-silver-bullet-2026","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{strategy.order.price}}","stop_loss":"ADD_SL_TO_PINE_ALERT","tp1":"ADD_TP1_TO_PINE_ALERT","tp2":"ADD_TP2_TO_PINE_ALERT","tp3":"ADD_TP3_TO_PINE_ALERT","time":"{{time}}","interval":"{{interval}}"}');
+('scalp-core', '短線核心策略', '盤中短線訊號，重視進出場速度與風險控制。', '["scalp"]', '["NQ","ES","GC","USTEC","XAUUSD","BTC","ETH"]', 'pro', 1, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"close","timeframes":["1","3","5","15"]}', '{"strategy":"scalp-core","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('algo-pro-v1-4', 'AlgoPro V1.4', '串接 TradingView 既有 AlgoPro 指標，使用 Data Window plot 回傳實際 SL/TP。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","BTC","ETH"]', 'pro', 2, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"smart-directional-plot","requiresExplicitLevels":false,"fallbackEnabled":true,"fallbackPolicy":"indicator-first-symbol-strategy","timeframes":["1","3","5","15"]}', '{"secret":"{{secret}}","source_id":"{{source_id}}","strategy":"{{strategy_id}}","event":"entry","ticker":"{{ticker}}","exchange":"{{exchange}}","action":"{{strategy.order.action}}","order_id":"{{strategy.order.id}}","order_comment":"{{strategy.order.comment}}","entry_price":"{{strategy.order.price}}","order_price":"{{strategy.order.price}}","price":"{{strategy.order.price}}","close":"{{close}}","long_stop_loss":"{{plot_5}}","short_stop_loss":"{{plot_6}}","long_tp1":"{{plot_7}}","short_tp1":"{{plot_8}}","probability":"{{plot_9}}","p0":"{{plot_0}}","p1":"{{plot_1}}","p2":"{{plot_2}}","p3":"{{plot_3}}","p4":"{{plot_4}}","p5":"{{plot_5}}","p6":"{{plot_6}}","p7":"{{plot_7}}","p8":"{{plot_8}}","p9":"{{plot_9}}","p10":"{{plot_10}}","p11":"{{plot_11}}","p12":"{{plot_12}}","p13":"{{plot_13}}","p14":"{{plot_14}}","p15":"{{plot_15}}","p16":"{{plot_16}}","p17":"{{plot_17}}","contracts":"{{strategy.order.contracts}}","market_position":"{{strategy.market_position}}","prev_market_position":"{{strategy.prev_market_position}}","time":"{{time}}","interval":"{{interval}}","alert_id":"{{ticker}}-{{time}}-{{strategy_id}}-{{strategy.order.id}}-{{strategy.order.comment}}","mapping_note":"AlgoPro V1.4 TradingView Add placeholder order: plot_5 Long SL, plot_6 Short SL, plot_7 Long TP, plot_8 Short TP, plot_9 probability. Backend uses indicator levels first and fills missing/invalid SL/TP by symbol strategy fallback."}'),
+('swing-trend', '波段趨勢策略', '順勢波段訊號，適合可持倉數小時到數天的會員。', '["swing"]', '["NQ","ES","GC","CL","USTEC","XAUUSD","BTC","ETH"]', 'pro', 2, '{"riskPoints":75,"targetR":[1,2,3],"entryMode":"close","timeframes":["60","120","240","D"]}', '{"strategy":"swing-trend","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('vip-momentum', 'VIP 動能策略', '高動能與關鍵行情提醒，含第三止盈目標。', '["scalp","daytrade"]', '["NQ","GC","CL","USTEC","XAUUSD","BTC","ETH"]', 'vip', 3, '{"riskPoints":45,"targetR":[1,2,3.5],"entryMode":"close","timeframes":["5","15","30","60"]}', '{"strategy":"vip-momentum","ticker":"{{ticker}}","action":"{{strategy.order.action}}","price":"{{close}}","time":"{{time}}","interval":"{{interval}}"}'),
+('bb-squeeze-breakout', 'BB Squeeze 突破共振', '串接 TradingView BB Squeeze 突破共振系統；目前需 Pine 補 TP hidden plot 才能正式發送。', '["scalp","daytrade"]', '["USTEC","XAUUSD","NQ","GC","BTC","ETH"]', 'pro', 4, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"plot","requiresExplicitLevels":true,"needsTpPlots":true}', '{"strategy":"bb-squeeze-breakout","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{close}}","stop_loss":"{{plot_6_or_7}}","tp1":"ADD_TP1_PLOT_TO_PINE","tp2":"ADD_TP2_PLOT_TO_PINE","tp3":"ADD_TP3_PLOT_TO_PINE","time":"{{time}}","interval":"{{interval}}"}'),
+('ict-silver-bullet-2026', 'ICT Silver Bullet 2026', '串接 TradingView ICT Advanced Silver Bullet；需 alert_message 或 hidden plot 回傳 SL/TP。', '["scalp","daytrade"]', '["XAUUSD","GC","USTEC","NQ","BTC","ETH"]', 'pro', 5, '{"riskPoints":30,"targetR":[1,2,3],"entryMode":"tradingview","levelSource":"alert_message","requiresExplicitLevels":true,"needsAlertMessage":true}', '{"strategy":"ict-silver-bullet-2026","ticker":"{{ticker}}","action":"{{strategy.order.action}}","entry_price":"{{strategy.order.price}}","stop_loss":"ADD_SL_TO_PINE_ALERT","tp1":"ADD_TP1_TO_PINE_ALERT","tp2":"ADD_TP2_TO_PINE_ALERT","tp3":"ADD_TP3_TO_PINE_ALERT","time":"{{time}}","interval":"{{interval}}"}');
 
 -- 系統設定
 INSERT INTO system_config (key, value) VALUES
@@ -711,6 +716,7 @@ INSERT INTO system_config (key, value) VALUES
 ('economic_calendar_source_url', 'https://economic-calendar.tradingview.com/events?from={from_iso}&to={to_iso}'),
 ('economic_calendar_source_name', 'TradingView Calendar'),
 ('economic_calendar_auto_remind', '1'),
+('economic_calendar_daily_digest_enabled', '0'),
 ('economic_calendar_remind_hour', '8'),
 ('economic_calendar_target_group', 'paid'),
 ('economic_calendar_impacts', 'high'),
@@ -721,6 +727,9 @@ INSERT INTO system_config (key, value) VALUES
 ('economic_calendar_market_only', '1'),
 ('economic_calendar_gemini_enabled', '1'),
 ('economic_calendar_gemini_model', 'gemini-2.0-flash'),
+('vip_analysis_auto_send', '1'),
+('vip_analysis_gemini_enabled', '1'),
+('vip_analysis_gemini_model', 'gemini-2.0-flash'),
 ('contact_telegram', '@Admin'),
 ('contact_line', '@dcsignals'),
 ('public_base_url', 'https://dc-signals-v91.cc559773.workers.dev'),
