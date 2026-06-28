@@ -11104,6 +11104,105 @@ function firstTvValue(...values) {
   return '';
 }
 
+function tvPayloadMessageText(payload = {}) {
+  return tvLevelTextSources(payload).join('\n').trim();
+}
+
+function tvMessagePreview(payload = {}) {
+  const text = tvPayloadMessageText(payload).replace(/\s+/g, ' ').trim();
+  return text ? text.slice(0, 140) : '';
+}
+
+function parseTvTickerFromText(text = '') {
+  const raw = String(text || '').toUpperCase();
+  const exchange = raw.match(/\b[A-Z_]+:([A-Z0-9._!]+)\b/);
+  if (exchange) {
+    const ticker = normalizeTvTicker(exchange[1]);
+    if (ticker) return ticker;
+  }
+  const aliases = [
+    'BTCUSDT', 'BTCUSD', 'XBTUSD', 'BTC',
+    'ETHUSDT', 'ETHUSD', 'ETH',
+    'USTEC.F', 'USTEC', 'US100', 'NAS100',
+    'XAUUSD', 'GOLD', 'XAU',
+    'NQ1!', 'MNQ1!', 'NQ',
+    'ES1!', 'MES1!', 'ES',
+    'GC1!', 'MGC1!', 'GC',
+    'CL1!', 'CL',
+    'RTY', 'YM'
+  ];
+  for (const alias of aliases) {
+    const clean = alias.replace(/[^A-Z0-9]/g, '');
+    const pattern = new RegExp(`(^|[^A-Z0-9])${clean}([^A-Z0-9]|$)`, 'i');
+    if (pattern.test(raw.replace(/[^A-Z0-9]/g, ' '))) return normalizeTvTicker(alias);
+    if (raw.includes(alias)) return normalizeTvTicker(alias);
+  }
+  return '';
+}
+
+function parseTvActionFromText(text = '') {
+  const raw = String(text || '').toLowerCase();
+  if (/(^|[^a-z])(long|buy|bullish|buy signal|long signal|做多|多單)([^a-z]|$)/i.test(raw)) return 'LONG';
+  if (/(^|[^a-z])(short|sell|bearish|sell signal|short signal|做空|空單)([^a-z]|$)/i.test(raw)) return 'SHORT';
+  return '';
+}
+
+function parseTvEntryFromText(text = '') {
+  const body = String(text || '').replace(/,/g, '');
+  const labeled = tvTextNumberAfter(body, ['entry_price', 'entry price', 'entry', 'price', 'close', 'signal price', 'trigger price', '進場價', '進場', '@']);
+  if (labeled !== null) return labeled;
+  const afterSide = body.match(/\b(?:buy|sell|long|short)\b[^\d\-]{0,32}(-?\d+(?:\.\d+)?)/i);
+  if (afterSide) return asNumber(afterSide[1], null);
+  const atPrice = body.match(/@\s*(-?\d+(?:\.\d+)?)/);
+  return atPrice ? asNumber(atPrice[1], null) : null;
+}
+
+function normalizeTradingViewPayload(payload = {}, url = null, source = null) {
+  const next = { ...(payload || {}) };
+  if (url?.searchParams) {
+    [
+      'ticker', 'symbol', 'source', 'action', 'side', 'direction',
+      'entry_price', 'price', 'close', 'strategy', 'strategy_id',
+      'time', 'interval', 'alert_id'
+    ].forEach((key) => {
+      const value = url.searchParams.get(key);
+      if (value && firstTvValue(next[key]) === '') next[key] = value;
+    });
+  }
+  const text = tvPayloadMessageText(next);
+  if (text) {
+    if (!normalizeTvTicker(firstTvValue(next.ticker, next.symbol, next.syminfo, next.source))) {
+      const ticker = parseTvTickerFromText(text);
+      if (ticker) next.ticker = ticker;
+    }
+    if (!normalizeTvAction(next)) {
+      const action = parseTvActionFromText(text);
+      if (action) next.action = action;
+    }
+    if (tvEntryPrice(next) === null) {
+      const entry = parseTvEntryFromText(text);
+      if (entry !== null) {
+        next.entry_price = entry;
+        next.price = entry;
+      }
+    }
+  }
+  if (!firstTvValue(next.strategy, next.strategy_id, next.strategyId) && source?.default_strategy_id) {
+    next.strategy = source.default_strategy_id;
+  }
+  return next;
+}
+
+function tvMissingFieldError(field, payload = {}) {
+  const preview = tvMessagePreview(payload);
+  const example = field === 'ticker'
+    ? '請在 Alert Message 加入 ticker，例如 "BTC SELL @ {{close}}" 或 JSON 的 "ticker":"BTC"。'
+    : field === 'action'
+      ? '請在 Alert Message 加入 action，例如 "BTC SELL @ {{close}}" 或 JSON 的 "action":"SELL"。'
+      : '請在 Alert Message 加入進場價，例如 "BTC SELL @ {{close}}" 或 JSON 的 "price":"{{close}}"。';
+  return `TradingView alert 缺少 ${field}${preview ? `；目前 message="${preview}"` : ''}。${example}`;
+}
+
 function tvOrderId(payload) {
   return String(firstTvValue(payload.order_id, payload.orderId, payload.strategy_order_id, payload.strategyOrderId, payload.strategy?.order?.id, payload.id, payload.comment)).trim();
 }
@@ -11556,12 +11655,18 @@ function isTrustedTradingViewWebhook(request) {
 }
 
 function inferTvEventKind(payload) {
+  const explicitText = [payload.event, payload.event_type, payload.type, payload.kind, payload.market_position, payload.marketPosition]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
   const text = [payload.event, payload.event_type, payload.type, tvOrderId(payload), tvOrderComment(payload), payload.market_position, payload.marketPosition]
     .map((value) => String(value || '').toLowerCase())
     .join(' ');
   const market = String(firstTvValue(payload.market_position, payload.marketPosition)).toLowerCase();
   const previous = String(firstTvValue(payload.prev_market_position, payload.prevMarketPosition, payload.previous_position, payload.previousPosition)).toLowerCase();
   if (market === 'flat' && ['long', 'short'].includes(previous)) return 'exit';
+  const textLevels = parseTvLevelsFromText(payload);
+  const hasEntry = tvEntryPrice(payload) !== null || textLevels.entry_price != null || parseTvEntryFromText(tvPayloadMessageText(payload)) !== null;
+  if (normalizeTvAction(payload) && hasEntry && !/\b(exit|close|flat)\b/.test(explicitText)) return 'entry';
   if (/\b(exit|close|flat|tp|take profit|takeprofit|sl|stop|stop loss|stoploss)\b/.test(text)) return 'exit';
   return 'entry';
 }
@@ -11721,9 +11826,9 @@ async function buildTvSignalDraft(db, source, payload) {
   const action = normalizeTvAction(payload);
   const textLevels = parseTvLevelsFromText(payload);
   const entryRaw = tvPreferTextLevel(tvEntryPrice(payload), textLevels.entry_price);
-  if (!ticker) throw new Error('TradingView alert 缺少 ticker');
-  if (!action) throw new Error('TradingView alert 缺少 action，請傳 LONG/SHORT 或 buy/sell');
-  if (entryRaw === null) throw new Error('TradingView alert 缺少 entry_price / strategy.order.price / price / close');
+  if (!ticker) throw new Error(tvMissingFieldError('ticker', payload));
+  if (!action) throw new Error(tvMissingFieldError('action', payload));
+  if (entryRaw === null) throw new Error(tvMissingFieldError('entry_price / price / close', payload));
 
   const allowed = parseList(source.allowed_symbols).map((s) => s.toUpperCase());
   if (allowed.length && !allowed.includes(ticker)) throw new Error(`${ticker} 不在此來源允許品種內`);
@@ -12310,6 +12415,8 @@ async function handleTradingViewWebhook(request, env, sourceId, url, ctx = null)
   } else if (!isTrustedTradingViewWebhook(request)) {
     return json({ ok: false, error: 'Invalid TradingView secret' }, 401);
   }
+
+  payload = normalizeTradingViewPayload(payload, url, source);
 
   const alertUid = String(payload.alert_uid || payload.alert_id || payload.id || [
     payload.time || Date.now(),
